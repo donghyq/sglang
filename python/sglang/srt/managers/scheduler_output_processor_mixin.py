@@ -871,8 +871,14 @@ class SchedulerOutputProcessorMixin:
             self._initialize_empty_logprob_containers(req)
 
         if req.top_logprobs_num > 0:
-            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
+            val = output.next_token_top_logprobs_val[i]
+            idx = output.next_token_top_logprobs_idx[i]
+            if isinstance(val, torch.Tensor):
+                val = val.tolist()
+            if isinstance(idx, torch.Tensor):
+                idx = idx.tolist()
+            req.output_top_logprobs_val.append(val)
+            req.output_top_logprobs_idx.append(idx)
 
         if (
             req.token_ids_logprob is not None

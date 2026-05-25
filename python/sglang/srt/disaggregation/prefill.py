@@ -504,6 +504,24 @@ class SchedulerDisaggregationPrefillMixin:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
+            # disaggregation prefill runs with no_copy_to_cpu=True in the
+            # sampler, so top-logprob slots arrive as GPU tensors rather than
+            # Python lists.  Convert them here to match the non-disaggregation
+            # path (see scheduler_output_processor_mixin.py).
+            if logits_output.next_token_top_logprobs_val is not None:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() if isinstance(v, torch.Tensor) else v
+                    for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() if isinstance(x, torch.Tensor) else x
+                    for x in logits_output.next_token_top_logprobs_idx
+                ]
+            if logits_output.next_token_token_ids_logprobs_val is not None:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() if isinstance(v, torch.Tensor) else v
+                    for v in logits_output.next_token_token_ids_logprobs_val
+                ]
 
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
