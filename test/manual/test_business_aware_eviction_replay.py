@@ -159,6 +159,8 @@ class ScenarioEvent:
     estimated_reload_cost: float
     estimated_reuse_prefix_len: float
     business_complete: bool = False
+    biz_type: str = "default"
+    sla_class: str = "standard"
 
 
 @dataclass
@@ -220,6 +222,8 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=20000.0,
                 estimated_reuse_prefix_len=20000.0,
                 business_complete=False,
+                biz_type="premium_rag",
+                sla_class="premium",
             ),
             ScenarioEvent(
                 "recent_low_value",
@@ -229,6 +233,8 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=True,
+                biz_type="best_effort_chat",
+                sla_class="best_effort",
             ),
             ScenarioEvent(
                 "cold_a",
@@ -238,6 +244,7 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=False,
+                biz_type="default",
             ),
             ScenarioEvent(
                 "cold_b",
@@ -247,6 +254,7 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=False,
+                biz_type="default",
             ),
         ],
         replay_events=[
@@ -258,6 +266,8 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=True,
+                biz_type="best_effort_chat",
+                sla_class="best_effort",
             ),
             ScenarioEvent(
                 "pressure_insert",
@@ -267,6 +277,7 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=False,
+                biz_type="default",
             ),
         ],
         post_evict_probes=[
@@ -278,6 +289,8 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=20000.0,
                 estimated_reuse_prefix_len=20000.0,
                 business_complete=False,
+                biz_type="premium_rag",
+                sla_class="premium",
             ),
             ScenarioEvent(
                 "recent_low_value_probe",
@@ -287,6 +300,8 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=True,
+                biz_type="best_effort_chat",
+                sla_class="best_effort",
             ),
             ScenarioEvent(
                 "pressure_insert_probe",
@@ -296,6 +311,7 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
                 estimated_reload_cost=1.0,
                 estimated_reuse_prefix_len=4.0,
                 business_complete=False,
+                biz_type="default",
             ),
         ],
     ),
@@ -338,6 +354,8 @@ def insert_event(cache: RadixCache, event: ScenarioEvent):
         estimated_reload_cost=event.estimated_reload_cost,
         estimated_reuse_prefix_len=event.estimated_reuse_prefix_len,
         business_complete=event.business_complete,
+        biz_type=event.biz_type,
+        sla_class=event.sla_class,
     )
     return node
 
@@ -383,6 +401,7 @@ def collect_leaf_state(cache: RadixCache) -> List[dict[str, Any]]:
     while stack:
         node = stack.pop()
         if node is not cache.root_node and len(node.children) == 0 and not node.evicted:
+            raw_metadata = cache.business_metadata_store.get_for_node(node.id)
             item = {
                 "node_id": node.id,
                 "tokens": node.key.token_ids,
@@ -391,6 +410,16 @@ def collect_leaf_state(cache: RadixCache) -> List[dict[str, Any]]:
                 "hit_count": node.hit_count,
                 "last_access_time": node.last_access_time,
                 "explanation": cache.get_business_metadata_explanation(node),
+                "raw_metadata": {
+                    "hot_bucket_score": raw_metadata.hot_bucket_score,
+                    "time_window_score": raw_metadata.time_window_score,
+                    "estimated_reload_cost": raw_metadata.estimated_reload_cost,
+                    "estimated_reuse_prefix_len": raw_metadata.estimated_reuse_prefix_len,
+                    "business_complete": raw_metadata.business_complete,
+                    "biz_type": raw_metadata.biz_type,
+                    "sla_class": raw_metadata.sla_class,
+                    "priority": raw_metadata.priority,
+                } if raw_metadata is not None else None,
             }
             leaves.append(item)
         for child in node.children.values():
@@ -427,6 +456,87 @@ def compute_probe_summary(cache: RadixCache, probe_events: List[ScenarioEvent]) 
     }
 
 
+def _leaf_token_key(tokens: List[int]) -> tuple:
+    return tuple(tokens)
+
+
+def compute_evicted_set(
+    pre_evict_leaves: List[dict[str, Any]],
+    post_evict_leaves: List[dict[str, Any]],
+) -> List[dict[str, Any]]:
+    """Diff pre/post eviction leaf sets to identify evicted nodes."""
+    surviving_keys = {_leaf_token_key(l["tokens"]) for l in post_evict_leaves}
+    evicted = [
+        leaf
+        for leaf in pre_evict_leaves
+        if _leaf_token_key(leaf["tokens"]) not in surviving_keys
+    ]
+    return evicted
+
+
+def compute_regret_and_cost(
+    evicted_leaves: List[dict[str, Any]],
+    probe_events: List[ScenarioEvent],
+    probe_statuses: List[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compute eviction regret and extra prefill cost.
+
+    regret: an evicted node whose token_ids match a post-eviction probe that
+            missed.  This means we evicted something we immediately needed.
+    extra_prefill_cost: sum of estimated_reload_cost for regret-evicted nodes,
+            i.e. the recompute burden caused by premature eviction.
+    """
+    evicted_by_tokens = {}
+    for leaf in evicted_leaves:
+        evicted_by_tokens[_leaf_token_key(leaf["tokens"])] = leaf
+
+    regrets: List[dict[str, Any]] = []
+    total_extra_cost = 0.0
+
+    for event, status in zip(probe_events, probe_statuses):
+        if status["matched"]:
+            continue
+        token_key = tuple(event.token_ids)
+        evicted_leaf = evicted_by_tokens.get(token_key)
+        if evicted_leaf is None:
+            continue
+        raw_metadata = evicted_leaf.get("raw_metadata") or {}
+        reload_cost = raw_metadata.get("estimated_reload_cost", 0.0)
+        total_extra_cost += reload_cost
+        regrets.append(
+            {
+                "probe_key": event.key,
+                "biz_type": event.biz_type,
+                "evicted_node_id": evicted_leaf["node_id"],
+                "estimated_reload_cost": reload_cost,
+            }
+        )
+
+    return {
+        "regret_count": len(regrets),
+        "regret_details": regrets,
+        "total_extra_prefill_cost": total_extra_cost,
+    }
+
+
+def compute_bucket_hit_loss(
+    probe_events: List[ScenarioEvent],
+    probe_statuses: List[dict[str, Any]],
+) -> dict[str, Any]:
+    """Group probe hit/miss by biz_type to show per-bucket impact."""
+    buckets: Dict[str, dict[str, Any]] = {}
+    for event, status in zip(probe_events, probe_statuses):
+        bucket = event.biz_type
+        if bucket not in buckets:
+            buckets[bucket] = {"total": 0, "hit": 0, "miss": 0}
+        buckets[bucket]["total"] += 1
+        if status["matched"]:
+            buckets[bucket]["hit"] += 1
+        else:
+            buckets[bucket]["miss"] += 1
+    return buckets
+
+
 def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[str, Any]:
     TreeNode.counter = 0
     allocator = RecordingAllocator()
@@ -451,7 +561,19 @@ def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[s
     pre_evict_leaves = collect_leaf_state(cache)
 
     evict_result = cache.evict(EvictParams(num_tokens=evict_tokens))
+    post_evict_leaves = collect_leaf_state(cache)
     probe_summary = compute_probe_summary(cache, scenario.post_evict_probes)
+
+    evicted_leaves = compute_evicted_set(pre_evict_leaves, post_evict_leaves)
+    regret_metrics = compute_regret_and_cost(
+        evicted_leaves,
+        scenario.post_evict_probes,
+        probe_summary["details"],
+    )
+    bucket_metrics = compute_bucket_hit_loss(
+        scenario.post_evict_probes,
+        probe_summary["details"],
+    )
 
     return {
         "policy": policy,
@@ -467,7 +589,10 @@ def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[s
             scenario.warm_events + scenario.replay_events,
         ),
         "post_evict_probe_summary": probe_summary,
-        "post_evict_leaves": collect_leaf_state(cache),
+        "post_evict_leaves": post_evict_leaves,
+        "evicted_leaves": evicted_leaves,
+        "regret_metrics": regret_metrics,
+        "bucket_hit_loss": bucket_metrics,
     }
 
 
@@ -481,6 +606,23 @@ def main():
         run_policy(policy, args.scenario, evict_tokens=args.evict_tokens)
         for policy in ["lru", "slru", "business_aware"]
     ]
+
+    # Compact comparison summary
+    print("=" * 72)
+    print(f"Scenario: {args.scenario}  (evict_tokens={args.evict_tokens})")
+    print("=" * 72)
+    for r in results:
+        regret = r["regret_metrics"]
+        print(f"\n[{r['policy']}]")
+        print(f"  evicted_tokens:     {r['evicted_tokens']}")
+        print(f"  freed_sequences:    {r['allocator_freed_sequences']}")
+        print(f"  probe hit/miss:     {r['post_evict_probe_summary']['hit_count']}/{r['post_evict_probe_summary']['miss_count']}")
+        print(f"  regret_count:       {regret['regret_count']}")
+        print(f"  extra_prefill_cost: {regret['total_extra_prefill_cost']:.1f}")
+        print(f"  bucket_hit_loss:    {r['bucket_hit_loss']}")
+    print("\n" + "=" * 72)
+    print("Full JSON below:\n")
+
     print(json.dumps(results, indent=2, ensure_ascii=False))
 
 

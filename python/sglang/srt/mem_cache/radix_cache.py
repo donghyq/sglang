@@ -851,6 +851,19 @@ class RadixCache(BasePrefixCache):
             return self.eviction_strategy.explain(node)
         return None
 
+    def set_business_metadata_from_context(self, node: TreeNode, context: dict) -> None:
+        """Formal injection entry: normalize upstream context via builder.
+
+        Upstream callers should prefer this over set_business_metadata so
+        that alias mapping, type coercion, and graceful degradation are
+        handled centrally by BusinessMetadataBuilder.
+        """
+        from sglang.srt.mem_cache.business_metadata import BusinessMetadataBuilder
+
+        builder = BusinessMetadataBuilder()
+        metadata = builder.build(context)
+        self.business_metadata_store.set_for_node(node.id, metadata)
+
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0:
             if node in self.evictable_leaves:

@@ -21,6 +21,7 @@ _bootstrap_local_sglang_import()
 
 from sglang.srt.mem_cache.business_metadata import (
     BusinessMetadata,
+    BusinessMetadataBuilder,
     BusinessMetadataStore,
 )
 from sglang.srt.mem_cache.evict_policy import BusinessAwareStrategy
@@ -124,6 +125,92 @@ class TestBusinessAwareEvictionPolicy(unittest.TestCase):
         self.assertIn("keep_score", explanation)
         self.assertIn("priority", explanation)
 
+
+
+
+class TestBusinessMetadataBuilder(unittest.TestCase):
+
+    def test_alias_mapping(self):
+        builder = BusinessMetadataBuilder()
+        metadata = builder.build({
+            'reload_cost': 5.0,
+            'reuse_len': 32.0,
+            'complete': True,
+            'biz': 'rag',
+            'sla_class': 'premium',
+            'priority': 3,
+        })
+        self.assertEqual(metadata.estimated_reload_cost, 5.0)
+        self.assertEqual(metadata.estimated_reuse_prefix_len, 32.0)
+        self.assertTrue(metadata.business_complete)
+        self.assertEqual(metadata.biz_type, 'rag')
+        self.assertEqual(metadata.sla_class, 'premium')
+        self.assertEqual(metadata.priority, 3)
+
+    def test_unknown_keys_ignored(self):
+        builder = BusinessMetadataBuilder()
+        metadata = builder.build({
+            'hot_bucket_score': 2.0,
+            'random_field': 999,
+            'another_unknown': 'test',
+        })
+        self.assertEqual(metadata.hot_bucket_score, 2.0)
+        self.assertEqual(metadata.biz_type, 'default')
+
+    def test_empty_context_degrades_to_defaults(self):
+        builder = BusinessMetadataBuilder()
+        metadata = builder.build({})
+        self.assertEqual(metadata.hot_bucket_score, 0.0)
+        self.assertFalse(metadata.business_complete)
+        self.assertEqual(metadata.sla_class, 'standard')
+
+
+class TestGracefulDegradation(unittest.TestCase):
+
+    def test_no_metadata_degrades_to_lru_like(self):
+        store = BusinessMetadataStore()
+        strategy = BusinessAwareStrategy(metadata_store=store)
+
+        baseline = time.monotonic()
+        old_node = FakeNode(id=30, last_access_time=baseline, hit_count=1)
+        new_node = FakeNode(id=31, last_access_time=baseline + 10.0, hit_count=1)
+
+        self.assertLess(
+            strategy.get_priority(old_node),
+            strategy.get_priority(new_node),
+        )
+
+    def test_sla_multiplier_bounded_effect(self):
+        store = BusinessMetadataStore()
+        strategy = BusinessAwareStrategy(metadata_store=store)
+
+        baseline = time.monotonic()
+        best_effort_node = FakeNode(id=40, last_access_time=baseline, hit_count=1)
+        premium_node = FakeNode(id=41, last_access_time=baseline, hit_count=1)
+
+        store.set_for_node(
+            best_effort_node.id,
+            BusinessMetadata(
+                hot_bucket_score=10.0,
+                estimated_reload_cost=10.0,
+                estimated_reuse_prefix_len=10.0,
+                sla_class='best_effort',
+            ),
+        )
+        store.set_for_node(
+            premium_node.id,
+            BusinessMetadata(
+                hot_bucket_score=10.0,
+                estimated_reload_cost=10.0,
+                estimated_reuse_prefix_len=10.0,
+                sla_class='premium',
+            ),
+        )
+
+        self.assertGreater(
+            strategy.get_priority(premium_node)[0],
+            strategy.get_priority(best_effort_node)[0],
+        )
 
 if __name__ == "__main__":
     unittest.main()
