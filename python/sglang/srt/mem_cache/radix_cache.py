@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.business_metadata import BusinessMetadataStore
 
 """
 Copyright 2023-2024 SGLang Team
@@ -53,6 +54,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.evict_policy import (
+    BusinessAwareStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -339,6 +341,8 @@ class RadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        self.business_metadata_store = BusinessMetadataStore()
+
         if self.eviction_policy == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
         elif self.eviction_policy == "lfu":
@@ -353,10 +357,14 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         elif self.eviction_policy == "slru":
             self.eviction_strategy: EvictionStrategy = SLRUStrategy()
+        elif self.eviction_policy == "business_aware":
+            self.eviction_strategy: EvictionStrategy = BusinessAwareStrategy(
+                metadata_store=self.business_metadata_store
+            )
 
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'business_aware'."
             )
 
         self.evictable_leaves = set()
@@ -369,6 +377,7 @@ class RadixCache(BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -377,6 +386,7 @@ class RadixCache(BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            eviction_policy=eviction_policy,
         )
         return RadixCache(params)
 
@@ -730,6 +740,7 @@ class RadixCache(BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        self.business_metadata_store.copy_for_node(child.id, new_node.id)
 
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -823,10 +834,22 @@ class RadixCache(BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
+        self.business_metadata_store.pop_for_node(node.id)
+
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
         self._update_leaf_status(node.parent)
+
+    def set_business_metadata(self, node: TreeNode, **kwargs) -> None:
+        from sglang.srt.mem_cache.business_metadata import BusinessMetadata
+
+        self.business_metadata_store.set_for_node(node.id, BusinessMetadata(**kwargs))
+
+    def get_business_metadata_explanation(self, node: TreeNode):
+        if hasattr(self.eviction_strategy, "explain"):
+            return self.eviction_strategy.explain(node)
+        return None
 
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0:

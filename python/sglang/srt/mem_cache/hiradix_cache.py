@@ -962,6 +962,11 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+    def set_business_metadata_for_node(self, node: TreeNode, **kwargs) -> None:
+        """Thin wrapper for attaching business metadata in HiCache experiments."""
+
+        self.set_business_metadata(node, **kwargs)
+
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
@@ -1405,6 +1410,7 @@ class HiRadixCache(RadixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        self.business_metadata_store.copy_for_node(child.id, new_node.id)
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
