@@ -43,6 +43,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.mem_cache.retrieval_namespace import compute_retrieval_extra_key
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,68 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
+
+
+class RetrievalCacheChunk(BaseModel):
+    """A retrieval chunk that participates in retrieval-conditioned cache reuse."""
+
+    id: str = Field(description="Stable chunk/document identifier from retrieval.")
+    content_hash: Optional[str] = Field(
+        default=None,
+        description="Optional exact content hash used to invalidate stale reusable context.",
+    )
+
+
+class RetrievalCacheSpec(BaseModel):
+    """Structured retrieval context used to derive a stable prefix-cache namespace."""
+
+    chunks: List[RetrievalCacheChunk] = Field(
+        default_factory=list,
+        description="Retrieved chunks/documents rendered into the prompt.",
+    )
+    namespace: Optional[str] = Field(
+        default=None,
+        description="Optional corpus/tenant/business namespace.",
+    )
+    template_rev: Optional[str] = Field(
+        default=None,
+        description="Prompt/render template revision used for the retrieved chunks.",
+    )
+    tokenizer_rev: Optional[str] = Field(
+        default=None,
+        description="Tokenizer revision used when rendering the retrieved chunks.",
+    )
+    render_rev: Optional[str] = Field(
+        default=None,
+        description="Revision of the retrieval rendering logic.",
+    )
+    model_name: Optional[str] = Field(
+        default=None,
+        description="Model identifier the reusable context was prepared for.",
+    )
+    model_fingerprint: Optional[str] = Field(
+        default=None,
+        description="Model fingerprint/version for exact runtime compatibility.",
+    )
+    tokenizer_fingerprint: Optional[str] = Field(
+        default=None,
+        description="Tokenizer fingerprint/version for exact compatibility.",
+    )
+    special_token_config: Optional[str] = Field(
+        default=None,
+        description="Special-token/rendering configuration hash.",
+    )
+    schema_version: Optional[str] = Field(
+        default=None,
+        description="Schema version for retrieval cache metadata.",
+    )
+    order_sensitive: bool = Field(
+        default=True,
+        description="Whether chunk order should affect the cache namespace.",
+    )
+
+    def to_extra_key(self) -> Optional[str]:
+        return compute_retrieval_extra_key(self.model_dump(exclude_none=True))
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -313,6 +376,8 @@ class CompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Structured retrieval-conditioned cache namespace
+    retrieval_cache: Optional[RetrievalCacheSpec] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -660,6 +725,8 @@ class ChatCompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Structured retrieval-conditioned cache namespace
+    retrieval_cache: Optional[RetrievalCacheSpec] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1237,6 +1304,10 @@ class ResponsesRequest(BaseModel):
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
+    )
+    retrieval_cache: Optional[RetrievalCacheSpec] = Field(
+        default=None,
+        description="Structured retrieval-conditioned cache namespace.",
     )
 
     # SGLang-specific sampling parameters

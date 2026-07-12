@@ -224,6 +224,10 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Structured retrieval-conditioned cache payload propagated from the API layer.
+    # Runtime type: Optional[dict] for a single request, or list[dict|None] for a batch.
+    retrieval_cache: Any = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -685,6 +689,11 @@ class GenerateReqInput(BaseReq):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            retrieval_cache=(
+                self.retrieval_cache[i]
+                if isinstance(self.retrieval_cache, list)
+                else self.retrieval_cache
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -768,6 +777,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # Structured retrieval-conditioned cache payload propagated from the API layer.
+    retrieval_cache: Optional[Dict[str, Any]] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

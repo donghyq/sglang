@@ -70,6 +70,21 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
+    def test_retrieval_cache_is_propagated(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            retrieval_cache={
+                "namespace": "docs",
+                "template_rev": "tpl-v1",
+                "chunks": [{"id": "doc:1", "content_hash": "hash-1"}],
+            },
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.retrieval_cache["namespace"], "docs")
+        self.assertEqual(internal.retrieval_cache["chunks"][0]["id"], "doc:1")
+
     # ---------- echo-handling ----------
     def test_echo_with_string_prompt_streaming(self):
         req = CompletionRequest(model="x", prompt="Hello", max_tokens=1, echo=True)

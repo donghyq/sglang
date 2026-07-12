@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.mem_cache.retrieval_namespace import compose_prefix_cache_extra_key
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -149,17 +150,28 @@ class OpenAIServingBase(ABC):
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
     def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
-            value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
+        """Compute the final extra_key for prefix-cache namespace isolation.
+
+        The composition is conservative and order-stable:
+        1. explicit cache_salt
+        2. structured retrieval-conditioned cache namespace
+        3. explicit extra_key
+        """
+        cache_salt = getattr(request, "cache_salt", None)
+        extra_key = getattr(request, "extra_key", None)
+        for key, value in [("cache_salt", cache_salt), ("extra_key", extra_key)]:
+            if value and not isinstance(value, str):
+                raise TypeError(
+                    f"Value of {key} must be a string, but got {type(value).__name__}"
+                )
+
+        retrieval_cache = getattr(request, "retrieval_cache", None)
+        retrieval_payload = (
+            retrieval_cache.model_dump(exclude_none=True)
+            if retrieval_cache is not None
+            else None
+        )
+        return compose_prefix_cache_extra_key(cache_salt, retrieval_payload, extra_key)
 
     @abstractmethod
     def _convert_to_internal_request(

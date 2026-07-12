@@ -141,6 +141,41 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_retrieval_cache_is_propagated(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            retrieval_cache={
+                "namespace": "waimai-poi",
+                "template_rev": "tpl-v3",
+                "chunks": [{"id": "poi:1001", "content_hash": "hash-a"}],
+            },
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_ins.image_data = conv_ins.audio_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = ["</s>"]
+            conv_mock.return_value = conv_ins
+
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(req)
+            self.assertEqual(adapted.retrieval_cache["namespace"], "waimai-poi")
+            self.assertEqual(adapted.retrieval_cache["chunks"][0]["id"], "poi:1001")
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None
