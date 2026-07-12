@@ -22,6 +22,7 @@ import argparse
 import enum
 import hashlib
 import json
+import time
 import sys
 import types
 import unittest.mock
@@ -161,6 +162,7 @@ class ScenarioEvent:
     business_complete: bool = False
     biz_type: str = "default"
     sla_class: str = "standard"
+    tenant: str = "default"
 
 
 @dataclass
@@ -315,7 +317,74 @@ SCENARIOS: Dict[str, ScenarioSpec] = {
             ),
         ],
     ),
+    "hotset_shift": ScenarioSpec(
+        warm_events=[
+            ScenarioEvent("old_hot_a", [601, 602, 603, 604], 8.0, 0.0, 6.0, 16.0, biz_type="legacy_hot"),
+            ScenarioEvent("old_hot_b", [611, 612, 613, 614], 8.0, 0.0, 6.0, 16.0, biz_type="legacy_hot"),
+            ScenarioEvent("new_hot_a", [621, 622, 623, 624], 1.0, 5.0, 6.0, 16.0, biz_type="new_hot"),
+            ScenarioEvent("cold_tail", [631, 632, 633, 634], 0.0, 0.0, 1.0, 4.0),
+        ],
+        replay_events=[
+            ScenarioEvent("new_hot_a", [621, 622, 623, 624], 1.0, 5.0, 6.0, 16.0, biz_type="new_hot"),
+            ScenarioEvent("new_hot_b", [641, 642, 643, 644], 1.0, 5.0, 6.0, 16.0, biz_type="new_hot"),
+        ],
+        post_evict_probes=[
+            ScenarioEvent("new_hot_a_probe", [621, 622, 623, 624], 1.0, 5.0, 6.0, 16.0, biz_type="new_hot"),
+            ScenarioEvent("new_hot_b_probe", [641, 642, 643, 644], 1.0, 5.0, 6.0, 16.0, biz_type="new_hot"),
+            ScenarioEvent("old_hot_a_probe", [601, 602, 603, 604], 8.0, 0.0, 6.0, 16.0, biz_type="legacy_hot"),
+        ],
+    ),
+    "short_burst": ScenarioSpec(
+        warm_events=[
+            ScenarioEvent("stable_valuable", [701, 702, 703, 704], 2.0, 0.0, 20.0, 24.0, biz_type="stable"),
+            ScenarioEvent("burst_1", [711, 712, 713, 714], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+            ScenarioEvent("burst_2", [721, 722, 723, 724], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+            ScenarioEvent("burst_3", [731, 732, 733, 734], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+        ],
+        replay_events=[
+            ScenarioEvent("burst_3", [731, 732, 733, 734], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+            ScenarioEvent("burst_4", [741, 742, 743, 744], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+        ],
+        post_evict_probes=[
+            ScenarioEvent("stable_valuable_probe", [701, 702, 703, 704], 2.0, 0.0, 20.0, 24.0, biz_type="stable"),
+            ScenarioEvent("burst_4_probe", [741, 742, 743, 744], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+            ScenarioEvent("burst_3_probe", [731, 732, 733, 734], 0.0, 0.0, 1.0, 4.0, biz_type="burst"),
+        ],
+    ),
+    "long_vs_short_prefix": ScenarioSpec(
+        warm_events=[
+            ScenarioEvent("long_prefix", [801, 802, 803, 804, 805, 806, 807, 808], 1.0, 0.0, 30.0, 64.0, biz_type="long_prefix"),
+            ScenarioEvent("short_recent", [811, 812, 813, 814], 0.0, 0.0, 1.0, 4.0, business_complete=True, biz_type="short_prefix"),
+            ScenarioEvent("cold_x", [821, 822, 823, 824], 0.0, 0.0, 1.0, 4.0),
+            ScenarioEvent("cold_y", [831, 832, 833, 834], 0.0, 0.0, 1.0, 4.0),
+        ],
+        replay_events=[
+            ScenarioEvent("short_recent", [811, 812, 813, 814], 0.0, 0.0, 1.0, 4.0, business_complete=True, biz_type="short_prefix"),
+            ScenarioEvent("pressure_insert", [841, 842, 843, 844], 0.0, 0.0, 1.0, 4.0),
+        ],
+        post_evict_probes=[
+            ScenarioEvent("long_prefix_probe", [801, 802, 803, 804, 805, 806, 807, 808], 1.0, 0.0, 30.0, 64.0, biz_type="long_prefix"),
+            ScenarioEvent("short_recent_probe", [811, 812, 813, 814], 0.0, 0.0, 1.0, 4.0, business_complete=True, biz_type="short_prefix"),
+        ],
+    ),
+    "tenant_fairness": ScenarioSpec(
+        warm_events=[
+            ScenarioEvent("tenant_a_valuable", [901, 902, 903, 904], 3.0, 0.0, 12.0, 16.0, biz_type="tenant_a", tenant="tenant_a"),
+            ScenarioEvent("tenant_b_valuable", [911, 912, 913, 914], 3.0, 0.0, 12.0, 16.0, biz_type="tenant_b", tenant="tenant_b"),
+            ScenarioEvent("tenant_a_cold", [921, 922, 923, 924], 0.0, 0.0, 1.0, 4.0, biz_type="tenant_a", tenant="tenant_a"),
+            ScenarioEvent("tenant_b_cold", [931, 932, 933, 934], 0.0, 0.0, 1.0, 4.0, biz_type="tenant_b", tenant="tenant_b"),
+        ],
+        replay_events=[
+            ScenarioEvent("tenant_b_valuable", [911, 912, 913, 914], 3.0, 0.0, 12.0, 16.0, biz_type="tenant_b", tenant="tenant_b"),
+            ScenarioEvent("pressure_insert", [941, 942, 943, 944], 0.0, 0.0, 1.0, 4.0, biz_type="shared", tenant="shared"),
+        ],
+        post_evict_probes=[
+            ScenarioEvent("tenant_a_valuable_probe", [901, 902, 903, 904], 3.0, 0.0, 12.0, 16.0, biz_type="tenant_a", tenant="tenant_a"),
+            ScenarioEvent("tenant_b_valuable_probe", [911, 912, 913, 914], 3.0, 0.0, 12.0, 16.0, biz_type="tenant_b", tenant="tenant_b"),
+        ],
+    ),
 }
+
 
 
 class RecordingAllocator(unittest.mock.Mock):
@@ -356,6 +425,7 @@ def insert_event(cache: RadixCache, event: ScenarioEvent):
         business_complete=event.business_complete,
         biz_type=event.biz_type,
         sla_class=event.sla_class,
+        tenant=event.tenant,
     )
     return node
 
@@ -419,6 +489,7 @@ def collect_leaf_state(cache: RadixCache) -> List[dict[str, Any]]:
                     "biz_type": raw_metadata.biz_type,
                     "sla_class": raw_metadata.sla_class,
                     "priority": raw_metadata.priority,
+                    "tenant": raw_metadata.tenant,
                 } if raw_metadata is not None else None,
             }
             leaves.append(item)
@@ -537,6 +608,45 @@ def compute_bucket_hit_loss(
     return buckets
 
 
+
+def compute_recomputed_tokens(
+    evicted_leaves: List[dict[str, Any]],
+    probe_events: List[ScenarioEvent],
+    probe_statuses: List[dict[str, Any]],
+) -> int:
+    evicted_token_keys = {_leaf_token_key(leaf["tokens"]) for leaf in evicted_leaves}
+    recomputed = 0
+    for event, status in zip(probe_events, probe_statuses):
+        if status["matched"]:
+            continue
+        if tuple(event.token_ids) in evicted_token_keys:
+            recomputed += len(event.token_ids)
+    return recomputed
+
+
+def estimate_metadata_memory_overhead(leaves: List[dict[str, Any]]) -> int:
+    total = 0
+    for leaf in leaves:
+        raw = leaf.get("raw_metadata")
+        if raw is None:
+            continue
+        total += len(json.dumps(raw, sort_keys=True, ensure_ascii=True).encode("utf-8"))
+    return total
+
+
+def compute_tenant_hit_loss(
+    probe_events: List[ScenarioEvent],
+    probe_statuses: List[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    tenants: Dict[str, dict[str, int]] = {}
+    for event, status in zip(probe_events, probe_statuses):
+        tenant = event.tenant
+        if tenant not in tenants:
+            tenants[tenant] = {"total": 0, "hit": 0, "miss": 0}
+        tenants[tenant]["total"] += 1
+        tenants[tenant]["hit" if status["matched"] else "miss"] += 1
+    return tenants
+
 def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[str, Any]:
     TreeNode.counter = 0
     allocator = RecordingAllocator()
@@ -560,7 +670,9 @@ def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[s
     replay_logs = replay_accesses(cache, scenario.replay_events)
     pre_evict_leaves = collect_leaf_state(cache)
 
+    eviction_start = time.perf_counter()
     evict_result = cache.evict(EvictParams(num_tokens=evict_tokens))
+    eviction_latency_ms = (time.perf_counter() - eviction_start) * 1000.0
     post_evict_leaves = collect_leaf_state(cache)
     probe_summary = compute_probe_summary(cache, scenario.post_evict_probes)
 
@@ -574,6 +686,16 @@ def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[s
         scenario.post_evict_probes,
         probe_summary["details"],
     )
+    tenant_metrics = compute_tenant_hit_loss(
+        scenario.post_evict_probes,
+        probe_summary["details"],
+    )
+    recomputed_tokens = compute_recomputed_tokens(
+        evicted_leaves,
+        scenario.post_evict_probes,
+        probe_summary["details"],
+    )
+    metadata_memory_overhead_bytes = estimate_metadata_memory_overhead(pre_evict_leaves)
 
     return {
         "policy": policy,
@@ -593,6 +715,10 @@ def run_policy(policy: str, scenario_name: str, evict_tokens: int = 4) -> dict[s
         "evicted_leaves": evicted_leaves,
         "regret_metrics": regret_metrics,
         "bucket_hit_loss": bucket_metrics,
+        "tenant_hit_loss": tenant_metrics,
+        "recomputed_tokens": recomputed_tokens,
+        "eviction_decision_latency_ms": eviction_latency_ms,
+        "metadata_memory_overhead_bytes": metadata_memory_overhead_bytes,
     }
 
 
@@ -619,7 +745,11 @@ def main():
         print(f"  probe hit/miss:     {r['post_evict_probe_summary']['hit_count']}/{r['post_evict_probe_summary']['miss_count']}")
         print(f"  regret_count:       {regret['regret_count']}")
         print(f"  extra_prefill_cost: {regret['total_extra_prefill_cost']:.1f}")
+        print(f"  recomputed_tokens:  {r['recomputed_tokens']}")
+        print(f"  evict_latency_ms:   {r['eviction_decision_latency_ms']:.3f}")
+        print(f"  metadata_overhead:  {r['metadata_memory_overhead_bytes']} bytes")
         print(f"  bucket_hit_loss:    {r['bucket_hit_loss']}")
+        print(f"  tenant_hit_loss:    {r['tenant_hit_loss']}")
     print("\n" + "=" * 72)
     print("Full JSON below:\n")
 
