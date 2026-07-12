@@ -100,6 +100,32 @@ class BusinessMetadataBuilder:
         }
     )
 
+    def _coerce_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _coerce_bool(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+            return default
+        if value is None:
+            return default
+        return bool(value)
+
     def build(self, context: Mapping[str, Any]) -> BusinessMetadata:
         normalized: Dict[str, Any] = {}
         for raw_key, value in context.items():
@@ -108,21 +134,27 @@ class BusinessMetadataBuilder:
                 normalized[key] = value
 
         if "hot_bucket_score" in normalized:
-            normalized["hot_bucket_score"] = float(normalized["hot_bucket_score"])
+            normalized["hot_bucket_score"] = self._coerce_float(
+                normalized["hot_bucket_score"]
+            )
         if "time_window_score" in normalized:
-            normalized["time_window_score"] = float(normalized["time_window_score"])
+            normalized["time_window_score"] = self._coerce_float(
+                normalized["time_window_score"]
+            )
         if "estimated_reload_cost" in normalized:
-            normalized["estimated_reload_cost"] = float(
+            normalized["estimated_reload_cost"] = self._coerce_float(
                 normalized["estimated_reload_cost"]
             )
         if "estimated_reuse_prefix_len" in normalized:
-            normalized["estimated_reuse_prefix_len"] = float(
+            normalized["estimated_reuse_prefix_len"] = self._coerce_float(
                 normalized["estimated_reuse_prefix_len"]
             )
         if "business_complete" in normalized:
-            normalized["business_complete"] = bool(normalized["business_complete"])
+            normalized["business_complete"] = self._coerce_bool(
+                normalized["business_complete"]
+            )
         if "priority" in normalized:
-            normalized["priority"] = int(normalized["priority"])
+            normalized["priority"] = self._coerce_int(normalized["priority"])
         if "biz_type" in normalized:
             normalized["biz_type"] = str(normalized["biz_type"])
         if "sla_class" in normalized:

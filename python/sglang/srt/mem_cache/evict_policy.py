@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import math
 from typing import TYPE_CHECKING, Tuple, Union
 
 from sglang.srt.mem_cache.business_metadata import (
@@ -83,6 +84,11 @@ class BusinessAwareStrategy(EvictionStrategy):
         time_window_weight: float = 0.5,
         business_complete_penalty: float = 5.0,
         priority_weight: float = 0.5,
+        max_hot_bucket_adjustment: float = 100.0,
+        max_time_window_adjustment: float = 50.0,
+        max_reload_cost_adjustment: float = 100.0,
+        max_reuse_prefix_adjustment: float = 100.0,
+        max_priority_adjustment: float = 10.0,
     ):
         self.metadata_store = metadata_store
         self.recency_weight = recency_weight
@@ -93,6 +99,25 @@ class BusinessAwareStrategy(EvictionStrategy):
         self.time_window_weight = time_window_weight
         self.business_complete_penalty = business_complete_penalty
         self.priority_weight = priority_weight
+        self.max_hot_bucket_adjustment = max_hot_bucket_adjustment
+        self.max_time_window_adjustment = max_time_window_adjustment
+        self.max_reload_cost_adjustment = max_reload_cost_adjustment
+        self.max_reuse_prefix_adjustment = max_reuse_prefix_adjustment
+        self.max_priority_adjustment = max_priority_adjustment
+
+    @staticmethod
+    def _sanitize_score(value: float) -> float:
+        if not math.isfinite(value):
+            return 0.0
+        return value
+
+    def _bounded_adjustment(self, value: float, weight: float, max_abs: float) -> float:
+        adjustment = self._sanitize_score(value) * weight
+        if adjustment > max_abs:
+            return max_abs
+        if adjustment < -max_abs:
+            return -max_abs
+        return adjustment
 
     def _compute_keep_score(self, node: "TreeNode") -> float:
         metadata = self.metadata_store.get_for_node(node.id)
@@ -110,11 +135,31 @@ class BusinessAwareStrategy(EvictionStrategy):
         keep_score = (
             self.recency_weight * node.last_access_time
             + self.frequency_weight * node.hit_count
-            + self.reuse_prefix_weight * metadata.estimated_reuse_prefix_len
-            + self.reload_cost_weight * metadata.estimated_reload_cost
-            + self.hot_bucket_weight * metadata.hot_bucket_score
-            + self.time_window_weight * metadata.time_window_score
-            + self.priority_weight * metadata.priority
+            + self._bounded_adjustment(
+                metadata.estimated_reuse_prefix_len,
+                self.reuse_prefix_weight,
+                self.max_reuse_prefix_adjustment,
+            )
+            + self._bounded_adjustment(
+                metadata.estimated_reload_cost,
+                self.reload_cost_weight,
+                self.max_reload_cost_adjustment,
+            )
+            + self._bounded_adjustment(
+                metadata.hot_bucket_score,
+                self.hot_bucket_weight,
+                self.max_hot_bucket_adjustment,
+            )
+            + self._bounded_adjustment(
+                metadata.time_window_score,
+                self.time_window_weight,
+                self.max_time_window_adjustment,
+            )
+            + self._bounded_adjustment(
+                metadata.priority,
+                self.priority_weight,
+                self.max_priority_adjustment,
+            )
         )
         keep_score *= sla_mult
 
