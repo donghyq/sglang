@@ -151,6 +151,13 @@ class RetrievalCacheChunk(BaseModel):
         default=None,
         description="Optional exact content hash used to invalidate stale reusable context.",
     )
+    text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional exact rendered chunk text for P1.5 runtime rendered-prefix reuse. "
+            "When absent, retrieval namespace remains planning/observability only."
+        ),
+    )
 
 
 class RetrievalCacheSpec(BaseModel):

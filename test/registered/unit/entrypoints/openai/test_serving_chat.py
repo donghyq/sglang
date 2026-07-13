@@ -176,6 +176,148 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.retrieval_cache["namespace"], "waimai-poi")
             self.assertEqual(adapted.retrieval_cache["chunks"][0]["id"], "poi:1001")
 
+    def test_retrieval_runtime_prefix_is_rendered_for_chat_prompt(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            retrieval_cache={
+                "namespace": "waimai-poi",
+                "template_rev": "tpl-v3",
+                "render_rev": "render-v1",
+                "schema_version": "schema-v1",
+                "chunks": [
+                    {
+                        "id": "poi:1001",
+                        "content_hash": "hash-a",
+                        "text": "门店信息：支持自取",
+                    }
+                ],
+            },
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_ins.image_data = conv_ins.audio_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = ["</s>"]
+            conv_mock.return_value = conv_ins
+
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                "Test prompt",
+                None,
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(req)
+            mutated_message = req.messages[0]
+            self.assertIsInstance(mutated_message.content, str)
+            self.assertIn("<<retrieval-prefix>>", mutated_message.content)
+            self.assertIn("门店信息：支持自取", mutated_message.content)
+            self.assertTrue(mutated_message.content.endswith("Hi?"))
+            self.assertEqual(adapted.text, "Test prompt")
+
+    def test_retrieval_runtime_prefix_applies_before_tokenized_chat_path(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            retrieval_cache={
+                "namespace": "waimai-poi",
+                "template_rev": "tpl-v3",
+                "render_rev": "render-v1",
+                "schema_version": "schema-v1",
+                "chunks": [
+                    {
+                        "id": "poi:1001",
+                        "content_hash": "hash-a",
+                        "text": "门店信息：支持自取",
+                    }
+                ],
+            },
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_ins.image_data = conv_ins.audio_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = ["</s>"]
+            conv_mock.return_value = conv_ins
+
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(req)
+            mutated_message = req.messages[0]
+            self.assertIsInstance(mutated_message.content, str)
+            self.assertIn("<<retrieval-prefix>>", mutated_message.content)
+            self.assertEqual(adapted.input_ids, [1, 2, 3])
+
+    def test_retrieval_runtime_prefix_supports_multimodal_user_content_parts(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "帮我看下这张图"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/a.png"},
+                        },
+                    ],
+                }
+            ],
+            retrieval_cache={
+                "namespace": "waimai-poi",
+                "template_rev": "tpl-v3",
+                "render_rev": "render-v1",
+                "schema_version": "schema-v1",
+                "chunks": [
+                    {
+                        "id": "poi:1001",
+                        "content_hash": "hash-a",
+                        "text": "门店信息：支持自取",
+                    }
+                ],
+            },
+        )
+
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+
+            self.chat._convert_to_internal_request(req)
+            mutated_parts = req.messages[0].content
+            self.assertIsInstance(mutated_parts, list)
+            self.assertEqual(mutated_parts[0]["type"], "text")
+            self.assertIn("<<retrieval-prefix>>", mutated_parts[0]["text"])
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None

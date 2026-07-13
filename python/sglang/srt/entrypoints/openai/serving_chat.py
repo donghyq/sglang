@@ -50,6 +50,9 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.mem_cache.retrieval_runtime_prefix import (
+    prepend_retrieval_prefix_to_chat_messages,
+)
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -356,6 +359,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+
+        if request.retrieval_cache is not None:
+            request.messages = prepend_retrieval_prefix_to_chat_messages(
+                [message.model_dump(exclude_none=True) for message in request.messages],
+                request.retrieval_cache.model_dump(exclude_none=True),
+            )
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)

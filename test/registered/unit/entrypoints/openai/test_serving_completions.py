@@ -85,6 +85,44 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.retrieval_cache["namespace"], "docs")
         self.assertEqual(internal.retrieval_cache["chunks"][0]["id"], "doc:1")
 
+    def test_retrieval_runtime_prefix_is_rendered_for_text_prompt(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="用户问题：这家店营业到几点？",
+            max_tokens=100,
+            retrieval_cache={
+                "namespace": "docs",
+                "template_rev": "tpl-v1",
+                "render_rev": "render-v1",
+                "schema_version": "schema-v1",
+                "chunks": [
+                    {
+                        "id": "doc:1",
+                        "content_hash": "hash-1",
+                        "text": "店铺营业时间：09:00-22:00",
+                    }
+                ],
+            },
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertIn("<<retrieval-prefix>>", internal.text)
+        self.assertIn("店铺营业时间：09:00-22:00", internal.text)
+        self.assertTrue(internal.text.endswith("用户问题：这家店营业到几点？"))
+
+    def test_retrieval_runtime_prefix_fail_closed_without_chunk_text(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            retrieval_cache={
+                "namespace": "docs",
+                "template_rev": "tpl-v1",
+                "chunks": [{"id": "doc:1", "content_hash": "hash-1"}],
+            },
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.text, "Hello world")
+
     # ---------- echo-handling ----------
     def test_echo_with_string_prompt_streaming(self):
         req = CompletionRequest(model="x", prompt="Hello", max_tokens=1, echo=True)

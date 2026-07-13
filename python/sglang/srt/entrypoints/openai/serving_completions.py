@@ -27,6 +27,9 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.mem_cache.retrieval_runtime_prefix import (
+    prepend_retrieval_runtime_prefix,
+)
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
@@ -77,6 +80,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
             prompt = generate_completion_prompt_from_request(request)
+
+        if request.retrieval_cache is not None:
+            prompt = prepend_retrieval_runtime_prefix(
+                prompt,
+                request.retrieval_cache.model_dump(exclude_none=True),
+            )
 
         # Set logprob start length based on echo and logprobs
         if request.echo and request.logprobs:

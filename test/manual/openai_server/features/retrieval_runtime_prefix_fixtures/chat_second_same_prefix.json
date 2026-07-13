@@ -1,0 +1,35 @@
+{
+  "model": "__SET_MODEL__",
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是外卖门店助手。"
+    },
+    {
+      "role": "user",
+      "content": "B问题：这家店支持夜宵吗？"
+    }
+  ],
+  "max_tokens": 1,
+  "temperature": 0,
+  "cache_salt": "__SET_CACHE_SALT__",
+  "retrieval_cache": {
+    "namespace": "waimai-chat",
+    "template_rev": "tpl-chat-v1",
+    "render_rev": "render-v1",
+    "schema_version": "schema-v1",
+    "order_sensitive": true,
+    "chunks": [
+      {
+        "id": "poi:1001",
+        "content_hash": "hash-hours-v1",
+        "text": "门店营业时间：09:00-22:00"
+      },
+      {
+        "id": "poi:1002",
+        "content_hash": "hash-service-v1",
+        "text": "服务信息：支持自取和堂食"
+      }
+    ]
+  }
+}
