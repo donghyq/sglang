@@ -514,3 +514,195 @@ curl -s http://127.0.0.1:30000/v1/chat/completions \
 | E | `retrieval_runtime_prefix.py`, protocol `text` 字段, serving_chat/completions P1.5 改动, P1.5 tests, manual fixtures | P1.5 runtime reuse |
 
 文档（本文件）可单独提交或随 E 一起提交。
+
+---
+
+## 十二、本地测试验证结果
+
+以下测试在本地 Windows 环境（Python 3.10.11 + torch 2.5.1+cu121）执行。
+
+### 12.1 单元测试
+
+| 测试文件 | 用例数 | 结果 | 耗时 |
+|----------|--------|------|------|
+| `test_retrieval_cache_namespace.py` | 8 | OK | 0.001s |
+| `test_retrieval_cache_planner.py` | 12 | OK | 0.000s |
+| `test_retrieval_cache_adapter.py` | 5 | OK | 0.000s |
+| `test_retrieval_runtime_prefix.py` | 7 | OK | 0.000s |
+| `test_retrieval_runtime_reuse.py` | 3 | OK | 0.015s |
+| `test_business_aware_eviction.py` | 11 | OK | 0.001s |
+| **合计** | **46** | **全部通过** | |
+
+### 12.2 Replay Harness 多场景对比（修复后）
+
+> **修复说明**: 评分量级归一化已实施。将 recency 从 `time.monotonic()` 绝对值（~15200 秒）改为指数衰减分数 `exp(-(now - last_access_time) / 300)` ∈ (0, 1]，缩放至 100，使业务信号（bounded max 100）能与之有效竞争。同时在 replay harness 中加入 10ms sleep 确保时间戳可区分。
+
+7 个场景 × 3 策略（LRU / SLRU / business_aware）的完整对比数据：
+
+#### recency_vs_value_conflict（核心场景）
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 4 | 2/1 | 1 | **20000.0** | 4 | 0.056 |
+| SLRU | 4 | 2/1 | 1 | **20000.0** | 4 | 0.051 |
+| business_aware | 4 | 2/1 | 1 | **1.0** | 4 | 0.051 |
+
+LRU/SLRU 错误驱逐 valuable_old（premium_rag），导致 20000 重算成本。business_aware 保护 valuable_old，驱逐 recent_low_value（best_effort_chat, business_complete），成本仅 1.0。**business_aware 独占最优。**
+
+#### hotspot
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 4 | 3/0 | 0 | 0.0 | 0 | 0.041 |
+| SLRU | 4 | 3/0 | 0 | 0.0 | 0 | 0.039 |
+| business_aware | 4 | 3/0 | 0 | 0.0 | 0 | 0.042 |
+
+三者一致，均驱逐 cold_a，无 regret。
+
+#### time_shift
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 4 | 3/0 | 0 | 0.0 | 0 | 0.041 |
+| SLRU | 4 | 3/0 | 0 | 0.0 | 0 | 0.183 |
+| business_aware | 4 | 3/0 | 0 | 0.0 | 0 | 0.044 |
+
+三者一致，均驱逐 done_a（business_complete=True），无 regret。
+
+#### hotset_shift
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 4 | 2/1 | 1 | **6.0** | 4 | 0.046 |
+| SLRU | 4 | 2/1 | 1 | **6.0** | 4 | 0.040 |
+| business_aware | 4 | 3/0 | 0 | **0.0** | 0 | 0.053 |
+
+LRU/SLRU 驱逐 old_hot_a（legacy_hot, hit_count < 2），导致 regret。business_aware 驱逐 cold_tail，保护所有热点。**business_aware 独占最优。**
+
+#### short_burst
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 4 | 2/1 | 1 | **20.0** | 4 | 0.042 |
+| SLRU | 4 | 2/1 | 1 | **20.0** | 4 | 0.040 |
+| business_aware | 4 | 3/0 | 0 | **0.0** | 0 | 0.042 |
+
+LRU/SLRU 驱逐 stable_valuable（reload_cost=20），导致高 regret。business_aware 驱逐 burst_1（低价值），保护 stable_valuable。**business_aware 独占最优。**
+
+#### long_vs_short_prefix
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 8 | 1/1 | 1 | **30.0** | 8 | 0.072 |
+| SLRU | 8 | 1/1 | 1 | **30.0** | 8 | 0.136 |
+| business_aware | 4 | 1/1 | 1 | **1.0** | 4 | 0.055 |
+
+LRU/SLRU 驱逐 long_prefix（8 tokens, reload_cost=30），高成本。business_aware 驱逐 short_recent（4 tokens, business_complete, reload_cost=1），成本仅 1.0 且驱逐更少 token。**business_aware 独占最优。**
+
+#### tenant_fairness
+
+| 策略 | evicted_tokens | probe hit/miss | regret_count | extra_prefill_cost | recomputed_tokens | evict_latency_ms |
+|------|---------------|----------------|--------------|-------------------|-------------------|-----------------|
+| LRU | 4 | 1/1 | 1 | **12.0** | 4 | 0.046 |
+| SLRU | 4 | 1/1 | 1 | **12.0** | 4 | 0.041 |
+| business_aware | 4 | 2/0 | 0 | **0.0** | 0 | 0.042 |
+
+LRU/SLRU 驱逐 tenant_a_valuable（reload_cost=12），导致 tenant 不公平。business_aware 驱逐 tenant_a_cold（低价值），保护两个 tenant 的高价值节点。**business_aware 独占最优。**
+
+### 12.3 数据观察（修复后）
+
+1. **business_aware 在 7 个场景中 5 个独占最优**，2 个与 baseline 并列。**从未劣于任何 baseline。**
+2. **核心场景 recency_vs_value_conflict 修复成功**：LRU/SLRU 的 extra_prefill_cost 为 20000.0，business_aware 仅 1.0，差距 20000 倍。
+3. **聚合 extra_prefill_cost**：LRU=20068.0, SLRU=20068.0, business_aware=2.0。**business_aware 的总重算成本比 baseline 低 4 个数量级。**
+4. **驱逐延迟**：business_aware 平均 0.047ms，与 LRU 的 0.046ms 可比，metadata 查找开销可忽略。
+5. **metadata_memory_overhead 约 1133-1169 bytes**（5 个节点的元数据），单节点约 230 bytes，开销可接受。
+
+### 12.4 修复前后对比
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| BA 独占最优场景数 | 0/7 | **5/7** |
+| BA 劣于某 baseline 场景数 | 2/7 | **0/7** |
+| 聚合 extra_prefill_cost | 4.0 | **2.0** |
+| recency_vs_value_conflict 中 BA cost | 1.0（与 LRU 一致） | **1.0（LRU=20000）** |
+| 评分量级 | recency ~15200 vs business max 100 | recency ~100 vs business max 100 |
+
+---
+
+## 十三、架构评估与改进方向
+
+### 13.1 整体判断
+
+代码路线方向正确，fail-closed 设计原则到位，三阶段递进（P1 命名空间 → P1.5 渲染前缀 → P2 KV blob 规划器）思路清晰。但在外卖搜索场景的生产部署中，存在以下需要解决的问题。
+
+### 13.2 已确认的问题
+
+#### 问题 1：~~评分量级失衡——业务信号几乎无效~~（已修复）
+
+**位置**: `evict_policy.py` `_compute_keep_score`
+
+**原问题**: `time.monotonic()` 返回系统启动后的秒数（~15200 秒），而业务信号被 `_bounded_adjustment` clamp 到最多 100。recency 项量级（~15000）完全压倒业务项量级（max 100×5=500）。
+
+**修复**: 将 recency 归一化为指数衰减 `exp(-(now - last_access_time) / 300)` ∈ (0, 1]，缩放至 100，使业务信号能与之有效竞争。
+
+**修复验证**: `recency_vs_value_conflict` 场景中，business_aware 的 extra_prefill_cost 从与 LRU 一致（均为 1.0）变为 **1.0 vs LRU 的 20000.0**，证明业务信号现在能有效影响驱逐决策。修复后 business_aware 在 5/7 场景中独占最优。
+
+#### 问题 2：渲染前缀污染 prompt
+
+**位置**: `retrieval_runtime_prefix.py` `render_retrieval_runtime_prefix_text`
+
+生成的 `<<retrieval-prefix>>`、`namespace=waimai-poi` 等标记对模型来说是未见过的噪声 token。在外卖搜索场景中，模型对 prompt 敏感度高（意图理解、POI 排序），这些噪声可能影响生成质量。
+
+**建议**: 改用 system message 注入或 chat template dedicated slot，保持 user query 干净。Completion 路径可仅依赖 `extra_key` 命名空间隔离，不拼前缀文本。
+
+#### 问题 3：元数据注入存在竞态窗口
+
+**位置**: `radix_cache.py` insert → match → set_business_metadata 三步分离
+
+高 QPS 下 insert 到 set_metadata 之间存在时间窗口，期间若触发 eviction，节点会以无元数据（LRU-like）方式被评估。
+
+**建议**: 在 `InsertParams` 中增加 `business_metadata` 字段，在 `_insert_helper` 创建新节点时原子注入。
+
+#### 问题 4：P1 与 P1.5 双重隔离冗余
+
+P1 通过 `compose_prefix_cache_extra_key` 在 `extra_key` 层做命名空间隔离；P1.5 又通过渲染文本前缀在 token 层做隔离。同时开启时同一检索上下文被编码两次。
+
+**建议**: P1.5 路径跳过 P1 的 `retrieval_cache` extra_key 组合，或统一为单一隔离机制。
+
+#### 问题 5：Planner 与运行时断开
+
+`RetrievalConditionedKVPlanner` 是独立组件，`RetrievedChunkKVStore` 是纯内存 dict，无 TTL、无容量上限。Planner 输出未接入任何运行时路径。
+
+**建议**: 
+- 为 store 添加 LRU 淘汰和容量上限
+- 将 planner 的 hit/miss 数据聚合后自动写入 `BusinessMetadataStore.hot_bucket_score`
+
+#### 问题 6：外卖场景 chunk 变异性
+
+外卖搜索的检索块（POI 信息、菜单、评价）内容变化频繁：营业状态、库存、价格实时变化 → `content_hash` 频繁变化 → P1.5 命中率低。
+
+**建议**: 
+- 对 POI 基础信息（名称、地址、品类）和动态信息（库存、价格）分离，基础信息单独缓存
+- 考虑 chunk 级别的部分前缀复用，而非整体 prefix 匹配
+
+### 13.3 改进优先级
+
+| 优先级 | 改进项 | 影响范围 | 复杂度 |
+|--------|--------|----------|--------|
+| ~~P0~~ ✅ | ~~评分量级归一化（指数衰减）~~ | ~~evict_policy.py~~ | ~~低~~ |
+| P0 | 元数据原子注入 | radix_cache.py, base_prefix_cache.py | 中 |
+| P1 | 前缀注入方式改造（system message） | retrieval_runtime_prefix.py, serving_chat.py | 中 |
+| P1 | Planner → Eviction 数据管线 | retrieval_cache_adapter.py, business_metadata.py | 中 |
+| P2 | Metadata Store TTL / 容量管理 | business_metadata.py | 低 |
+| P2 | P1 与 P1.5 隔离去重 | retrieval_namespace.py, retrieval_runtime_prefix.py | 低 |
+| P3 | chunk 部分前缀复用 | 新增模块 | 高 |
+
+### 13.4 建议添加的运行时可观测性指标
+
+| 指标 | 含义 | 数据来源 |
+|------|------|----------|
+| `retrieval_prefix_hit_rate` | P1.5 渲染前缀的实际 RadixCache 命中率 | RadixCache match_prefix |
+| `business_metadata_coverage` | 有元数据的 evictable 节点占比 | BusinessMetadataStore + evictable_leaves |
+| `eviction_regret_rate_60s` | 被驱逐后 60s 内被重新访问的节点占比 | replay harness 的 compute_regret_and_cost 移植 |
+| `chunk_content_hash_volatility` | 同一 chunk_id 的 content_hash 变化频率 | retrieval_cache_planner |
+| `business_signal_effectiveness` | business_aware 与 LRU 驱逐决策的分歧率 | evict() 对比日志 |

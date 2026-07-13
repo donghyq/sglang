@@ -413,7 +413,7 @@ def insert_event(cache: RadixCache, event: ScenarioEvent):
     key = RadixKey(event.token_ids)
     value = torch.tensor(event.token_ids, dtype=torch.int64)
     cache.insert(InsertParams(key=key, value=value))
-
+    time.sleep(0.01)  # ensure monotonic clock advances between inserts
     match_result = cache.match_prefix(MatchPrefixParams(key=key))
     node = match_result.last_device_node
     cache.set_business_metadata(
@@ -432,6 +432,7 @@ def insert_event(cache: RadixCache, event: ScenarioEvent):
 
 def touch_event(cache: RadixCache, event: ScenarioEvent) -> dict[str, Any]:
     key = RadixKey(event.token_ids)
+    time.sleep(0.01)  # ensure monotonic clock advances before touch
     result = cache.match_prefix(MatchPrefixParams(key=key))
     matched = len(result.device_indices) == len(event.token_ids)
     explanation = None

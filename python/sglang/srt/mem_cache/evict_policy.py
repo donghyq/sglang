@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import math
+import time
 from typing import TYPE_CHECKING, Tuple, Union
 
 from sglang.srt.mem_cache.business_metadata import (
@@ -89,6 +90,8 @@ class BusinessAwareStrategy(EvictionStrategy):
         max_reload_cost_adjustment: float = 100.0,
         max_reuse_prefix_adjustment: float = 100.0,
         max_priority_adjustment: float = 10.0,
+        recency_decay_tau: float = 300.0,
+        recency_scale: float = 100.0,
     ):
         self.metadata_store = metadata_store
         self.recency_weight = recency_weight
@@ -104,6 +107,8 @@ class BusinessAwareStrategy(EvictionStrategy):
         self.max_reload_cost_adjustment = max_reload_cost_adjustment
         self.max_reuse_prefix_adjustment = max_reuse_prefix_adjustment
         self.max_priority_adjustment = max_priority_adjustment
+        self.recency_decay_tau = recency_decay_tau
+        self.recency_scale = recency_scale
 
     @staticmethod
     def _sanitize_score(value: float) -> float:
@@ -120,12 +125,16 @@ class BusinessAwareStrategy(EvictionStrategy):
         return adjustment
 
     def _compute_keep_score(self, node: "TreeNode") -> float:
+        now = time.monotonic()
+        recency_score = math.exp(
+            -(now - node.last_access_time) / self.recency_decay_tau
+        )
         metadata = self.metadata_store.get_for_node(node.id)
 
         if metadata is None:
             # Graceful degradation: pure recency + frequency (LRU-like).
             return (
-                self.recency_weight * node.last_access_time
+                self.recency_weight * recency_score * self.recency_scale
                 + self.frequency_weight * node.hit_count
             )
 
@@ -133,7 +142,7 @@ class BusinessAwareStrategy(EvictionStrategy):
         sla_mult = _sla_multiplier(metadata.sla_class)
 
         keep_score = (
-            self.recency_weight * node.last_access_time
+            self.recency_weight * recency_score * self.recency_scale
             + self.frequency_weight * node.hit_count
             + self._bounded_adjustment(
                 metadata.estimated_reuse_prefix_len,
