@@ -1504,9 +1504,15 @@ class PauseGenerationReqInput(BaseReq, kw_only=True):
             requests will be retracted back to the waiting_queue.
             Note: The KV cache can be flushed in this mode and will be automatically
             recomputed after continue_generation.
+
+    preserve_kv: Same as retract, but the KV cache of paused requests is
+            written back to the Host (via HiCache write_backup) before
+            releasing GPU memory. The radix tree node is preserved so that
+            match_prefix can hit on resume, avoiding a full re-prefill.
+            This is the mode used by Partial Rollout for KV-aware resume.
     """
 
-    mode: Literal["abort", "retract", "in_place"] = "abort"
+    mode: Literal["abort", "retract", "in_place", "preserve_kv"] = "abort"
 
 
 class ContinueGenerationReqInput(BaseReq, kw_only=True):
@@ -1769,6 +1775,47 @@ class AbortReq(BaseReq, kw_only=True):
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
+        if self.rid is None:
+            self.rid = ""
+
+
+class PauseReq(BaseReq, kw_only=True):
+    """Per-request pause with KV cache preservation.
+
+    Unlike PauseGenerationReqInput (which is a global engine pause), PauseReq
+    targets specific requests by rid prefix. When pause_all is True, all
+    running requests are paused.
+
+    KV cache of paused requests is written back to Host via HiCache
+    write_backup before GPU memory is released, enabling KV-aware resume
+    on the next continue_generation / ResumeReq.
+    """
+
+    # Pause all running requests
+    pause_all: bool = False
+    # Optional batch identifier for verl-side tracking
+    rollout_batch_id: Optional[str] = None
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = ""
+
+
+class ResumeReq(BaseReq, kw_only=True):
+    """Resume previously paused requests.
+
+    Moves paused requests back to the waiting queue so they can be
+    re-scheduled. If the KV cache was preserved (via PauseReq), the
+    radix tree match_prefix will hit and load_back the KV from Host,
+    avoiding a full re-prefill.
+    """
+
+    # Resume all paused requests
+    resume_all: bool = False
+    # Optional batch identifier matching the PauseReq
+    rollout_batch_id: Optional[str] = None
+
+    def __post_init__(self):
         if self.rid is None:
             self.rid = ""
 

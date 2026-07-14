@@ -992,6 +992,10 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
+        # Partial Rollout: "discard" (default, releases KV) or "preserve_kv"
+        # (writes KV to Host via HiCache write_backup before releasing GPU).
+        self.retract_mode: str = "discard"
+
         # For observability
         self.metrics_collector = metrics_collector
         if time_stats is not None:
@@ -1496,12 +1500,15 @@ class Req(ReqDllmMixin):
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
 
-        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        # When retract_mode == "preserve_kv", keep last_node and prefix_indices
+        # so that match_prefix can hit on resume and load_back the KV from Host.
+        if self.retract_mode != "preserve_kv":
+            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            self.last_node = None
+            self.cache_protected_len = 0
+            self.num_matched_prefix_tokens = 0
         self.routed_experts = None
         self.indexer_topk = None
-        self.last_node = None
-        self.cache_protected_len = 0
-        self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
@@ -1704,14 +1711,29 @@ def release_req(
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
+    # Partial Rollout: preserve_kv mode writes KV to Host (HiCache write_backup)
+    # before releasing GPU memory, and inserts into the radix tree so that
+    # match_prefix can hit on resume. This avoids a full re-prefill.
+    preserve_kv = getattr(req, "retract_mode", "discard") == "preserve_kv"
+
+    if preserve_kv and hasattr(tree_cache, "write_backup") and req.last_node is not None:
+        try:
+            tree_cache.write_backup(req.last_node, write_back=True)
+        except Exception as e:
+            logger.warning(
+                f"write_backup failed for req {req.rid}, falling back to discard: {e}"
+            )
+            preserve_kv = False
+
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, is_insert=False)
+    # When preserving KV, insert into the tree so prefix matching works on resume.
+    # Otherwise, release without inserting (original behavior).
+    release_kv_cache(req, tree_cache, is_insert=preserve_kv)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)

@@ -73,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
+    PauseReq,
+    ResumeReq,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -1735,6 +1737,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.is_pause = False
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
+
+    async def pause_request(self, obj: PauseReq):
+        """Dispatch a per-request pause to the scheduler."""
+        await self._async_dispatch_to_scheduler(obj)
+
+    async def resume_request(self, obj: ResumeReq):
+        """Dispatch a per-request resume to the scheduler."""
+        await self._async_dispatch_to_scheduler(obj)
 
     async def update_weights_from_disk(
         self,

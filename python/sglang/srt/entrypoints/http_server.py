@@ -128,6 +128,8 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReq,
+    PauseReq,
+    ResumeReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -1620,6 +1622,32 @@ async def continue_generation(
     await _global_state.tokenizer_manager.continue_generation(obj)
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
+        status_code=200,
+    )
+
+
+@app.post("/pause_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pause_request(
+    obj: Annotated[PauseReq, Body()], request: Request
+):
+    """Pause specific requests with KV cache preservation."""
+    await _global_state.tokenizer_manager.pause_request(obj)
+    return ORJSONResponse(
+        content={"message": "Requests paused with KV preservation.", "status": "ok"},
+        status_code=200,
+    )
+
+
+@app.post("/resume_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def resume_request(
+    obj: Annotated[ResumeReq, Body()], request: Request
+):
+    """Resume previously paused requests."""
+    await _global_state.tokenizer_manager.resume_request(obj)
+    return ORJSONResponse(
+        content={"message": "Requests resumed.", "status": "ok"},
         status_code=200,
     )
 

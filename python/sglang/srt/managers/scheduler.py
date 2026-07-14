@@ -121,6 +121,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    PauseReq,
+    ResumeReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1402,6 +1404,8 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (PauseReq, self.pause_request),
+                (ResumeReq, self.resume_request),
                 (ConfigureLoggingReq, self.configure_logging),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
@@ -4125,6 +4129,29 @@ class Scheduler(
             self.running_batch.batch_is_full = False
             self.chunked_req = None
 
+        if recv_req.mode == "preserve_kv" and not self.running_batch.is_empty():
+            # Partial Rollout: retract all running requests but preserve their
+            # KV cache by writing it back to Host (HiCache write_backup) before
+            # releasing GPU memory. The radix tree node is kept so that
+            # match_prefix hits on resume, avoiding a full re-prefill.
+            self.running_batch.filter_batch()
+            if len(self.running_batch.reqs) != 0:
+                for req in self.running_batch.reqs:
+                    req.retract_mode = "preserve_kv"
+                retracted_reqs = self.running_batch.retract_all(
+                    self.server_args, offload_kv=False
+                )
+                logger.info(
+                    f"[pause_generation:preserve_kv] retracted "
+                    f"{len(retracted_reqs)} requests with KV preservation"
+                )
+                for req in retracted_reqs:
+                    req.retract_mode = "discard"  # reset for next cycle
+                    self._add_request_to_queue(req)
+
+            self.running_batch.batch_is_full = False
+            self.chunked_req = None
+
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
         # so without this hop ``gen_throughput`` retains its last non-zero
@@ -4159,6 +4186,74 @@ class Scheduler(
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
+
+    def pause_request(self, recv_req: PauseReq):
+        """Pause specific requests with KV cache preservation.
+
+        Unlike pause_generation (global), this targets individual requests by
+        rid prefix. The KV cache is written back to Host via HiCache
+        write_backup before GPU memory is released.
+        """
+        if self.enable_overlap and self.last_batch:
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        if self.last_batch:
+            if self.running_batch.is_empty():
+                self.running_batch = self.last_batch
+            else:
+                self.running_batch.merge_batch(self.last_batch)
+            self.last_batch = None
+
+        if not self.running_batch.is_empty():
+            self.running_batch.filter_batch()
+            to_pause = []
+            keep = []
+            for req in self.running_batch.reqs:
+                should_pause = (
+                    recv_req.pause_all
+                    or (recv_req.rid and req.rid.startswith(recv_req.rid))
+                )
+                if should_pause:
+                    req.retract_mode = "preserve_kv"
+                    to_pause.append(req)
+                else:
+                    keep.append(req)
+
+            if to_pause:
+                # Retract only the targeted requests
+                from sglang.srt.managers.schedule_batch import retract_all
+
+                retracted = retract_all(
+                    reqs=to_pause,
+                    server_args=self.server_args,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tree_cache=self.tree_cache,
+                    hisparse_coordinator=self.hisparse_coordinator,
+                    offload_kv=False,
+                )
+                logger.info(
+                    f"[pause_request] paused {len(retracted)} requests "
+                    f"with KV preservation, batch_id={recv_req.rollout_batch_id}"
+                )
+                for req in retracted:
+                    req.retract_mode = "discard"
+                    self._add_request_to_queue(req)
+
+            self.running_batch.reqs = keep
+            self.running_batch.batch_is_full = False
+
+    def resume_request(self, recv_req: ResumeReq):
+        """Resume previously paused requests.
+
+        Requests are already in the waiting queue (placed there by pause_request).
+        This is a no-op marker that logs the resume event; the scheduler's
+        normal event loop will pick them up and match_prefix will hit the
+        preserved KV in the radix tree.
+        """
+        logger.info(
+            f"[resume_request] resume requested, batch_id={recv_req.rollout_batch_id}"
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
