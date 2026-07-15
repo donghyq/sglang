@@ -1607,13 +1607,27 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/68ad4e3a8d8a66fb2a43be57471ee13a8bec4ec0/vllm/model_executor/layers/quantization/schema.py
+KVCacheScaleValue = Union[float, List[float]]
+
+
+class KVCacheScalePair(BaseModel):
+    """Separate K/V scales for one layer.
+
+    Each scale can be a scalar (per-tensor) or one value per local KV head.
+    """
+
+    k: KVCacheScaleValue
+    v: KVCacheScaleValue
+
+
+KVCacheLayerScale = Union[KVCacheScaleValue, KVCacheScalePair]
+
+
 class KVCacheQuantSchema(BaseModel):
     dtype: str
-    # Each key is a TP rank. Each value is a dictionary mapping a TP rank's
-    # layer indices to their per-tensor KV cache scaling factor.
-    # TODO: Consider pulling this and its validation methods out into its
-    # own schema class (tricky as its members are variable)
-    scaling_factor: Dict[int, Dict[int, float]]
+    # Each key is a TP rank. Each value maps layer indices to either a legacy
+    # shared scalar/vector scale or separate K/V scalar/vector scales.
+    scaling_factor: Dict[int, Dict[int, KVCacheLayerScale]]
 
     @model_validator(mode="after")
     def check_is_fp8(self) -> "KVCacheQuantSchema":
@@ -1687,13 +1701,12 @@ def kv_cache_scales_loader(
     tp_size: int,
     num_hidden_layers: int,
     model_type: Optional[str],
-) -> Iterable[Tuple[int, float]]:
-    """
-    A simple utility to read in KV cache scaling factors that have been
-    previously serialized to disk. Used by the model to populate the appropriate
-    KV cache scaling factors. The serialization should represent a dictionary
-    whose keys are the TP ranks and values are another dictionary mapping layers
-    to their KV cache scaling factors.
+) -> Iterable[Tuple[int, KVCacheLayerScale]]:
+    """Load calibrated KV cache scales for the current TP rank.
+
+    Backward-compatible entries are a shared scalar per layer. Per-head files may
+    instead provide a shared vector, or ``{"k": ..., "v": ...}`` with separate
+    scalar/vector scales. Vectors are local to the serialized TP rank.
     """
     try:
         with open(filename) as f:

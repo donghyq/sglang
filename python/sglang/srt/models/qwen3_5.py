@@ -77,6 +77,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    kv_cache_scales_loader,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import (
@@ -1361,6 +1362,33 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        """Load calibrated scales for full-attention layers only.
+
+        Qwen3.5 interleaves full attention with GatedDeltaNet layers; the latter
+        use recurrent state rather than a K/V cache and therefore have no scales.
+        """
+        parallel = get_parallel()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            parallel.attn_tp_rank,
+            parallel.attn_tp_size,
+            self.config.num_hidden_layers,
+            self.config.__class__.model_type,
+        ):
+            layer = self.layers[layer_idx]
+            attn = getattr(layer, "attn", None)
+            if attn is None:
+                continue
+            if not hasattr(attn, "k_scale"):
+                raise RuntimeError(
+                    f"Full-attention layer {layer_idx} has no KV cache scale attributes"
+                )
+
+            from sglang.srt.layers.quantization.kv_cache import set_kv_scale
+
+            set_kv_scale(attn, scaling_factor)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1675,6 +1703,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
+
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
 
@@ -1836,6 +1867,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
 
     def should_apply_lora(self, module_name: str) -> bool:
         # Accept all language model layer modules (attention, linear_attn, mlp).

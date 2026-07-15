@@ -611,6 +611,27 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = "auto"
+    kv_cache_quant_granularity: A[
+        str,
+        Arg(
+            help=(
+                "Quantization granularity for FP8 KV cache. 'per_tensor' uses "
+                "one scale per K/V tensor; 'per_head' uses one calibrated scale "
+                "per local KV head. Per-head currently requires the FA3 backend."
+            ),
+            choices=["per_tensor", "per_head"],
+        ),
+    ] = "per_tensor"
+    kv_cache_quant_skip_modules: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Comma-separated module-name substrings that keep per-tensor KV "
+                "cache scales when --kv-cache-quant-granularity=per_head."
+            ),
+            type_parser=nullable_str,
+        ),
+    ] = None
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32."
     ] = False
@@ -2879,6 +2900,7 @@ class ServerArgs:
         # deterministic backend is set before auto-detection fills it in.
         self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
+        self._handle_fp8_kv_cache_quant_granularity()
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
         self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
@@ -4902,6 +4924,30 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+    def _handle_fp8_kv_cache_quant_granularity(self):
+        if self.kv_cache_quant_granularity != "per_head":
+            return
+        if self.kv_cache_dtype != "fp8_e4m3":
+            raise ValueError(
+                "--kv-cache-quant-granularity=per_head requires "
+                "--kv-cache-dtype=fp8_e4m3"
+            )
+        if self.use_mla_backend():
+            raise ValueError(
+                "--kv-cache-quant-granularity=per_head currently supports MHA "
+                "models only"
+            )
+        prefill_backend, decode_backend = self._resolved_attention_backends()
+        unsupported = {
+            backend for backend in (prefill_backend, decode_backend) if backend != "fa3"
+        }
+        if unsupported:
+            raise ValueError(
+                "--kv-cache-quant-granularity=per_head currently requires FA3 "
+                "for both prefill and decode, but got "
+                f"prefill={prefill_backend}, decode={decode_backend}"
+            )
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""

@@ -443,8 +443,9 @@ class LlamaModel(nn.Module):
                 layer_self_attn = self.layers[layer_idx].self_attn
 
             if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
+                from sglang.srt.layers.quantization.kv_cache import set_kv_scale
+
+                set_kv_scale(layer_self_attn.attn, scaling_factor)
             else:
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"

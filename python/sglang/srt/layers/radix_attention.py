@@ -106,6 +106,7 @@ class RadixAttention(nn.Module):
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
         self.use_irope = use_irope
+        self.prefix = prefix
         self.k_scale = None
         self.v_scale = None
         self.k_scale_float = None
@@ -116,6 +117,19 @@ class RadixAttention(nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:
             self.quant_method.create_weights(self)
+        else:
+            # Explicit FP8 KV cache on an otherwise unquantized model has no
+            # quantization method to create scale parameters. Install calibrated
+            # per-head scale slots here; scalar checkpoint values broadcast.
+            from sglang.srt.layers.quantization.kv_cache import (
+                create_kv_scale_parameters,
+                use_per_head_kv_scale,
+            )
+
+            if use_per_head_kv_scale(prefix):
+                create_kv_scale_parameters(self, per_head=True)
+                self.k_scale.data.fill_(1.0)
+                self.v_scale.data.fill_(1.0)
         self.attn_type = attn_type
 
         self.pos_encoding_mode = pos_encoding_mode
