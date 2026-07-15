@@ -451,9 +451,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         with record_function("UnifiedMHA.set_kv_buffer"):
             if cache_k.dtype != self.dtype:
                 if k_scale is not None:
-                    cache_k.div_(k_scale)
+                    cache_k.div_(self._reshape_kv_scale(k_scale, cache_k))
                 if v_scale is not None:
-                    cache_v.div_(v_scale)
+                    cache_v.div_(self._reshape_kv_scale(v_scale, cache_v))
                 cache_k = cache_k.to(self.dtype)
                 cache_v = cache_v.to(self.dtype)
             if self.store_dtype != self.dtype:

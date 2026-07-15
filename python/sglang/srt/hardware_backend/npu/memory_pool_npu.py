@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -176,8 +176,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
@@ -188,9 +188,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k.div_(self._reshape_kv_scale(k_scale, cache_k))
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                cache_v.div_(self._reshape_kv_scale(v_scale, cache_v))
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 

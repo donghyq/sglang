@@ -1787,8 +1787,8 @@ class MHATokenToKVPool(KVCache):
         loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
@@ -1802,9 +1802,9 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k.div_(self._reshape_kv_scale(k_scale, cache_k))
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                cache_v.div_(self._reshape_kv_scale(v_scale, cache_v))
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -1843,6 +1843,19 @@ class MHATokenToKVPool(KVCache):
             return
 
         self._store_kv_layer(layer_id - self.start_layer, loc, cache_k, cache_v)
+
+    @staticmethod
+    def _reshape_kv_scale(
+        scale: Union[float, torch.Tensor], cache: torch.Tensor
+    ) -> Union[float, torch.Tensor]:
+        if not isinstance(scale, torch.Tensor) or scale.numel() == 1:
+            return scale
+        if cache.ndim != 3 or scale.ndim != 1 or scale.shape[0] != cache.shape[1]:
+            raise ValueError(
+                "Per-head KV cache scale must have shape [num_kv_heads]; "
+                f"got scale={tuple(scale.shape)}, cache={tuple(cache.shape)}"
+            )
+        return scale.view(1, -1, 1)
 
     def _store_kv_layer(
         self,
@@ -1900,8 +1913,8 @@ class MHATokenToKVPool(KVCache):
         commit_lens: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         layer_id_override: Optional[int] = None,
     ):
         if layer_id_override is not None:
@@ -1926,9 +1939,9 @@ class MHATokenToKVPool(KVCache):
 
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k.div_(self._reshape_kv_scale(k_scale, cache_k))
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                cache_v.div_(self._reshape_kv_scale(v_scale, cache_v))
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -2653,8 +2666,8 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
+        k_scale: Union[float, torch.Tensor] = 1.0,
+        v_scale: Union[float, torch.Tensor] = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
