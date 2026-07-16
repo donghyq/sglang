@@ -957,6 +957,7 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        self.partial_rollout_paused_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3627,6 +3628,9 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        # Paused requests are not runnable, but still own a resumable lifecycle
+        # and may reference KV preserved in the prefix cache.
+        idle &= len(self.partial_rollout_paused_queue) == 0
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -3794,7 +3798,9 @@ class Scheduler(
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}, "
+                f"#partial-rollout-paused-req: "
+                f"{len(self.partial_rollout_paused_queue)}"
             )
             success = False
         return success
@@ -3952,6 +3958,25 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+
+        # Paused partial-rollout requests have already released request-local
+        # GPU allocations into the prefix cache. Remove only their scheduler
+        # ownership here; releasing request KV again would double-free it.
+        still_paused = []
+        aborted_paused = []
+        for req in self.partial_rollout_paused_queue:
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                aborted_paused.append(req)
+            else:
+                still_paused.append(req)
+        self.partial_rollout_paused_queue = still_paused
+        for req in aborted_paused:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=req.rid), req
+            )
+            logger.debug(f"Abort paused partial-rollout request. {req.rid=}")
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
@@ -4207,17 +4232,17 @@ class Scheduler(
         if not self.running_batch.is_empty():
             self.running_batch.filter_batch()
             to_pause = []
-            keep = []
-            for req in self.running_batch.reqs:
+            keep_indices = []
+            for index, req in enumerate(self.running_batch.reqs):
                 should_pause = (
                     recv_req.pause_all
                     or (recv_req.rid and req.rid.startswith(recv_req.rid))
                 )
-                if should_pause:
+                if should_pause and req.req_pool_idx is not None:
                     req.retract_mode = "preserve_kv"
                     to_pause.append(req)
                 else:
-                    keep.append(req)
+                    keep_indices.append(index)
 
             if to_pause:
                 # Retract only the targeted requests
@@ -4238,21 +4263,36 @@ class Scheduler(
                 )
                 for req in retracted:
                     req.retract_mode = "discard"
-                    self._add_request_to_queue(req)
+                    self.partial_rollout_paused_queue.append(req)
 
-            self.running_batch.reqs = keep
+            self.running_batch.filter_batch(keep_indices=keep_indices)
             self.running_batch.batch_is_full = False
 
     def resume_request(self, recv_req: ResumeReq):
         """Resume previously paused requests.
 
-        Requests are already in the waiting queue (placed there by pause_request).
-        This is a no-op marker that logs the resume event; the scheduler's
-        normal event loop will pick them up and match_prefix will hit the
-        preserved KV in the radix tree.
+        Moves matching requests from the partial-rollout paused queue back to
+        the scheduler queue. Prefix matching then restores the preserved KV.
         """
+        to_resume = []
+        still_paused = []
+        for req in self.partial_rollout_paused_queue:
+            should_resume = (
+                recv_req.resume_all
+                or (recv_req.rid and req.rid.startswith(recv_req.rid))
+            )
+            if should_resume:
+                to_resume.append(req)
+            else:
+                still_paused.append(req)
+
+        self.partial_rollout_paused_queue = still_paused
+        for req in to_resume:
+            self._add_request_to_queue(req, is_retracted=True)
+
         logger.info(
-            f"[resume_request] resume requested, batch_id={recv_req.rollout_batch_id}"
+            f"[resume_request] resumed {len(to_resume)} requests, "
+            f"batch_id={recv_req.rollout_batch_id}"
         )
 
     def load_lora_adapter(

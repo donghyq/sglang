@@ -1500,13 +1500,14 @@ class Req(ReqDllmMixin):
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
 
-        # When retract_mode == "preserve_kv", keep last_node and prefix_indices
-        # so that match_prefix can hit on resume and load_back the KV from Host.
-        if self.retract_mode != "preserve_kv":
-            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
-            self.last_node = None
-            self.cache_protected_len = 0
-            self.num_matched_prefix_tokens = 0
+        # Request-local indices refer to the allocation that release_kv_cache()
+        # just released. Even in preserve_kv mode, reusable ownership now
+        # belongs to the radix/HiCache tree. A resumed request must rematch the
+        # prefix and acquire fresh indices.
+        self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.last_node = None
+        self.cache_protected_len = 0
+        self.num_matched_prefix_tokens = 0
         self.routed_experts = None
         self.indexer_topk = None
         self.swa_uuid_for_lock = None

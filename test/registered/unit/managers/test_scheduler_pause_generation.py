@@ -10,6 +10,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
@@ -32,6 +33,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
         scheduler.running_batch.batch_is_full = False
+        scheduler.partial_rollout_paused_queue = []
+        scheduler.waiting_queue = []
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
@@ -53,7 +56,29 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
+        scheduler.enable_hicache_storage = False
+        scheduler.ipc_channels = MagicMock()
         return scheduler
+
+    def test_abort_removes_paused_request_without_double_free(self):
+        scheduler = self._new_scheduler()
+        paused = SimpleNamespace(rid="paused-rid", req_pool_idx=None)
+        other = SimpleNamespace(rid="other-rid", req_pool_idx=None)
+        scheduler.partial_rollout_paused_queue = [paused, other]
+
+        scheduler.abort_request(AbortReq(rid="paused-rid"))
+
+        self.assertEqual(scheduler.partial_rollout_paused_queue, [other])
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+
+    def test_paused_request_is_not_fully_idle(self):
+        scheduler = self._new_scheduler()
+        scheduler.partial_rollout_paused_queue = [SimpleNamespace(rid="paused-rid")]
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler._pp_microbatches_drained = MagicMock(return_value=True)
+
+        self.assertFalse(scheduler.is_fully_idle(for_health_check=True))
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
