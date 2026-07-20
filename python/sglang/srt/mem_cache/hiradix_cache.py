@@ -921,6 +921,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
+        self._record_capacity_tombstone(node, "device_capacity")
         self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -948,12 +949,15 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
+            self._record_capacity_tombstone(x, "host_capacity")
             self._record_remove_event(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
+            self.business_metadata_store.pop_for_node(x.id)
+            self._drop_retention_node(x)
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
@@ -1255,6 +1259,13 @@ class HiRadixCache(RadixCache):
             last_node = last_node.parent
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
+
+        # Host-resident prefixes remain reusable and therefore are not
+        # recompute regret. Only a miss beyond both tiers can consume a
+        # capacity tombstone.
+        matched_length = len(value) + host_hit_length
+        self._observe_recompute_after_miss(key, matched_length)
+        self._maybe_sample_retention()
 
         return MatchResult(
             device_indices=value,

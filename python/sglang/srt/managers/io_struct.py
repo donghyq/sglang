@@ -228,6 +228,9 @@ class GenerateReqInput(BaseReq):
     # Runtime type: Optional[dict] for a single request, or list[dict|None] for a batch.
     retrieval_cache: Any = None
 
+    # Raw API business context. It is normalized before entering the scheduler.
+    cache_business_context: Any = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -694,6 +697,11 @@ class GenerateReqInput(BaseReq):
                 if isinstance(self.retrieval_cache, list)
                 else self.retrieval_cache
             ),
+            cache_business_context=(
+                self.cache_business_context[i]
+                if isinstance(self.cache_business_context, list)
+                else self.cache_business_context
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -780,6 +788,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Structured retrieval-conditioned cache payload propagated from the API layer.
     retrieval_cache: Optional[Dict[str, Any]] = None
+
+    # Normalized BusinessMetadata; kept as Any to avoid an io_struct dependency
+    # on the cache implementation.
+    business_metadata: Any = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

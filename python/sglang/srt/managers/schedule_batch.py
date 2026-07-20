@@ -61,6 +61,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.business_metadata import BusinessMetadata
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
@@ -614,6 +615,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        business_metadata: Optional[BusinessMetadata] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -632,6 +634,7 @@ class Req(ReqDllmMixin):
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
+        self.business_metadata = business_metadata
 
         # For req-level memory management
         self.kv_committed_len = 0

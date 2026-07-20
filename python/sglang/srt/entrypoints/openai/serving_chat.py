@@ -425,6 +425,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.retrieval_cache is not None
                 else None
             ),
+            cache_business_context=request.cache_business_context,
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),

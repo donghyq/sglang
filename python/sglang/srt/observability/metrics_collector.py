@@ -1650,6 +1650,48 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        regret_labelnames = [*labels.keys(), "reason", "workflow_stage", "content_type"]
+        self.kv_cache_recompute_regret = Counter(
+            name="sglang:kv_cache_recompute_regret_total",
+            documentation="Capacity evictions followed by an exact-prefix recomputation within the regret window.",
+            labelnames=regret_labelnames,
+        )
+        self.kv_cache_recompute_regret_tokens = Counter(
+            name="sglang:kv_cache_recompute_regret_tokens_total",
+            documentation="Tokens recomputed after a recent capacity eviction.",
+            labelnames=regret_labelnames,
+        )
+        self.kv_cache_recompute_regret_bytes = Counter(
+            name="sglang:kv_cache_recompute_regret_bytes_total",
+            documentation="Estimated KV bytes discarded by regretted capacity evictions.",
+            labelnames=regret_labelnames,
+        )
+        self.kv_cache_retention_unused_token_seconds = Counter(
+            name="sglang:kv_cache_retention_unused_token_seconds_total",
+            documentation="Sampled token-seconds retained without a cache hit.",
+            labelnames=regret_labelnames,
+        )
+        self.kv_cache_retention_unused_byte_seconds = Counter(
+            name="sglang:kv_cache_retention_unused_byte_seconds_total",
+            documentation="Sampled estimated KV byte-seconds retained without a cache hit.",
+            labelnames=regret_labelnames,
+        )
+        self.kv_cache_retention_regret = Counter(
+            name="sglang:kv_cache_retention_regret_total",
+            documentation="Sampled retention-regret events such as expired protection that remained unused.",
+            labelnames=regret_labelnames,
+        )
+        self.kv_cache_planner_physical_outcome = Counter(
+            name="sglang:kv_cache_planner_physical_outcome_total",
+            documentation="Comparison between retrieval planner candidates and exact local physical prefix hits.",
+            labelnames=[*labels.keys(), "outcome"],
+        )
+        self.kv_cache_admission = Counter(
+            name="sglang:kv_cache_admission_total",
+            documentation="Business-aware cache admission decisions.",
+            labelnames=[*labels.keys(), "decision", "workflow_stage", "content_type"],
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -1661,3 +1703,75 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def _regret_labels(self, reason: str, workflow_stage: str, content_type: str):
+        return {
+            **self.labels,
+            "reason": reason,
+            "workflow_stage": workflow_stage,
+            "content_type": content_type,
+        }
+
+    def record_recompute_regret(
+        self,
+        *,
+        reason: str,
+        workflow_stage: str,
+        content_type: str,
+        tokens: int,
+        estimated_bytes: int,
+    ) -> None:
+        labels = self._regret_labels(reason, workflow_stage, content_type)
+        self.kv_cache_recompute_regret.labels(**labels).inc()
+        self.kv_cache_recompute_regret_tokens.labels(**labels).inc(max(0, tokens))
+        self.kv_cache_recompute_regret_bytes.labels(**labels).inc(
+            max(0, estimated_bytes)
+        )
+
+    def record_retention_interval(
+        self,
+        *,
+        reason: str,
+        workflow_stage: str,
+        content_type: str,
+        token_seconds: float,
+        byte_seconds: float,
+    ) -> None:
+        labels = self._regret_labels(reason, workflow_stage, content_type)
+        self.kv_cache_retention_unused_token_seconds.labels(**labels).inc(
+            max(0.0, token_seconds)
+        )
+        self.kv_cache_retention_unused_byte_seconds.labels(**labels).inc(
+            max(0.0, byte_seconds)
+        )
+
+    def record_retention_regret(
+        self, *, reason: str, workflow_stage: str, content_type: str
+    ) -> None:
+        labels = self._regret_labels(reason, workflow_stage, content_type)
+        self.kv_cache_retention_regret.labels(**labels).inc()
+
+    def record_planner_physical_outcome(
+        self, *, planner_candidate: bool, physical_exact_hit: bool
+    ) -> None:
+        outcome = (
+            f"candidate_{'hit' if planner_candidate else 'miss'}_"
+            f"physical_{'hit' if physical_exact_hit else 'miss'}"
+        )
+        self.kv_cache_planner_physical_outcome.labels(
+            **self.labels, outcome=outcome
+        ).inc()
+
+    def record_admission(
+        self,
+        *,
+        admitted: bool,
+        workflow_stage: str,
+        content_type: str,
+    ) -> None:
+        self.kv_cache_admission.labels(
+            **self.labels,
+            decision="admit" if admitted else "reject",
+            workflow_stage=workflow_stage,
+            content_type=content_type,
+        ).inc()

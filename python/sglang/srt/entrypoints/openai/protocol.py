@@ -385,6 +385,8 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Structured retrieval-conditioned cache namespace
     retrieval_cache: Optional[RetrievalCacheSpec] = None
+    # Optional business context used only as bounded cache-policy hints.
+    cache_business_context: Optional[Dict[str, Any]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -734,6 +736,8 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Structured retrieval-conditioned cache namespace
     retrieval_cache: Optional[RetrievalCacheSpec] = None
+    # Optional business context used only as bounded cache-policy hints.
+    cache_business_context: Optional[Dict[str, Any]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1315,6 +1319,10 @@ class ResponsesRequest(BaseModel):
     retrieval_cache: Optional[RetrievalCacheSpec] = Field(
         default=None,
         description="Structured retrieval-conditioned cache namespace.",
+    )
+    cache_business_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Bounded business hints for cache admission and eviction.",
     )
 
     # SGLang-specific sampling parameters

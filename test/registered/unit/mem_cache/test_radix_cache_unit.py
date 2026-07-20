@@ -28,6 +28,7 @@ import random
 import time
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 import torch
 
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.business_metadata import BusinessMetadata
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
@@ -278,6 +280,9 @@ class TestRadixCache(unittest.TestCase):
                 value=torch.tensor([10, 20, 30], dtype=torch.int64),
             )
         )
+        _, node = cache.probe_prefix(RadixKey([1, 2, 3]))
+        cache.set_business_metadata_from_context(node, {"session": "session-1"})
+        self.assertEqual(len(cache.business_metadata_store), 1)
         self.assertGreater(cache.total_size(), 0)
 
         # Reset
@@ -285,6 +290,155 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.total_size(), 0)
         self.assertEqual(cache.evictable_size(), 0)
         self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(len(cache.business_metadata_store), 0)
+
+    def test_business_metadata_is_copied_on_split_and_removed_on_delete(self):
+        cache = RadixCache.create_simulated(eviction_policy="business_aware")
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4])))
+        _, original = cache.probe_prefix(RadixKey([1, 2, 3, 4]))
+        cache.set_business_metadata_from_context(
+            original, {"session": "session-1", "content_type": "session_prefix"}
+        )
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2])))
+        _, split = cache.probe_prefix(RadixKey([1, 2]))
+        self.assertEqual(
+            cache.business_metadata_store.get_for_node(split.id).session_id,
+            "session-1",
+        )
+
+        cache._delete_leaf(original)
+        self.assertIsNone(cache.business_metadata_store.get_for_node(original.id))
+
+    def test_normalized_request_metadata_binds_to_exact_terminal_node(self):
+        cache = RadixCache.create_simulated(eviction_policy="business_aware")
+        key = RadixKey([1, 2, 3, 4], "retrieval=v1")
+        cache.insert(InsertParams(key=key))
+        req = SimpleNamespace(
+            rid="request-1",
+            business_metadata=BusinessMetadata(
+                session_id="session-1",
+                content_type="session_prefix",
+            ),
+        )
+
+        cache._bind_request_business_metadata(req, key)
+        matched, node = cache.probe_prefix(key)
+        metadata = cache.business_metadata_store.get_for_node(node.id)
+
+        self.assertEqual(matched, len(key))
+        self.assertEqual(metadata.session_id, "session-1")
+        self.assertEqual(metadata.reusable_tokens, len(key))
+        # A different namespace must not observe or overwrite this node.
+        self.assertEqual(cache.probe_prefix(RadixKey([1, 2, 3, 4], "other"))[0], 0)
+
+    def test_capacity_eviction_tombstone_is_exact_bounded_and_resettable(self):
+        allocator = unittest.mock.Mock()
+        allocator.device = torch.device("cpu")
+        cache = RadixCache.create_simulated(
+            mock_allocator=allocator, eviction_policy="business_aware"
+        )
+        key = RadixKey([1, 2, 3, 4], "retrieval:v1:one")
+        cache.insert(InsertParams(key=key))
+        _, node = cache.probe_prefix(key)
+        cache.set_business_metadata_from_context(
+            node,
+            {
+                "workflow_stage": "retrieval",
+                "content_type": "retrieval_prefix",
+                "kv_bytes": 4096,
+                "reusable_tokens": 4,
+            },
+        )
+
+        cache.evict(EvictParams(num_tokens=4))
+        self.assertEqual(len(cache._eviction_tombstones), 1)
+
+        # Namespace is part of the exact identity and cannot consume it.
+        cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4], "retrieval:v1:other"))
+        )
+        self.assertEqual(len(cache._eviction_tombstones), 1)
+        cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(cache._eviction_tombstones), 0)
+
+        cache._eviction_tombstones["old"] = unittest.mock.Mock(
+            created_at=time.monotonic() - cache._TOMBSTONE_TTL_SECONDS - 1
+        )
+        cache._cleanup_expired_tombstones(time.monotonic())
+        self.assertEqual(len(cache._eviction_tombstones), 0)
+        cache._eviction_tombstones["reset"] = unittest.mock.Mock()
+        cache.reset()
+        self.assertEqual(len(cache._eviction_tombstones), 0)
+
+    def test_retention_sampling_is_bounded_and_reports_expiry_once(self):
+        cache = RadixCache.create_simulated(eviction_policy="business_aware")
+        collector = unittest.mock.Mock()
+        cache.metrics_collector = collector
+        cache._RETENTION_SAMPLE_INTERVAL_SECONDS = 0
+        key = RadixKey([1, 2, 3, 4], "retrieval:v1:sample")
+        cache.insert(InsertParams(key=key))
+        _, node = cache.probe_prefix(key)
+        req = SimpleNamespace(
+            rid="sample",
+            business_metadata=BusinessMetadata(
+                workflow_stage="tool_call",
+                content_type="session_prefix",
+                reusable_tokens=4,
+                kv_bytes=1024,
+                lease_expires_at=time.time() + 1,
+                reuse_probability=0.9,
+                prediction_confidence=0.9,
+                prediction_expires_at=time.time() + 1,
+            ),
+        )
+        cache._bind_business_metadata_to_node(req, node, 4)
+        sample = cache._retention_samples[node.id]
+        sample.sampled_at -= 2
+        bound = cache.business_metadata_store.get_for_node(node.id)
+        bound.lease_expires_at = time.time() - 1
+        bound.prediction_expires_at = time.time() - 1
+
+        cache._maybe_sample_retention(time.monotonic())
+        cache._maybe_sample_retention(time.monotonic() + 1)
+
+        self.assertGreaterEqual(collector.record_retention_interval.call_count, 1)
+        reasons = [
+            call.kwargs["reason"]
+            for call in collector.record_retention_regret.call_args_list
+        ]
+        self.assertEqual(reasons.count("expired_lease"), 1)
+        self.assertEqual(reasons.count("prediction_protected_unused"), 1)
+        self.assertLessEqual(
+            len(cache._retention_samples), cache._RETENTION_SAMPLE_MAX_ENTRIES
+        )
+
+        sample.tracked_at -= cache._RETENTION_SAMPLE_TTL_SECONDS + 1
+        cache._maybe_sample_retention(time.monotonic() + 2)
+        self.assertNotIn(node.id, cache._retention_samples)
+
+    def test_retention_does_not_report_already_expired_protection(self):
+        cache = RadixCache.create_simulated(eviction_policy="business_aware")
+        collector = unittest.mock.Mock()
+        cache.metrics_collector = collector
+        cache._RETENTION_SAMPLE_INTERVAL_SECONDS = 0
+        key = RadixKey([1, 2], "retrieval:v1:expired")
+        cache.insert(InsertParams(key=key))
+        _, node = cache.probe_prefix(key)
+        cache.set_business_metadata_from_context(
+            node,
+            {
+                "lease_expires_at": time.time() - 1,
+                "reuse_probability": 0.9,
+                "prediction_confidence": 0.9,
+                "prediction_expires_at": time.time() - 1,
+            },
+        )
+        cache._retention_samples[node.id].sampled_at -= 1
+
+        cache._maybe_sample_retention(time.monotonic())
+
+        collector.record_retention_regret.assert_not_called()
 
     def test_insert_and_match_basic(self):
         """Test basic insert and match operations."""

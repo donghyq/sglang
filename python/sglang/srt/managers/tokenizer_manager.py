@@ -44,6 +44,8 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.mem_cache.business_metadata import BusinessMetadataBuilder
+from sglang.srt.mem_cache.retrieval_namespace import compute_retrieval_extra_key
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -978,6 +980,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            try:
+                business_context = obj.cache_business_context or {}
+                retrieval_namespace = compute_retrieval_extra_key(obj.retrieval_cache)
+                if business_context or retrieval_namespace is not None:
+                    business_metadata = BusinessMetadataBuilder().build(
+                        business_context
+                    )
+                else:
+                    business_metadata = None
+                if business_metadata is not None and retrieval_namespace is not None:
+                    business_metadata = dataclasses.replace(
+                        business_metadata,
+                        retrieval_namespace=retrieval_namespace,
+                    )
+            except Exception:
+                # Cache policy hints must never make an otherwise valid request fail.
+                logger.warning("Ignoring invalid cache business context", exc_info=True)
+                business_metadata = None
+
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -1018,6 +1039,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 retrieval_cache=obj.retrieval_cache,
+                business_metadata=business_metadata,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,

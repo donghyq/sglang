@@ -1,8 +1,40 @@
 from __future__ import annotations
 
+import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping, Optional
+
+_METRIC_WORKFLOW_STAGES = frozenset(
+    {
+        "unknown",
+        "retrieval",
+        "planning",
+        "tool_call",
+        "tool_result",
+        "response",
+        "completed",
+    }
+)
+_METRIC_CONTENT_TYPES = frozenset(
+    {
+        "public_prefix",
+        "session_prefix",
+        "private_tail",
+        "tool_schema",
+        "retrieval_prefix",
+    }
+)
+
+
+def metric_workflow_stage(value: str) -> str:
+    """Map untrusted workflow values to a bounded Prometheus label set."""
+    return value if value in _METRIC_WORKFLOW_STAGES else "other"
+
+
+def metric_content_type(value: str) -> str:
+    """Map content types to the normalized schema's bounded label set."""
+    return value if value in _METRIC_CONTENT_TYPES else "private_tail"
 
 
 @dataclass
@@ -41,6 +73,19 @@ class BusinessMetadata:
     sla_class: str = "standard"
     tenant: str = "default"
     trace_tag: str = ""
+    session_id: str = ""
+    workflow_id: str = ""
+    workflow_stage: str = "unknown"
+    lifecycle_state: str = "active"
+    retrieval_namespace: str = ""
+    content_type: str = "private_tail"
+    reusable_tokens: int = 0
+    kv_bytes: int = 0
+    recompute_cost: float = 0.0
+    lease_expires_at: float = 0.0
+    reuse_probability: float = 0.0
+    prediction_confidence: float = 0.0
+    prediction_expires_at: float = 0.0
 
 
 _SLA_WEIGHT_MULTIPLIER: Dict[str, float] = {
@@ -83,6 +128,12 @@ class BusinessMetadataBuilder:
         "done": "business_complete",
         "type": "biz_type",
         "biz": "biz_type",
+        "workflow": "workflow_id",
+        "session": "session_id",
+        "stage": "workflow_stage",
+        "state": "lifecycle_state",
+        "namespace": "retrieval_namespace",
+        "reuse_probability_confidence": "prediction_confidence",
     }
 
     _VALID_FIELDS = frozenset(
@@ -97,20 +148,44 @@ class BusinessMetadataBuilder:
             "sla_class",
             "tenant",
             "trace_tag",
+            "session_id",
+            "workflow_id",
+            "workflow_stage",
+            "lifecycle_state",
+            "retrieval_namespace",
+            "content_type",
+            "reusable_tokens",
+            "kv_bytes",
+            "recompute_cost",
+            "lease_expires_at",
+            "reuse_probability",
+            "prediction_confidence",
+            "prediction_expires_at",
         }
     )
 
     def _coerce_float(self, value: Any, default: float = 0.0) -> float:
         try:
-            return float(value)
+            result = float(value)
+            return result if math.isfinite(result) else default
         except (TypeError, ValueError):
             return default
 
     def _coerce_int(self, value: Any, default: int = 0) -> int:
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
+
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return min(upper, max(lower, value))
+
+    @staticmethod
+    def _string(value: Any, default: str = "", max_length: int = 256) -> str:
+        if value is None:
+            return default
+        return str(value)[:max_length]
 
     def _coerce_bool(self, value: Any, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -127,6 +202,8 @@ class BusinessMetadataBuilder:
         return bool(value)
 
     def build(self, context: Mapping[str, Any]) -> BusinessMetadata:
+        if not isinstance(context, Mapping):
+            return BusinessMetadata()
         normalized: Dict[str, Any] = {}
         for raw_key, value in context.items():
             key = self._ALIASES.get(raw_key, raw_key)
@@ -154,15 +231,80 @@ class BusinessMetadataBuilder:
                 normalized["business_complete"]
             )
         if "priority" in normalized:
-            normalized["priority"] = self._coerce_int(normalized["priority"])
-        if "biz_type" in normalized:
-            normalized["biz_type"] = str(normalized["biz_type"])
-        if "sla_class" in normalized:
-            normalized["sla_class"] = str(normalized["sla_class"])
-        if "tenant" in normalized:
-            normalized["tenant"] = str(normalized["tenant"])
-        if "trace_tag" in normalized:
-            normalized["trace_tag"] = str(normalized["trace_tag"])
+            normalized["priority"] = int(
+                self._clamp(self._coerce_int(normalized["priority"]), -100, 100)
+            )
+
+        for field_name in (
+            "estimated_reload_cost",
+            "estimated_reuse_prefix_len",
+            "recompute_cost",
+        ):
+            if field_name in normalized:
+                normalized[field_name] = self._clamp(
+                    self._coerce_float(normalized[field_name]), 0.0, 1e9
+                )
+        for field_name in ("reusable_tokens", "kv_bytes"):
+            if field_name in normalized:
+                normalized[field_name] = int(
+                    self._clamp(self._coerce_int(normalized[field_name]), 0, 1 << 50)
+                )
+        for field_name in (
+            "reuse_probability",
+            "prediction_confidence",
+        ):
+            if field_name in normalized:
+                normalized[field_name] = self._clamp(
+                    self._coerce_float(normalized[field_name]), 0.0, 1.0
+                )
+        for field_name in (
+            "lease_expires_at",
+            "prediction_expires_at",
+        ):
+            if field_name in normalized:
+                normalized[field_name] = max(
+                    0.0, self._coerce_float(normalized[field_name])
+                )
+
+        string_defaults = {
+            "biz_type": "default",
+            "sla_class": "standard",
+            "tenant": "default",
+            "trace_tag": "",
+            "session_id": "",
+            "workflow_id": "",
+            "workflow_stage": "unknown",
+            "lifecycle_state": "active",
+            "retrieval_namespace": "",
+            "content_type": "private_tail",
+        }
+        for field_name, default in string_defaults.items():
+            if field_name in normalized:
+                normalized[field_name] = self._string(
+                    normalized[field_name], default=default
+                )
+
+        if normalized.get("sla_class") not in _SLA_WEIGHT_MULTIPLIER:
+            normalized["sla_class"] = "standard"
+        if normalized.get("lifecycle_state") not in {
+            "active",
+            "tool_waiting",
+            "tool_returned",
+            "completed",
+            "cancelled",
+        }:
+            normalized["lifecycle_state"] = "active"
+        if normalized.get("content_type") not in {
+            "public_prefix",
+            "session_prefix",
+            "private_tail",
+            "tool_schema",
+            "retrieval_prefix",
+        }:
+            normalized["content_type"] = "private_tail"
+
+        if normalized.get("business_complete"):
+            normalized.setdefault("lifecycle_state", "completed")
 
         return BusinessMetadata(**normalized)
 
@@ -203,15 +345,28 @@ class BusinessMetadataStore:
             metadata = self._metadata_by_node_id.get(source_node_id)
             if metadata is None:
                 return
-            self._metadata_by_node_id[target_node_id] = BusinessMetadata(
-                hot_bucket_score=metadata.hot_bucket_score,
-                time_window_score=metadata.time_window_score,
-                estimated_reload_cost=metadata.estimated_reload_cost,
-                estimated_reuse_prefix_len=metadata.estimated_reuse_prefix_len,
-                business_complete=metadata.business_complete,
-                biz_type=metadata.biz_type,
-                priority=metadata.priority,
-                sla_class=metadata.sla_class,
-                tenant=metadata.tenant,
-                trace_tag=metadata.trace_tag,
-            )
+            self._metadata_by_node_id[target_node_id] = replace(metadata)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._metadata_by_node_id.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._metadata_by_node_id)
+
+    def bind_runtime_facts(
+        self,
+        node_id: int,
+        metadata: BusinessMetadata,
+        *,
+        reusable_tokens: int,
+        kv_bytes: Optional[int] = None,
+    ) -> BusinessMetadata:
+        """Attach normalized request metadata plus cache-observed facts."""
+        bound = replace(
+            metadata,
+            reusable_tokens=max(0, reusable_tokens),
+            kv_bytes=(metadata.kv_bytes if kv_bytes is None else max(0, kv_bytes)),
+        )
+        return self.set_for_node(node_id, bound)

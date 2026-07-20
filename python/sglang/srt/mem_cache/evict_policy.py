@@ -109,6 +109,9 @@ class BusinessAwareStrategy(EvictionStrategy):
         self.max_priority_adjustment = max_priority_adjustment
         self.recency_decay_tau = recency_decay_tau
         self.recency_scale = recency_scale
+        self.max_business_residual = 75.0
+        self.max_lifecycle_adjustment = 20.0
+        self.large_private_tail_tokens = 8192
 
     @staticmethod
     def _sanitize_score(value: float) -> float:
@@ -126,8 +129,9 @@ class BusinessAwareStrategy(EvictionStrategy):
 
     def _compute_keep_score(self, node: "TreeNode") -> float:
         now = time.monotonic()
+        wall_now = time.time()
         recency_score = math.exp(
-            -(now - node.last_access_time) / self.recency_decay_tau
+            -max(0.0, now - node.last_access_time) / max(self.recency_decay_tau, 1e-6)
         )
         metadata = self.metadata_store.get_for_node(node.id)
 
@@ -138,14 +142,24 @@ class BusinessAwareStrategy(EvictionStrategy):
                 + self.frequency_weight * node.hit_count
             )
 
-        # Bounded SLA multiplier in [0.5, 1.5].
-        sla_mult = _sla_multiplier(metadata.sla_class)
-
-        keep_score = (
+        base_score = (
             self.recency_weight * recency_score * self.recency_scale
             + self.frequency_weight * node.hit_count
-            + self._bounded_adjustment(
-                metadata.estimated_reuse_prefix_len,
+        )
+        recompute_cost = max(
+            self._sanitize_score(metadata.recompute_cost),
+            self._sanitize_score(metadata.estimated_reload_cost),
+            0.0,
+        )
+        kv_bytes = max(self._sanitize_score(float(metadata.kv_bytes)), 0.0)
+        cost_size_score = min(
+            25.0,
+            math.log1p(recompute_cost) * 4.0,
+        ) - min(15.0, math.log1p(kv_bytes) / 2.0)
+
+        business_residual = (
+            self._bounded_adjustment(
+                max(metadata.reusable_tokens, metadata.estimated_reuse_prefix_len),
                 self.reuse_prefix_weight,
                 self.max_reuse_prefix_adjustment,
             )
@@ -170,12 +184,57 @@ class BusinessAwareStrategy(EvictionStrategy):
                 self.max_priority_adjustment,
             )
         )
-        keep_score *= sla_mult
+        content_adjustments = {
+            "public_prefix": 12.0,
+            "tool_schema": 12.0,
+            "retrieval_prefix": 8.0,
+            "session_prefix": 5.0,
+            "private_tail": -4.0,
+        }
+        business_residual += content_adjustments.get(metadata.content_type, 0.0)
+        if metadata.prediction_expires_at > wall_now and metadata.reuse_probability > 0:
+            business_residual += (
+                15.0 * metadata.reuse_probability * metadata.prediction_confidence
+            )
+        business_residual *= _sla_multiplier(metadata.sla_class)
+        business_residual = max(
+            -self.max_business_residual,
+            min(self.max_business_residual, business_residual),
+        )
 
-        if metadata.business_complete:
-            keep_score -= self.business_complete_penalty
+        lifecycle_adjustment = 0.0
+        if metadata.lifecycle_state == "tool_waiting":
+            # A waiting tool is protected only while its finite lease is valid.
+            if metadata.lease_expires_at > wall_now:
+                lifecycle_adjustment = self.max_lifecycle_adjustment
+        elif metadata.lifecycle_state == "tool_returned":
+            lifecycle_adjustment = 8.0
+        elif metadata.lifecycle_state in {"completed", "cancelled"}:
+            lifecycle_adjustment = -self.max_lifecycle_adjustment
+        elif metadata.business_complete:
+            lifecycle_adjustment = -self.business_complete_penalty
 
-        return keep_score
+        return base_score + cost_size_score + business_residual + lifecycle_adjustment
+
+    def should_admit(self, metadata, num_tokens: int) -> bool:
+        """Conservative admission; rejection never affects current computation."""
+        if metadata is None:
+            return True
+        if metadata.content_type in {"public_prefix", "tool_schema"}:
+            return True
+        if (
+            metadata.content_type == "private_tail"
+            and num_tokens >= self.large_private_tail_tokens
+            and metadata.reuse_probability * metadata.prediction_confidence < 0.25
+        ):
+            return False
+        if (
+            metadata.lifecycle_state in {"completed", "cancelled"}
+            and metadata.content_type == "private_tail"
+            and metadata.reuse_probability * metadata.prediction_confidence < 0.5
+        ):
+            return False
+        return True
 
     def explain(self, node: "TreeNode") -> dict:
         metadata = self.metadata_store.get_for_node(node.id)
@@ -212,6 +271,6 @@ class BusinessAwareStrategy(EvictionStrategy):
             "priority": self.get_priority(node),
         }
 
-    def get_priority(self, node: "TreeNode") -> Tuple[float, float]:
+    def get_priority(self, node: "TreeNode") -> Tuple[float, float, int]:
         keep_score = self._compute_keep_score(node)
-        return (keep_score, node.last_access_time)
+        return (keep_score, node.last_access_time, node.id)

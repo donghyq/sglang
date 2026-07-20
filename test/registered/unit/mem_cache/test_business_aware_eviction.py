@@ -98,9 +98,7 @@ class TestBusinessAwareEvictionPolicy(unittest.TestCase):
                 business_complete=True,
             ),
         )
-        self.assertLess(
-            strategy.get_priority(completed), strategy.get_priority(active)
-        )
+        self.assertLess(strategy.get_priority(completed), strategy.get_priority(active))
 
     def test_explain_contains_keep_score_and_metadata(self):
         store = BusinessMetadataStore()
@@ -137,7 +135,6 @@ class TestBusinessAwareEvictionPolicy(unittest.TestCase):
         store = BusinessMetadataStore()
         strategy = BusinessAwareStrategy(metadata_store=store)
         baseline = time.monotonic()
-
         normal = FakeNode(id=110, last_access_time=baseline, hit_count=1)
         extreme = FakeNode(id=111, last_access_time=baseline, hit_count=1)
 
@@ -171,7 +168,17 @@ class TestBusinessAwareEvictionPolicy(unittest.TestCase):
                 estimated_reload_cost=float("-inf"),
             ),
         )
-        self.assertEqual(strategy.get_priority(clean), strategy.get_priority(dirty))
+        clean_priority = strategy.get_priority(clean)
+        dirty_priority = strategy.get_priority(dirty)
+        self.assertAlmostEqual(clean_priority[0], dirty_priority[0], places=3)
+        self.assertEqual(clean_priority[1], dirty_priority[1])
+
+    def test_non_finite_integer_fields_fail_closed_in_builder(self):
+        metadata = BusinessMetadataBuilder().build(
+            {"reusable_tokens": float("inf"), "kv_bytes": float("nan")}
+        )
+        self.assertEqual(metadata.reusable_tokens, 0)
+        self.assertEqual(metadata.kv_bytes, 0)
 
     def test_all_high_priority_requests_do_not_break_recency_order(self):
         store = BusinessMetadataStore()
@@ -185,6 +192,41 @@ class TestBusinessAwareEvictionPolicy(unittest.TestCase):
                 BusinessMetadata(priority=999999, sla_class="premium"),
             )
         self.assertLess(strategy.get_priority(old), strategy.get_priority(new))
+
+    def test_tool_waiting_protection_expires_with_lease(self):
+        store = BusinessMetadataStore()
+        strategy = BusinessAwareStrategy(metadata_store=store)
+        baseline = time.monotonic()
+        wall_now = time.time()
+        leased = FakeNode(id=140, last_access_time=baseline, hit_count=1)
+        expired = FakeNode(id=141, last_access_time=baseline, hit_count=1)
+        store.set_for_node(
+            leased.id,
+            BusinessMetadata(
+                lifecycle_state="tool_waiting", lease_expires_at=wall_now + 60
+            ),
+        )
+        store.set_for_node(
+            expired.id,
+            BusinessMetadata(
+                lifecycle_state="tool_waiting", lease_expires_at=wall_now - 1
+            ),
+        )
+        self.assertGreater(
+            strategy.get_priority(leased), strategy.get_priority(expired)
+        )
+
+    def test_large_one_shot_private_tail_is_not_admitted(self):
+        strategy = BusinessAwareStrategy(metadata_store=BusinessMetadataStore())
+        metadata = BusinessMetadata(
+            content_type="private_tail",
+            reuse_probability=0.1,
+            prediction_confidence=0.5,
+        )
+        self.assertFalse(strategy.should_admit(metadata, 8192))
+        self.assertTrue(
+            strategy.should_admit(BusinessMetadata(content_type="public_prefix"), 16384)
+        )
 
 
 class TestBusinessMetadataBuilder(unittest.TestCase):
@@ -238,6 +280,26 @@ class TestBusinessMetadataBuilder(unittest.TestCase):
         self.assertEqual(metadata.estimated_reload_cost, 0.0)
         self.assertEqual(metadata.priority, 0)
         self.assertFalse(metadata.business_complete)
+
+    def test_runtime_fields_are_clamped_and_validated(self):
+        metadata = BusinessMetadataBuilder().build(
+            {
+                "session": "s1",
+                "workflow": "w1",
+                "state": "invalid",
+                "reuse_probability": 4,
+                "prediction_confidence": -2,
+                "kv_bytes": -1,
+                "content_type": "unknown",
+            }
+        )
+        self.assertEqual(metadata.session_id, "s1")
+        self.assertEqual(metadata.workflow_id, "w1")
+        self.assertEqual(metadata.lifecycle_state, "active")
+        self.assertEqual(metadata.reuse_probability, 1.0)
+        self.assertEqual(metadata.prediction_confidence, 0.0)
+        self.assertEqual(metadata.kv_bytes, 0)
+        self.assertEqual(metadata.content_type, "private_tail")
 
 
 if __name__ == "__main__":

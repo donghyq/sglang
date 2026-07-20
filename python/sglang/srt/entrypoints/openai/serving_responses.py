@@ -287,6 +287,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             if request.retrieval_cache is not None
                             else None
                         ),
+                        cache_business_context=request.cache_business_context,
                         background=request.background,
                     )
 
@@ -1305,6 +1306,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 rid=request_id,
                 extra_key=adapted_request.extra_key,
                 retrieval_cache=adapted_request.retrieval_cache,
+                cache_business_context=adapted_request.cache_business_context,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,

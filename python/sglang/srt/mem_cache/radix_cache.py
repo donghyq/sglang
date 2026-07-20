@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.business_metadata import BusinessMetadataStore
+from sglang.srt.mem_cache.business_metadata import (
+    BusinessMetadata,
+    BusinessMetadataBuilder,
+    BusinessMetadataStore,
+    metric_content_type,
+    metric_workflow_stage,
+)
 
 """
 Copyright 2023-2024 SGLang Team
@@ -25,9 +31,11 @@ The radix tree data structure for managing the KV cache.
 import hashlib
 import heapq
 import logging
+import struct
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
@@ -320,7 +328,36 @@ def split_node_hash_value(
     return new_node_hash, child_hash
 
 
+@dataclass(frozen=True)
+class _EvictionTombstone:
+    created_at: float
+    tokens: int
+    estimated_bytes: int
+    reason: str
+    workflow_stage: str
+    content_type: str
+
+
+@dataclass
+class _RetentionSample:
+    node: TreeNode
+    tracked_at: float
+    sampled_at: float
+    last_hit_count: int
+    lease_was_active: bool = False
+    prediction_was_active: bool = False
+    lease_expiry_reported: bool = False
+    prediction_expiry_reported: bool = False
+
+
 class RadixCache(BasePrefixCache):
+    _TOMBSTONE_MAX_ENTRIES = 4096
+    _TOMBSTONE_TTL_SECONDS = 60.0
+    _RETENTION_SAMPLE_MAX_ENTRIES = 512
+    _RETENTION_SAMPLE_BATCH = 8
+    _RETENTION_SAMPLE_INTERVAL_SECONDS = 1.0
+    _RETENTION_SAMPLE_TTL_SECONDS = 600.0
+
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
@@ -342,6 +379,9 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.business_metadata_store = BusinessMetadataStore()
+        self._eviction_tombstones: OrderedDict[str, _EvictionTombstone] = OrderedDict()
+        self._retention_samples: OrderedDict[int, _RetentionSample] = OrderedDict()
+        self._last_retention_sample_at = time.monotonic()
 
         if self.eviction_policy == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
@@ -393,6 +433,12 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        self.business_metadata_store.clear()
+        # A reset/version invalidation is not a capacity eviction. Drop all
+        # observation state so a later miss cannot be attributed to eviction.
+        self._eviction_tombstones.clear()
+        self._retention_samples.clear()
+        self._last_retention_sample_at = time.monotonic()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
@@ -469,11 +515,32 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._observe_recompute_after_miss(key, len(value))
+        self._maybe_sample_retention()
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
         )
+
+    def probe_prefix(self, key: RadixKey) -> Tuple[int, Optional[TreeNode]]:
+        """Read-only physical prefix probe without access-stat or tree mutation."""
+        if self.disable or len(key) == 0:
+            return 0, None
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        matched = 0
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None or child.evicted:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            matched += prefix_len
+            node = child
+            if prefix_len < len(child.key):
+                break
+            key = key[prefix_len:]
+        return matched, node if matched else None
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -520,6 +587,11 @@ class RadixCache(BasePrefixCache):
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
+        metadata = getattr(req, "business_metadata", None)
+        if is_insert and isinstance(self.eviction_strategy, BusinessAwareStrategy):
+            is_insert = self.eviction_strategy.should_admit(metadata, key_len)
+            self._record_admission_metric(is_insert, metadata)
+
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
@@ -531,7 +603,11 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+            self._bind_request_business_metadata(req, radix_key)
         else:
+            # Only release request-owned KV after the already protected prefix.
+            # Earlier chunked nodes can be shared or locked and must remain in
+            # the radix tree until normal capacity eviction reclaims them.
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
@@ -607,6 +683,7 @@ class RadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+        self._bind_business_metadata_to_node(req, new_last_node, len(radix_key))
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -620,6 +697,7 @@ class RadixCache(BasePrefixCache):
             return EvictResult()
 
         start_time = time.perf_counter()
+        self._maybe_sample_retention()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
@@ -631,6 +709,7 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            self._record_capacity_tombstone(x, "device_capacity")
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
@@ -710,6 +789,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
+            self._inc_hit_count(child)
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -741,6 +821,8 @@ class RadixCache(BasePrefixCache):
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         self.business_metadata_store.copy_for_node(child.id, new_node.id)
+        if self.business_metadata_store.get_for_node(new_node.id) is not None:
+            self._track_retention_node(new_node)
 
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -835,6 +917,7 @@ class RadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.business_metadata_store.pop_for_node(node.id)
+        self._drop_retention_node(node)
 
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
@@ -842,9 +925,9 @@ class RadixCache(BasePrefixCache):
         self._update_leaf_status(node.parent)
 
     def set_business_metadata(self, node: TreeNode, **kwargs) -> None:
-        from sglang.srt.mem_cache.business_metadata import BusinessMetadata
-
-        self.business_metadata_store.set_for_node(node.id, BusinessMetadata(**kwargs))
+        metadata = BusinessMetadataBuilder().build(kwargs)
+        self.business_metadata_store.set_for_node(node.id, metadata)
+        self._track_retention_node(node)
 
     def get_business_metadata_explanation(self, node: TreeNode):
         if hasattr(self.eviction_strategy, "explain"):
@@ -858,11 +941,287 @@ class RadixCache(BasePrefixCache):
         that alias mapping, type coercion, and graceful degradation are
         handled centrally by BusinessMetadataBuilder.
         """
-        from sglang.srt.mem_cache.business_metadata import BusinessMetadataBuilder
-
         builder = BusinessMetadataBuilder()
         metadata = builder.build(context)
         self.business_metadata_store.set_for_node(node.id, metadata)
+        self._track_retention_node(node)
+
+    def _bind_request_business_metadata(self, req: Req, key: RadixKey) -> None:
+        """Bind normalized request hints to the exact terminal cache node."""
+        try:
+            matched, node = self.probe_prefix(key)
+            if matched != len(key) or node is None:
+                return
+            self._bind_business_metadata_to_node(req, node, len(key))
+        except Exception:
+            logger.warning(
+                "Failed to bind business metadata for request %s",
+                getattr(req, "rid", "unknown"),
+                exc_info=True,
+            )
+
+    def _bind_business_metadata_to_node(
+        self, req: Req, node: TreeNode, reusable_tokens: int
+    ) -> None:
+        metadata = getattr(req, "business_metadata", None)
+        if not isinstance(metadata, BusinessMetadata) or node is self.root_node:
+            return
+        self.business_metadata_store.bind_runtime_facts(
+            node.id,
+            metadata,
+            reusable_tokens=reusable_tokens,
+        )
+        self._track_retention_node(node)
+
+    @staticmethod
+    def _digest_units(
+        units: List[Union[int, Tuple[int, int]]],
+        *,
+        extra_key: Optional[str],
+        is_bigram: bool,
+    ) -> str:
+        """Hash an exact logical prefix without retaining user token content."""
+        digest = hashlib.sha256()
+        digest.update(b"radix-regret-v1\x01" if is_bigram else b"radix-regret-v1\x00")
+        encoded_extra_key = (extra_key or "").encode("utf-8", errors="replace")
+        digest.update(struct.pack("<I", len(encoded_extra_key)))
+        digest.update(encoded_extra_key)
+        for unit in units:
+            if is_bigram:
+                left, right = unit
+                digest.update(struct.pack("<qq", int(left), int(right)))
+            else:
+                digest.update(struct.pack("<q", int(unit)))
+        digest.update(struct.pack("<Q", len(units)))
+        return digest.hexdigest()
+
+    def _node_prefix_units(self, node: TreeNode):
+        path = []
+        current = node
+        while current is not None and current is not self.root_node:
+            path.append(current)
+            current = current.parent
+        path.reverse()
+        units = []
+        for path_node in path:
+            units.extend(list(path_node.key))
+        return units
+
+    def _record_capacity_tombstone(self, node: TreeNode, reason: str) -> None:
+        """Remember a bounded, privacy-safe identity for real capacity loss."""
+        try:
+            units = self._node_prefix_units(node)
+            if not units:
+                return
+            metadata = self.business_metadata_store.get_for_node(node.id)
+            digest = self._digest_units(
+                units,
+                extra_key=node.key.extra_key,
+                is_bigram=node.key.is_bigram,
+            )
+            estimated_bytes = 0
+            if metadata is not None and metadata.kv_bytes > 0:
+                reusable_tokens = max(1, metadata.reusable_tokens)
+                estimated_bytes = int(
+                    metadata.kv_bytes
+                    * min(len(node.key), reusable_tokens)
+                    / reusable_tokens
+                )
+            self._eviction_tombstones[digest] = _EvictionTombstone(
+                created_at=time.monotonic(),
+                tokens=len(node.key),
+                estimated_bytes=estimated_bytes,
+                reason=reason,
+                workflow_stage=metric_workflow_stage(
+                    metadata.workflow_stage if metadata else "unknown"
+                ),
+                content_type=metric_content_type(
+                    metadata.content_type if metadata else "private_tail"
+                ),
+            )
+            self._eviction_tombstones.move_to_end(digest)
+            self._cleanup_expired_tombstones(time.monotonic())
+            while len(self._eviction_tombstones) > self._TOMBSTONE_MAX_ENTRIES:
+                self._eviction_tombstones.popitem(last=False)
+        except Exception:
+            logger.warning("Failed to record KV eviction tombstone", exc_info=True)
+
+    def _cleanup_expired_tombstones(self, now: float) -> None:
+        while self._eviction_tombstones:
+            _, tombstone = next(iter(self._eviction_tombstones.items()))
+            if now - tombstone.created_at <= self._TOMBSTONE_TTL_SECONDS:
+                break
+            self._eviction_tombstones.popitem(last=False)
+
+    def _observe_recompute_after_miss(self, key: RadixKey, matched_tokens: int) -> None:
+        """Consume the longest exact evicted prefix when a lookup now misses."""
+        if matched_tokens >= len(key) or not self._eviction_tombstones:
+            return
+        try:
+            now = time.monotonic()
+            self._cleanup_expired_tombstones(now)
+            units = list(key)
+            found_digest = None
+            found = None
+            # Only page boundaries can have existed as radix nodes. Search from
+            # longest to shortest and consume one event per lookup.
+            length = len(units) // self.page_size * self.page_size
+            while length > matched_tokens:
+                digest = self._digest_units(
+                    units[:length],
+                    extra_key=key.extra_key,
+                    is_bigram=key.is_bigram,
+                )
+                tombstone = self._eviction_tombstones.get(digest)
+                if tombstone is not None:
+                    found_digest, found = digest, tombstone
+                    break
+                length -= self.page_size
+            if found_digest is None or found is None:
+                return
+            self._eviction_tombstones.pop(found_digest, None)
+            collector = self.metrics_collector
+            if collector is not None:
+                collector.record_recompute_regret(
+                    reason=found.reason,
+                    workflow_stage=found.workflow_stage,
+                    content_type=found.content_type,
+                    tokens=found.tokens,
+                    estimated_bytes=found.estimated_bytes,
+                )
+        except Exception:
+            logger.warning("Failed to observe KV recompute regret", exc_info=True)
+
+    def _track_retention_node(self, node: TreeNode) -> None:
+        try:
+            monotonic_now = time.monotonic()
+            wall_now = time.time()
+            metadata = self.business_metadata_store.get_for_node(node.id)
+            if metadata is None:
+                return
+            self._retention_samples[node.id] = _RetentionSample(
+                node=node,
+                tracked_at=monotonic_now,
+                sampled_at=monotonic_now,
+                last_hit_count=node.hit_count,
+                lease_was_active=(
+                    metadata.lease_expires_at > 0
+                    and wall_now < metadata.lease_expires_at
+                ),
+                prediction_was_active=(
+                    metadata.reuse_probability > 0
+                    and metadata.prediction_confidence > 0
+                    and metadata.prediction_expires_at > 0
+                    and wall_now < metadata.prediction_expires_at
+                ),
+            )
+            self._retention_samples.move_to_end(node.id)
+            while len(self._retention_samples) > self._RETENTION_SAMPLE_MAX_ENTRIES:
+                self._retention_samples.popitem(last=False)
+            self._maybe_sample_retention(monotonic_now)
+        except Exception:
+            logger.warning("Failed to track KV retention sample", exc_info=True)
+
+    def _drop_retention_node(self, node: TreeNode) -> None:
+        self._retention_samples.pop(node.id, None)
+
+    def _maybe_sample_retention(self, now: Optional[float] = None) -> None:
+        """Sample a bounded rotating subset; never traverse the radix tree."""
+        now = time.monotonic() if now is None else now
+        if (
+            now - self._last_retention_sample_at
+            < self._RETENTION_SAMPLE_INTERVAL_SECONDS
+        ):
+            return
+        self._last_retention_sample_at = now
+        wall_now = time.time()
+        for _ in range(min(self._RETENTION_SAMPLE_BATCH, len(self._retention_samples))):
+            node_id, sample = self._retention_samples.popitem(last=False)
+            if now - sample.tracked_at > self._RETENTION_SAMPLE_TTL_SECONDS:
+                continue
+            metadata = self.business_metadata_store.get_for_node(node_id)
+            if metadata is None:
+                continue
+            self._retention_samples[node_id] = sample
+            elapsed = max(0.0, now - sample.sampled_at)
+            was_used = sample.node.hit_count > sample.last_hit_count
+            if not was_used and elapsed > 0:
+                self._record_retention_interval(metadata, sample.node, elapsed)
+            sample.sampled_at = now
+            sample.last_hit_count = sample.node.hit_count
+            if (
+                not was_used
+                and sample.lease_was_active
+                and wall_now >= metadata.lease_expires_at
+                and not sample.lease_expiry_reported
+            ):
+                self._record_retention_regret("expired_lease", metadata)
+                sample.lease_expiry_reported = True
+            if (
+                not was_used
+                and sample.prediction_was_active
+                and wall_now >= metadata.prediction_expires_at
+                and not sample.prediction_expiry_reported
+            ):
+                self._record_retention_regret("prediction_protected_unused", metadata)
+                sample.prediction_expiry_reported = True
+
+    def _record_retention_interval(
+        self, metadata: BusinessMetadata, node: TreeNode, elapsed: float
+    ) -> None:
+        try:
+            collector = self.metrics_collector
+            if collector is None:
+                return
+            # A sample represents one physical radix segment, not the whole
+            # request prefix attached to its terminal node. Count the segment
+            # once and scale the request-level byte estimate proportionally.
+            tokens = len(node.key)
+            estimated_bytes = 0
+            if metadata.kv_bytes > 0:
+                reusable_tokens = max(1, metadata.reusable_tokens)
+                estimated_bytes = int(
+                    metadata.kv_bytes * min(tokens, reusable_tokens) / reusable_tokens
+                )
+            collector.record_retention_interval(
+                reason="unused_sample",
+                workflow_stage=metric_workflow_stage(metadata.workflow_stage),
+                content_type=metric_content_type(metadata.content_type),
+                token_seconds=max(0, tokens) * elapsed,
+                byte_seconds=max(0, estimated_bytes) * elapsed,
+            )
+        except Exception:
+            logger.warning("Failed to record KV retention interval", exc_info=True)
+
+    def _record_retention_regret(self, reason: str, metadata: BusinessMetadata) -> None:
+        try:
+            collector = self.metrics_collector
+            if collector is not None:
+                collector.record_retention_regret(
+                    reason=reason,
+                    workflow_stage=metric_workflow_stage(metadata.workflow_stage),
+                    content_type=metric_content_type(metadata.content_type),
+                )
+        except Exception:
+            logger.warning("Failed to record KV retention regret", exc_info=True)
+
+    def _record_admission_metric(
+        self, admitted: bool, metadata: Optional[BusinessMetadata]
+    ) -> None:
+        try:
+            collector = self.metrics_collector
+            if collector is not None:
+                collector.record_admission(
+                    admitted=admitted,
+                    workflow_stage=metric_workflow_stage(
+                        metadata.workflow_stage if metadata else "unknown"
+                    ),
+                    content_type=metric_content_type(
+                        metadata.content_type if metadata else "private_tail"
+                    ),
+                )
+        except Exception:
+            logger.warning("Failed to record KV admission decision", exc_info=True)
 
     def _update_leaf_status(self, node: TreeNode):
         if node.evicted or node.lock_ref > 0:

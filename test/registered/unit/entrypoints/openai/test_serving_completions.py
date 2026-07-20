@@ -85,6 +85,19 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(internal.retrieval_cache["namespace"], "docs")
         self.assertEqual(internal.retrieval_cache["chunks"][0]["id"], "doc:1")
 
+    def test_cache_business_context_is_propagated(self):
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            cache_business_context={
+                "session": "session-1",
+                "state": "tool_waiting",
+            },
+        )
+        internal, _ = self.sc._convert_to_internal_request(req)
+        self.assertEqual(internal.cache_business_context["session"], "session-1")
+        self.assertEqual(internal.cache_business_context["state"], "tool_waiting")
+
     def test_retrieval_runtime_prefix_is_rendered_for_text_prompt(self):
         req = CompletionRequest(
             model="x",

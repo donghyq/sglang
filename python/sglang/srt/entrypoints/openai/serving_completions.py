@@ -138,6 +138,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if request.retrieval_cache is not None
                 else None
             ),
+            cache_business_context=request.cache_business_context,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,

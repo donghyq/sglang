@@ -545,6 +545,19 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertNotEqual(original_rid, new_rid)
         self.assertEqual(req.rid, new_rid)
 
+    def test_business_context_batch_item_propagation(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            cache_business_context=[
+                {"session": "session-1"},
+                {"session": "session-2"},
+            ],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].cache_business_context["session"], "session-1")
+        self.assertEqual(req[1].cache_business_context["session"], "session-2")
+
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided

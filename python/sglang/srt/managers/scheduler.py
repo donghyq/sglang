@@ -1888,6 +1888,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                business_metadata=recv_req.business_metadata,
             )
             req.tokenizer = self.tokenizer
 

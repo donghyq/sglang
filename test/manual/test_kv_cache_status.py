@@ -37,7 +37,6 @@ def _bootstrap_local_sglang_import() -> None:
 _bootstrap_local_sglang_import()
 
 from sglang.srt.mem_cache.kv_cache_status import (
-    KVCacheStatus,
     KVCacheStatusReporter,
 )
 from sglang.srt.mem_cache.retrieval_cache_planner import (
@@ -47,7 +46,6 @@ from sglang.srt.mem_cache.retrieval_cache_planner import (
 )
 
 import pytest
-
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -103,7 +101,7 @@ def _make_payload(
 
 
 def _make_reporter_with_store(
-    stored_chunks=None,
+    stored_chunks=None, *, prefix_cache=None, metrics_collector=None
 ) -> KVCacheStatusReporter:
     """Create a reporter backed by a store with optional pre-stored chunks."""
     store = RetrievedChunkKVStore()
@@ -111,7 +109,56 @@ def _make_reporter_with_store(
         for chunk in stored_chunks:
             store.put(chunk)
     planner = RetrievalConditionedKVPlanner(store=store)
-    return KVCacheStatusReporter(planner=planner)
+    return KVCacheStatusReporter(
+        planner=planner,
+        prefix_cache=prefix_cache,
+        metrics_collector=metrics_collector,
+    )
+
+
+class _FakeMetadataStore:
+    def get_for_node(self, node_id):
+        return types.SimpleNamespace(
+            kv_bytes=4096,
+            retrieval_namespace="retrieval:v1:test",
+            lease_expires_at=0.0,
+            content_type="retrieval_prefix",
+            lifecycle_state="active",
+            recompute_cost=2.0,
+        )
+
+
+class _FakePrefixCache:
+    def __init__(self, matched_tokens):
+        self.matched_tokens = matched_tokens
+        self.business_metadata_store = _FakeMetadataStore()
+
+    def probe_prefix(self, key):
+        node = types.SimpleNamespace(id=7, lock_ref=1)
+        return self.matched_tokens, node if self.matched_tokens else None
+
+
+class _FakeMetricsCollector:
+    def __init__(self, raises=False):
+        self.raises = raises
+        self.outcomes = []
+
+    def record_planner_physical_outcome(self, **outcome):
+        if self.raises:
+            raise RuntimeError("metrics unavailable")
+        self.outcomes.append(outcome)
+
+
+def _install_fake_radix_key(monkeypatch):
+    module = types.ModuleType("sglang.srt.mem_cache.radix_cache")
+
+    class RadixKey:
+        def __init__(self, token_ids, extra_key=None):
+            self.token_ids = token_ids
+            self.extra_key = extra_key
+
+    module.RadixKey = RadixKey
+    monkeypatch.setitem(sys.modules, "sglang.srt.mem_cache.radix_cache", module)
 
 
 # --------------------------------------------------------------------------- #
@@ -120,7 +167,7 @@ def _make_reporter_with_store(
 
 
 class TestHitScenario:
-    """A matching stored chunk should produce has_cache=True."""
+    """A planner match is a candidate, not a physical cache hit."""
 
     def test_hit_scenario(self):
         chunk = _make_stored_chunk(token_count=256)
@@ -129,11 +176,14 @@ class TestHitScenario:
         payload = _make_payload()
         status = reporter.query(payload)
 
-        assert status.has_cache is True
+        assert status.has_cache is False
+        assert status.planner_candidate is True
+        assert status.physical_exact_hit is False
         assert status.hit_chunk_count == 1
         assert status.miss_chunk_count == 0
-        assert status.reusable_token_count == 256
-        assert status.fallback_required is False
+        assert status.reusable_token_count == 0
+        assert status.fallback_required is True
+        assert status.reject_reason == "physical_prefix_not_verified"
         assert status.miss_breakdown == {}
         assert status.plan_latency_ms >= 0.0
 
@@ -145,19 +195,19 @@ class TestHitScenario:
         status = reporter.query(_make_payload())
         d = status.to_dict()
 
-        assert d["has_cache"] is True
+        assert d["has_cache"] is False
+        assert d["planner_candidate"] is True
+        assert d["physical_exact_hit"] is False
         assert d["hit_chunk_count"] == 1
         assert d["miss_chunk_count"] == 0
-        assert d["reusable_token_count"] == 100
-        assert d["fallback_required"] is False
+        assert d["reusable_token_count"] == 0
+        assert d["fallback_required"] is True
         assert d["miss_breakdown"] == {}
         assert isinstance(d["plan_latency_ms"], float)
 
     def test_partial_hit(self):
         """One hit + one miss should report has_cache=True, fallback=True."""
-        hit_chunk = _make_stored_chunk(
-            chunk_id="chunk_hit", content_hash="hash_hit"
-        )
+        hit_chunk = _make_stored_chunk(chunk_id="chunk_hit", content_hash="hash_hit")
         reporter = _make_reporter_with_store([hit_chunk])
 
         payload = {
@@ -178,12 +228,50 @@ class TestHitScenario:
         }
         status = reporter.query(payload)
 
-        assert status.has_cache is True
+        assert status.has_cache is False
+        assert status.planner_candidate is True
         assert status.hit_chunk_count == 1
         assert status.miss_chunk_count == 1
         assert status.fallback_required is True
         assert "blob_missing" in status.miss_breakdown
         assert status.miss_breakdown["blob_missing"] == 1
+
+    def test_planner_and_physical_outcome_are_recorded_separately(self, monkeypatch):
+        _install_fake_radix_key(monkeypatch)
+        collector = _FakeMetricsCollector()
+        reporter = _make_reporter_with_store(
+            [_make_stored_chunk()],
+            prefix_cache=_FakePrefixCache(matched_tokens=3),
+            metrics_collector=collector,
+        )
+
+        status = reporter.query(
+            _make_payload(), input_ids=[1, 2, 3, 4], extra_key="retrieval:v1:test"
+        )
+
+        assert status.has_cache is True
+        assert status.planner_candidate is True
+        assert status.physical_exact_hit is True
+        assert status.reusable_token_count == 3
+        assert status.estimated_kv_bytes == 4096
+        assert collector.outcomes == [
+            {"planner_candidate": True, "physical_exact_hit": True}
+        ]
+
+    def test_metrics_failure_does_not_change_status(self, monkeypatch):
+        _install_fake_radix_key(monkeypatch)
+        reporter = _make_reporter_with_store(
+            [_make_stored_chunk()],
+            prefix_cache=_FakePrefixCache(matched_tokens=2),
+            metrics_collector=_FakeMetricsCollector(raises=True),
+        )
+
+        status = reporter.query(
+            _make_payload(), input_ids=[1, 2], extra_key="retrieval:v1:test"
+        )
+
+        assert status.has_cache is True
+        assert status.reusable_token_count == 2
 
 
 class TestMissScenario:
