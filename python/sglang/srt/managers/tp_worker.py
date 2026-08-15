@@ -525,6 +525,15 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
+            if batch is not None and batch.is_trie_beam_batch:
+                # Trie beam search ranks only legal child tokens across all live
+                # branches.  Calling the ordinary sampler here would consume one
+                # unconstrained token before that coordinated ranking can run.
+                # Scheduler admission remains closed until its branch lifecycle
+                # consumes this explicitly marked result.
+                batch_result.is_trie_beam_logits = True
+                return batch_result
+
             if (
                 self.enable_overlap
                 and not self.enable_spec

@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import copy
 import dataclasses
 import faulthandler
 import logging
@@ -40,6 +41,14 @@ from torch.distributed import barrier
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.constrained.trie_beam_search import (
+    TrieBeam,
+    TrieBeamExecution,
+    TrieBeamGroup,
+    TrieBeamRuntime,
+    TrieBeamRuntimeBranch,
+)
+from sglang.srt.constrained.trie_grammar_backend import TrieGrammar
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -164,6 +173,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_MATCHED_TOKEN,
     MultimodalInputs,
     NextBatchPlan,
     Req,
@@ -287,6 +297,19 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class TrieBeamSchedulerExecution:
+    """Scheduler-owned state for one isolated Trie constrained beam request.
+
+    This state is deliberately separate from ``Req``.  A root request is the
+    only externally visible request, while the execution owns internal branch
+    requests and their KV-page mappings.
+    """
+
+    root_req: Req
+    execution: TrieBeamExecution
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -974,6 +997,321 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        # A root request id maps to its scheduler-owned trie beam execution.
+        # Admission stays closed until the complete execution path is wired,
+        # but keeping this state separate from ordinary Req objects prevents
+        # branch-local lifecycle state from leaking into normal scheduling.
+        self.trie_beam_executions: Dict[str, Any] = {}
+
+    def _fork_trie_beam_kv_mapping(
+        self,
+        parent: TrieBeamRuntimeBranch,
+        _child: TrieBeam,
+        shared_prefix: torch.Tensor,
+    ) -> torch.Tensor:
+        """Create a child KV mapping with a shared full-page prefix.
+
+        The writable suffix is allocated on private pages and copied before it
+        is published to the child request.  The returned tensor deliberately
+        contains only logical token locations: allocator ownership is tracked
+        at page granularity by ``TrieBeamRuntime``.
+        """
+        parent_kv = parent.kv_indices
+        prefix_len = shared_prefix.numel()
+        if prefix_len > parent_kv.numel() or prefix_len % self.page_size:
+            raise ValueError(
+                "Trie beam shared KV prefix must be a page-aligned parent prefix."
+            )
+        if prefix_len and not torch.equal(parent_kv[:prefix_len], shared_prefix):
+            raise ValueError(
+                "Trie beam shared KV prefix does not match the parent mapping."
+            )
+
+        suffix_len = parent_kv.numel() - prefix_len
+        if suffix_len == 0:
+            return parent_kv.clone()
+
+        private_page_len = (
+            (suffix_len + self.page_size - 1) // self.page_size
+        ) * self.page_size
+        private_pages = self.token_to_kv_pool_allocator.alloc(private_page_len)
+        if private_pages is None:
+            raise RuntimeError(
+                "Insufficient KV cache pages to create a trie beam private suffix."
+            )
+        private_suffix = private_pages[:suffix_len]
+        try:
+            self.token_to_kv_pool.move_kv_cache(
+                private_suffix, parent_kv[prefix_len:]
+            )
+        except Exception:
+            self.token_to_kv_pool_allocator.free(private_pages)
+            raise
+        return torch.cat((shared_prefix, private_suffix))
+
+    def _release_unregistered_trie_beam_kv_mapping(
+        self, kv_indices: torch.Tensor
+    ) -> None:
+        """Return private pages prepared for a child that was not committed."""
+        allocator = self.token_to_kv_pool_allocator
+        if self.page_size == 1:
+            page_ids = kv_indices
+            beam_page_refcounts = getattr(allocator, "beam_token_refcounts", {})
+        else:
+            page_ids = kv_indices // self.page_size
+            beam_page_refcounts = getattr(allocator, "beam_page_refcounts", {})
+        private_mask = torch.tensor(
+            [int(page_id) not in beam_page_refcounts for page_id in page_ids.cpu()],
+            dtype=torch.bool,
+            device=kv_indices.device,
+        )
+        private_indices = kv_indices[private_mask]
+        if private_indices.numel():
+            allocator.free(private_indices)
+
+    @staticmethod
+    def _clone_trie_beam_req(parent: Req, beam: TrieBeam) -> Req:
+        """Clone branch-local request state without exposing internal branch ids.
+
+        The caller subsequently obtains a fresh request-pool slot.  Mutable
+        output and grammar state must never be shared with a sibling branch.
+        """
+        child = copy.copy(parent)
+        child.rid = f"{parent.rid}#trie-beam-{beam.branch_id}"
+        child.output_ids = array("q", beam.tokens)
+        child.full_untruncated_fill_ids = parent.origin_input_ids + child.output_ids
+        child.grammar = beam.grammar
+        child.req_pool_idx = None
+        child.finished_reason = None
+        child.finished_output = None
+        child.to_finish = None
+        child.kv_committed_freed = False
+        child.kv_overallocated_freed = False
+        child.trie_beam_root_rid = parent.trie_beam_root_rid
+        return child
+
+    @staticmethod
+    def _apply_trie_beam_to_req(req: Req, beam: TrieBeam) -> None:
+        """Make an existing internal request represent its selected Beam."""
+        req.output_ids = array("q", beam.tokens)
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.grammar = beam.grammar
+        req.finished_reason = None
+        req.finished_output = None
+        req.to_finish = None
+
+    def _trie_beam_shared_prefixes(
+        self, execution: TrieBeamExecution
+    ) -> Dict[int, torch.Tensor]:
+        """Return page-aligned prefixes only for parents that fork."""
+        prefixes = {}
+        # ``TrieBeamExecution.advance`` computes the transition after it has
+        # selected children from logits.  Prepare a prefix for each currently
+        # live parent so the coordinator can consume precisely the entries
+        # needed by a newly discovered fork.
+        for parent_id, branch in execution.runtime.branches.items():
+            parent_kv = branch.kv_indices
+            prefix_len = (parent_kv.numel() // self.page_size) * self.page_size
+            prefixes[parent_id] = parent_kv[:prefix_len]
+        return prefixes
+
+    def _start_trie_beam_execution(self, req: Req) -> TrieBeamSchedulerExecution:
+        if not isinstance(req.grammar, TrieGrammar):
+            raise ValueError("Trie beam search requires a TrieGrammar request.")
+        if req.req_pool_idx is None:
+            raise RuntimeError("Trie beam root must own a request-pool slot.")
+        kv_len = req.kv_committed_len
+        root_kv = self.req_to_token_pool.req_to_token[req.req_pool_idx, :kv_len]
+        cache_protected_len = req.cache_protected_len
+        if cache_protected_len > kv_len:
+            raise RuntimeError(
+                "Trie beam cache-protected prefix exceeds the root KV mapping."
+            )
+        if cache_protected_len % self.page_size:
+            raise RuntimeError(
+                "Trie beam cache-protected prefix must end at a KV page boundary."
+            )
+        group = TrieBeamGroup(
+            req.grammar.fork(),
+            req.sampling_params.beam_width,
+            req.sampling_params.num_return_sequences,
+        )
+        execution = TrieBeamExecution(
+            group,
+            TrieBeamRuntime(
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.page_size,
+            ),
+        )
+        execution.register_root(req, root_kv, root_kv[cache_protected_len:])
+        req.trie_beam_root_rid = req.rid
+        state = TrieBeamSchedulerExecution(root_req=req, execution=execution)
+        self.trie_beam_executions[req.rid] = state
+        return state
+
+    def _build_trie_beam_decode_batch(
+        self, state: TrieBeamSchedulerExecution
+    ) -> ScheduleBatch:
+        """Build the next isolated Decode batch for all live Beam branches.
+
+        A selected token is intentionally not part of the branch KV mapping
+        yet.  ``prepare_for_decode`` allocates its destination position, and
+        this method supplies that selected token directly as the Decode input.
+        This mirrors the ordinary scheduler's one-step delayed KV write without
+        relying on its sampled-token relay buffer.
+        """
+        execution = state.execution
+        beams = execution.group.active
+        reqs = [execution.runtime.branches[beam.branch_id].req for beam in beams]
+        if not reqs:
+            raise RuntimeError("Cannot build a Trie beam Decode batch without live branches.")
+        if any(not beam.tokens for beam in beams):
+            raise RuntimeError("Every Trie beam Decode branch must have a selected token.")
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=False,
+            spec_algorithm=self.spec_algorithm,
+        )
+        device = self.req_to_token_pool.device
+        req_pool_indices = [req.req_pool_idx for req in reqs]
+        if any(index is None for index in req_pool_indices):
+            raise RuntimeError("A live Trie beam branch has no request-pool slot.")
+        seq_lens = [req.kv_committed_len for req in reqs]
+        batch.req_pool_indices = torch.tensor(
+            req_pool_indices, dtype=torch.int64, device=device
+        )
+        batch.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq_lens)
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        batch.prepare_for_decode()
+        try:
+            execution.runtime.append_decode_kv_locations(
+                [beam.branch_id for beam in beams], batch.out_cache_loc
+            )
+        except Exception:
+            self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
+            raise
+        batch.input_ids = torch.tensor(
+            [beam.tokens[-1] for beam in beams], dtype=torch.int64, device=device
+        )
+        return batch
+
+    def _finish_trie_beam_execution(self, state: TrieBeamSchedulerExecution) -> None:
+        """Publish the best completed SID path and reclaim internal branches.
+
+        The public SGLang generation protocol has one output sequence per
+        request.  Admission therefore limits this first scheduler integration
+        to ``num_return_sequences == 1``; returning multiple SID paths needs a
+        dedicated response field rather than overloading normal text output.
+        """
+        results = state.execution.results
+        if not results:
+            raise RuntimeError("Trie beam search exhausted without a terminal SID path.")
+        best = results[0]
+        root_req = state.root_req
+        logger.info(
+            "LUGR trie execution finished: rid=%s best_tokens=%s all_results=%s",
+            root_req.rid,
+            best.tokens,
+            [beam.tokens for beam in results],
+        )
+        root_req.output_ids = array("q", best.tokens)
+        root_req.full_untruncated_fill_ids = root_req.origin_input_ids + root_req.output_ids
+        root_req.finished_reason = FINISH_MATCHED_TOKEN(matched=best.tokens[-1])
+        root_req.finished_len = len(best.tokens)
+        state.execution.release_all()
+        self._release_trie_beam_root_cache_lock(root_req)
+        self.trie_beam_executions.pop(root_req.rid, None)
+        self.output_streamer.stream_output([root_req], return_logprob=False)
+
+    def _release_trie_beam_root_cache_lock(self, root_req: Req) -> None:
+        """Release the prefix-cache lock retained by the root request.
+
+        Trie Beam completes outside the ordinary result processor, so it does
+        not call ``release_kv_cache``.  Its uncached KV suffix is reclaimed by
+        ``TrieBeamRuntime``, but the initial prefix-cache match still holds a
+        lock through ``last_node``.  Releasing that lock explicitly keeps the
+        prefix cache's protected-token accounting in sync with the allocator.
+        """
+        if root_req.last_node is not None:
+            self.tree_cache.dec_lock_ref(root_req.last_node)
+            root_req.last_node = None
+
+    def _process_trie_beam_logits(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        """Advance one isolated Trie Beam batch without normal result handling.
+
+        This method only commits Beam-local request/KV ownership.  The general
+        scheduler remains protected by admission control until construction of
+        the next multi-branch decode batch and root-response publication are
+        implemented together.
+        """
+        if result.logits_output is None or result.logits_output.next_token_logits is None:
+            raise RuntimeError("Trie beam worker result does not contain next-token logits.")
+
+        if not batch.reqs:
+            raise RuntimeError("Trie beam logits must contain at least one branch request.")
+        root_rid = getattr(batch.reqs[0], "trie_beam_root_rid", batch.reqs[0].rid)
+        if any(getattr(req, "trie_beam_root_rid", root_rid) != root_rid for req in batch.reqs):
+            raise RuntimeError("Trie beam logits batch mixes different root requests.")
+        state = self.trie_beam_executions.get(root_rid)
+        if state is None:
+            if len(batch.reqs) != 1:
+                raise RuntimeError("The first Trie beam batch must contain one root request.")
+            state = self._start_trie_beam_execution(batch.reqs[0])
+        execution = state.execution
+        expected_reqs = [
+            execution.runtime.branches[beam.branch_id].req
+            for beam in execution.group.active
+        ]
+        if batch.reqs != expected_reqs:
+            raise RuntimeError(
+                "Trie beam Decode batch request order does not match active branches."
+            )
+        logits = result.logits_output.next_token_logits
+        if logits.shape[0] != len(execution.group.active):
+            raise RuntimeError(
+                "Trie beam logits rows do not match the active branch count: "
+                f"{logits.shape[0]} != {len(execution.group.active)}."
+            )
+
+        active = execution.advance(
+            logits,
+            create_child_req=lambda beam: self._clone_trie_beam_req(
+                execution.runtime.branches[beam.parent_id].req, beam
+            ),
+            shared_prefixes=self._trie_beam_shared_prefixes(execution),
+            create_child_kv_indices=self._fork_trie_beam_kv_mapping,
+            release_unregistered_child_kv_indices=(
+                self._release_unregistered_trie_beam_kv_mapping
+            ),
+        )
+        for beam in active:
+            self._apply_trie_beam_to_req(execution.runtime.branches[beam.branch_id].req, beam)
+
+        if execution.is_finished:
+            self._finish_trie_beam_execution(state)
+            # ``event_loop_normal`` stores this batch as ``last_batch`` after
+            # processing its result.  Internal branch requests have already
+            # released their request-pool slots, so leaving them in the batch
+            # would make the scheduler appear perpetually busy: no Trie Beam
+            # execution remains to run, while ``on_idle`` still sees a
+            # non-empty ``last_batch``.  Drop the completed internal batch
+            # before it becomes ``last_batch`` and let the root request remain
+            # the only externally visible completion.
+            batch.filter_batch(keep_indices=[])
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1882,6 +2220,40 @@ class Scheduler(
             ),
         )
 
+    def _trie_beam_request_error(self, req: Req, recv_req, session_id):
+        """Validate the intentionally narrow first scheduler integration."""
+        if req.sampling_params.beam_width <= 1:
+            return None
+        if session_id is not None or recv_req.session_id is not None:
+            return "Trie-constrained beam search does not support sessions yet."
+        if req.stream:
+            return "Trie-constrained beam search does not support streaming output yet."
+        if recv_req.mm_inputs is not None:
+            return "Trie-constrained beam search does not support multimodal inputs yet."
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and req.sampling_params.beam_width > 15
+        ):
+            return (
+                "Trie-constrained Beam P/D handoff currently supports at most "
+                "16 first-step candidates."
+            )
+        if not self.spec_algorithm.is_none():
+            return (
+                "Trie-constrained beam search does not support speculative "
+                "decoding yet."
+            )
+        if self.enable_overlap:
+            return "Trie-constrained beam search requires overlap scheduling to be disabled."
+        if req.sampling_params.num_return_sequences != 1:
+            return (
+                "Trie-constrained beam search currently supports only "
+                "num_return_sequences == 1; multi-SID response encoding is pending."
+            )
+        if self.trie_beam_executions:
+            return "Only one Trie-constrained beam search request may run at a time."
+        return None
+
     def _process_and_broadcast_mm_inputs(
         self,
         raw_mm_inputs,
@@ -2131,6 +2503,12 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if error_msg := self._trie_beam_request_error(req, recv_req, session_id):
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -2627,6 +3005,27 @@ class Scheduler(
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
+        # Trie Beam runs as an isolated scheduler transaction.  Its branch
+        # requests own shared KV pages and must never pass through ordinary
+        # prefix-cache insertion, retraction, or mixed batching.  The root
+        # prefill result has already selected one token per active branch; the
+        # next forward writes those tokens' KV and returns their successor
+        # logits.
+        if self.trie_beam_executions:
+            if len(self.trie_beam_executions) != 1:
+                raise RuntimeError("Only one isolated Trie beam execution may run at a time.")
+            state = next(iter(self.trie_beam_executions.values()))
+            return NextBatchPlan(
+                batch_to_run=self._build_trie_beam_decode_batch(state),
+                # The isolated Trie execution is selected before the ordinary
+                # prefill/decode planner, so it does not need to mark the
+                # ordinary running batch as full. Keeping this flag set
+                # after the final Beam result would leave a later ordinary
+                # request permanently in the waiting queue: no Beam execution
+                # remains, yet the prefill planner refuses to admit work.
+                running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
+            )
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2763,6 +3162,19 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    @staticmethod
+    def _is_trie_beam_root_request(req: Req) -> bool:
+        """Return whether ``req`` needs the isolated Trie Beam prefill protocol.
+
+        A root request has no internal Beam marker until Decode reconstructs its
+        branches.  It must therefore be identified from its Trie grammar and
+        requested beam width while it is still in the Prefill waiting queue.
+        """
+        return (
+            isinstance(getattr(req, "grammar", None), TrieGrammar)
+            and req.sampling_params.beam_width > 1
+        )
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2890,6 +3302,16 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            is_trie_beam_root = self._is_trie_beam_root_request(req)
+            # Trie Beam's first Prefill step produces several constrained
+            # candidates rather than the normal single boundary token.  Do
+            # not merge it into a conventional Prefill batch, otherwise the
+            # latter would silently execute the single-token P/D protocol.
+            # Conversely, once a Trie root has been admitted, stop here so
+            # its candidate handoff owns the whole batch.
+            if is_trie_beam_root and adder.can_run_list:
+                break
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2955,6 +3377,9 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
+                break
+
+            if is_trie_beam_root:
                 break
 
         if mamba_allocator is not None:
@@ -3493,7 +3918,16 @@ class Scheduler(
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
-        if batch.forward_mode.is_decode():
+        if (
+            isinstance(result, GenerationBatchResult)
+            # Some result producers (including older P/D worker paths) do not
+            # materialize this optional coordination marker. Treat the missing
+            # marker as an ordinary generation result.
+            and getattr(result, "is_trie_beam_logits", False)
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            self._process_trie_beam_logits(batch, result)
+        elif batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
@@ -3611,6 +4045,29 @@ class Scheduler(
         self.maybe_sleep_on_idle()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
+        return self._is_scheduler_quiescent(
+            for_health_check=for_health_check, allow_waiting_queue=False
+        )
+
+    def is_paused_for_kv_cache_release(self) -> bool:
+        """Return whether a paused scheduler can safely discard its GPU KV cache.
+
+        A retract-mode global pause moves unfinished requests back to the waiting
+        queue after releasing their request-owned GPU KV. Those requests remain
+        part of the lifecycle, so the server is intentionally not ``fully_idle``.
+        They are nevertheless unable to run while ``_engine_paused`` is set.
+
+        Keep every other quiescence guard, including per-request paused state and
+        asynchronous KV operations. This is deliberately narrower than treating a
+        paused engine as idle and is only suitable for a KV-cache-only release.
+        """
+        return self._engine_paused and self._is_scheduler_quiescent(
+            for_health_check=False, allow_waiting_queue=True
+        )
+
+    def _is_scheduler_quiescent(
+        self, *, for_health_check: bool, allow_waiting_queue: bool
+    ) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -3627,7 +4084,8 @@ class Scheduler(
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        if not allow_waiting_queue:
+            idle &= len(self.waiting_queue) == 0
         # Paused requests are not runnable, but still own a resumable lifecycle
         # and may reference KV preserved in the prefix cache.
         idle &= len(self.partial_rollout_paused_queue) == 0
@@ -3955,6 +4413,23 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # Trie Beam owns internal branch requests outside ``running_batch``.
+        # Abort must therefore release their shared KV pages explicitly rather
+        # than waiting for the normal per-request decode cleanup path.
+        aborted_trie_roots = [
+            root_rid
+            for root_rid in self.trie_beam_executions
+            if recv_req.abort_all or root_rid.startswith(recv_req.rid)
+        ]
+        for root_rid in aborted_trie_roots:
+            state = self.trie_beam_executions.pop(root_rid)
+            state.execution.release_all()
+            self._release_trie_beam_root_cache_lock(state.root_req)
+            self.ipc_channels.send_to_tokenizer.send_output(
+                AbortReq(rid=root_rid), state.root_req
+            )
+            logger.debug(f"Abort Trie beam request. {root_rid=}")
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -4233,6 +4708,7 @@ class Scheduler(
             self.running_batch.filter_batch()
             to_pause = []
             keep_indices = []
+            paused_req_ids = set()
             for index, req in enumerate(self.running_batch.reqs):
                 should_pause = (
                     recv_req.pause_all
@@ -4240,7 +4716,14 @@ class Scheduler(
                 )
                 if should_pause and req.req_pool_idx is not None:
                     req.retract_mode = "preserve_kv"
-                    to_pause.append(req)
+                    # With overlap scheduling, running_batch and last_batch can
+                    # temporarily contain the same Req object. Retracting it
+                    # twice releases req_pool_idx on the first pass and crashes
+                    # release_kv_cache on the second pass.
+                    req_identity = id(req)
+                    if req_identity not in paused_req_ids:
+                        paused_req_ids.add(req_identity)
+                        to_pause.append(req)
                 else:
                     keep_indices.append(index)
 

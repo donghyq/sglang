@@ -2026,6 +2026,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
+    @property
+    def is_trie_beam_batch(self) -> bool:
+        """Whether this is one isolated Trie-constrained beam batch.
+
+        The prefill batch has one external root request.  Later Decode batches
+        contain several scheduler-internal branch requests, all carrying the
+        same private root marker.  Keeping that marker on ``Req`` instead of
+        inferring from ``beam_width`` prevents an ordinary multi-request batch
+        from accidentally bypassing the regular sampler.
+        """
+        if not self.reqs:
+            return False
+        root_rid = getattr(self.reqs[0], "trie_beam_root_rid", None)
+        if root_rid is not None:
+            return all(
+                getattr(req, "trie_beam_root_rid", None) == root_rid
+                for req in self.reqs
+            )
+        return len(self.reqs) == 1 and self.reqs[0].sampling_params.beam_width > 1
+
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):
