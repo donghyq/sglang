@@ -124,6 +124,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        # Beam COW ownership is intentionally separate from RadixCache locks.
+        # Keys are physical page ids; values are live beam references.
+        self.beam_page_refcounts: dict[int, int] = {}
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -258,7 +261,100 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
+    def _beam_page_ids(self, kv_indices: torch.Tensor) -> list[int]:
+        if kv_indices.numel() == 0:
+            return []
+        page_ids = torch.unique(kv_indices // self.page_size).cpu().tolist()
+        if 0 in page_ids:
+            raise ValueError(
+                "KV page 0 is reserved for padded outputs and cannot be beam-owned."
+            )
+        return page_ids
+
+    def register_beam_pages(self, kv_indices: torch.Tensor) -> None:
+        """Register pages newly owned by a root beam or its private suffix."""
+        page_ids = self._beam_page_ids(kv_indices)
+        duplicate_page_ids = [
+            page_id for page_id in page_ids if page_id in self.beam_page_refcounts
+        ]
+        if duplicate_page_ids:
+            raise ValueError(
+                f"KV page {duplicate_page_ids[0]} is already beam-owned."
+            )
+        for page_id in page_ids:
+            self.beam_page_refcounts[page_id] = 1
+
+    def fork_shared_prefix(
+        self, kv_indices: torch.Tensor, child_count: int = 1
+    ) -> None:
+        """Add child references to every fully populated shared prefix page.
+
+        A shared partial page is unsafe: the next decode token of a child can
+        overwrite the parent's KV slot. The scheduler must retain only a
+        page-aligned prefix and allocate each branch's tail privately.
+        """
+        if child_count < 1:
+            raise ValueError(f"child_count must be positive, got {child_count}.")
+        if kv_indices.numel() % self.page_size:
+            raise ValueError(
+                "A beam shared prefix must end at a KV page boundary; "
+                "copy the partial tail into a private page first."
+            )
+        page_ids = self._beam_page_ids(kv_indices)
+        missing_page_ids = [
+            page_id for page_id in page_ids if page_id not in self.beam_page_refcounts
+        ]
+        if missing_page_ids:
+            raise ValueError(
+                f"Cannot fork unregistered KV page {missing_page_ids[0]}."
+            )
+        for page_id in page_ids:
+            self.beam_page_refcounts[page_id] += child_count
+
+    def release_beam_suffix(self, kv_indices: torch.Tensor) -> None:
+        """Release one beam's references and free pages at refcount zero.
+
+        The caller must pass every page referenced by that beam, including a
+        shared prefix. Passing only private suffix pages would leak the prefix
+        reference held by the pruned beam.
+        """
+        page_ids = self._beam_page_ids(kv_indices)
+        missing_page_ids = [
+            page_id
+            for page_id in page_ids
+            if page_id not in self.beam_page_refcounts
+        ]
+        if missing_page_ids:
+            raise ValueError(
+                f"Cannot release unregistered KV page {missing_page_ids[0]}."
+            )
+
+        released_page_ids = []
+        for page_id in page_ids:
+            refcount = self.beam_page_refcounts[page_id]
+            if refcount == 1:
+                del self.beam_page_refcounts[page_id]
+                released_page_ids.append(page_id)
+            else:
+                self.beam_page_refcounts[page_id] = refcount - 1
+        if released_page_ids:
+            pages = torch.tensor(
+                released_page_ids, dtype=torch.int64, device=self.device
+            )
+            self._free_unshared(pages * self.page_size)
+
     def free(self, free_index: torch.Tensor):
+        beam_owned = set(self._beam_page_ids(free_index)) & set(
+            self.beam_page_refcounts
+        )
+        if beam_owned:
+            raise ValueError(
+                "Use release_beam_suffix() to free beam-owned KV pages; "
+                f"direct free would violate COW ownership for pages {sorted(beam_owned)}."
+            )
+        self._free_unshared(free_index)
+
+    def _free_unshared(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
@@ -281,6 +377,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.is_not_in_free_group = True
         self.free_group = []
+        self.beam_page_refcounts.clear()
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
