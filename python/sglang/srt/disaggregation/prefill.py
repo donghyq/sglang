@@ -48,6 +48,8 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.constrained.trie_beam_search import trie_constrained_beam_topk
+from sglang.srt.constrained.trie_grammar_backend import TrieGrammar
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -621,7 +623,63 @@ class SchedulerDisaggregationPrefillMixin:
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        next_token_ids = result.next_token_ids.tolist()
+        is_trie_beam_batch = batch.is_trie_beam_batch
+        has_trie_beam_root = any(
+            isinstance(req.grammar, TrieGrammar)
+            and req.sampling_params.beam_width > 1
+            for req in batch.reqs
+        )
+        if has_trie_beam_root and not is_trie_beam_batch:
+            raise RuntimeError(
+                "Trie Beam root request entered a non-isolated P/D Prefill batch; "
+                "refusing the single-token handoff protocol."
+            )
+        if is_trie_beam_batch:
+            if result.logits_output is None or result.logits_output.next_token_logits is None:
+                raise RuntimeError(
+                    "Trie Beam P/D prefill requires raw next-token logits."
+                )
+            if len(batch.reqs) != 1 or not isinstance(batch.reqs[0].grammar, TrieGrammar):
+                raise RuntimeError(
+                    "Trie Beam P/D prefill requires one Trie grammar request."
+                )
+            req = batch.reqs[0]
+            logits = result.logits_output.next_token_logits
+            terminal_children = [[
+                req.grammar.terminal[
+                    req.grammar.children[req.grammar.node_id][token]
+                ]
+                for token in req.grammar.allowed_tokens
+            ]]
+            selected = trie_constrained_beam_topk(
+                logits,
+                torch.zeros(1, dtype=logits.dtype, device=logits.device),
+                [req.grammar.allowed_tokens],
+                terminal_children,
+                req.sampling_params.beam_width,
+                req.sampling_params.num_return_sequences,
+            )
+            handoff = []
+            for parent, token, score in zip(
+                selected.active_parent_indices.tolist(),
+                selected.active_token_ids.tolist(),
+                selected.active_scores.tolist(),
+                strict=True,
+            ):
+                del parent
+                handoff.append((token, score, False))
+            for parent, token, score in zip(
+                selected.completed_parent_indices.tolist(),
+                selected.completed_token_ids.tolist(),
+                selected.completed_scores.tolist(),
+                strict=True,
+            ):
+                del parent
+                handoff.append((token, score, True))
+            req.trie_beam_handoff_candidates = handoff
+            next_token_ids = [0]
+        else:
+            next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
@@ -648,7 +706,15 @@ class SchedulerDisaggregationPrefillMixin:
                     advance_logprob_pt(i, req)
                     continue
 
-                req.output_ids.append(next_token_id)
+                if not is_trie_beam_batch:
+                    if (
+                        isinstance(req.grammar, TrieGrammar)
+                        and req.sampling_params.beam_width > 1
+                    ):
+                        raise RuntimeError(
+                            "Trie Beam root request reached the normal P/D boundary-token path."
+                        )
+                    req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
@@ -688,7 +754,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
-                if req.grammar is not None:
+                if req.grammar is not None and not is_trie_beam_batch:
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:

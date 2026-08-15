@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import logging
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
+
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
@@ -267,6 +271,20 @@ class MetadataBuffers:
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            # Compact first-step candidates for Trie-constrained Beam P/D.
+            # The normal P/D protocol uses only output_ids[:, 0].  Keeping a
+            # dedicated buffer makes the Beam handoff unambiguous and avoids
+            # overloading user-visible logprob fields.
+            self.trie_beam_token_ids = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.trie_beam_scores = torch.zeros(
+                (size, 16), dtype=torch.float32, device=device
+            )
+            self.trie_beam_terminal = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.trie_beam_count = torch.zeros((size, 16), dtype=torch.int32, device=device)
             self.cached_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
@@ -322,6 +340,10 @@ class MetadataBuffers:
     def get_buf_infos(self):
         bufs = [
             self.output_ids,
+            self.trie_beam_token_ids,
+            self.trie_beam_scores,
+            self.trie_beam_terminal,
+            self.trie_beam_count,
             self.cached_tokens,
             self.output_token_logprobs_val,
             self.output_token_logprobs_idx,
@@ -361,6 +383,10 @@ class MetadataBuffers:
             sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
             self.output_ids[idx].clone(),
+            self.trie_beam_token_ids[idx].clone(),
+            self.trie_beam_scores[idx].clone(),
+            self.trie_beam_terminal[idx].clone(),
+            self.trie_beam_count[idx].clone(),
             self.cached_tokens[idx].clone(),
             self.output_token_logprobs_val[idx].clone(),
             self.output_token_logprobs_idx[idx].clone(),
@@ -382,7 +408,41 @@ class MetadataBuffers:
 
     def set_buf(self, req: Req):
 
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        # A Trie Beam P/D handoff deliberately has no single sampled boundary
+        # token.  Its selected constrained children are carried by the
+        # dedicated buffers below.  Retain zero in output_ids for the legacy
+        # single-path protocol.
+        metadata_idx = req.metadata_buffer_index
+        self.output_ids[metadata_idx].zero_()
+        # Clear every field before publishing a new handoff.  In particular,
+        # ``trie_beam_count`` is the consumer-side validity marker and must be
+        # written only after its complete candidate payload is available.
+        self.trie_beam_token_ids[metadata_idx].zero_()
+        self.trie_beam_scores[metadata_idx].zero_()
+        self.trie_beam_terminal[metadata_idx].zero_()
+        self.trie_beam_count[metadata_idx].zero_()
+        if req.output_ids:
+            self.output_ids[metadata_idx][0] = req.output_ids[0]
+        handoff = getattr(req, "trie_beam_handoff_candidates", None)
+        if handoff is not None:
+            if not 1 <= len(handoff) <= self.trie_beam_token_ids.shape[1]:
+                raise RuntimeError(
+                    "Trie Beam P/D handoff exceeds metadata candidate capacity."
+                )
+            for i, (token_id, score, terminal) in enumerate(handoff):
+                self.trie_beam_token_ids[metadata_idx][i] = token_id
+                self.trie_beam_scores[metadata_idx][i] = score
+                self.trie_beam_terminal[metadata_idx][i] = int(terminal)
+            # Publish after all token/score/terminal fields.  Mooncake may
+            # observe this metadata from a different device, so a count must
+            # never advertise a partially populated candidate array.
+            self.trie_beam_count[metadata_idx][0] = len(handoff)
+            logger.info(
+                "LUGR trie handoff metadata written: rid=%s metadata_idx=%s candidates=%s",
+                req.rid,
+                metadata_idx,
+                handoff,
+            )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
