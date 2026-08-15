@@ -58,6 +58,7 @@ def _make_req(
     regex=None,
     ebnf=None,
     structural_tag=None,
+    trie=None,
     rid="req-1",
     custom_params=None,
 ):
@@ -68,6 +69,7 @@ def _make_req(
     req.sampling_params.regex = regex
     req.sampling_params.ebnf = ebnf
     req.sampling_params.structural_tag = structural_tag
+    req.sampling_params.trie = trie
     req.sampling_params.custom_params = custom_params
     req.require_reasoning = False
     req.grammar = None
@@ -186,6 +188,17 @@ class TestProcessReqWithGrammar(unittest.TestCase):
             req.grammar_key,
             ("structural_tag", '{"structures": [], "triggers": []}'),
         )
+
+    def test_trie_cache_miss_uses_canonical_json_key(self):
+        mgr = self._make_mgr()
+        future = Future()
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (future, False)
+
+        req = _make_req(trie=[[1, 2], [3]])
+        result = mgr.process_req_with_grammar(req)
+
+        self.assertTrue(result)
+        self.assertEqual(req.grammar_key, ("trie", "[[1,2],[3]]"))
 
     def test_cache_hit_returns_false(self):
         """Cache hit should NOT add to grammar queue."""

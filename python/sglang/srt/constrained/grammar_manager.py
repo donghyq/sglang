@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from concurrent import futures
@@ -136,9 +137,10 @@ class GrammarManager:
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
             or req.sampling_params.structural_tag is not None
+            or req.sampling_params.trie is not None
         ):
             if self.grammar_backend is None:
-                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag, trie) is not supported when the server is launched with --grammar-backend none"
                 req.set_finish_with_abort(error_msg)
             else:
                 if req.sampling_params.json_schema is not None:
@@ -147,8 +149,15 @@ class GrammarManager:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
                     key = ("ebnf", req.sampling_params.ebnf)
-                elif req.sampling_params.structural_tag:
+                elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
+                elif req.sampling_params.trie is not None:
+                    key = (
+                        "trie",
+                        json.dumps(req.sampling_params.trie, separators=(",", ":")),
+                    )
+                else:
+                    raise AssertionError("Grammar request has no grammar constraint.")
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
                     key, req.require_reasoning

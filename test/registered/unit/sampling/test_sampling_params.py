@@ -289,6 +289,56 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_trie_is_valid_token_constraint(self):
+        self._make(trie=[[1, 2], [3]]).verify(self.VOCAB_SIZE)
+
+    def test_trie_rejects_empty_path_and_invalid_token(self):
+        with self.assertRaises(ValueError):
+            self._make(trie=[[]]).verify(self.VOCAB_SIZE)
+        with self.assertRaises(ValueError):
+            self._make(trie=[[self.VOCAB_SIZE]]).verify(self.VOCAB_SIZE)
+        with self.assertRaises(ValueError):
+            self._make(trie=[[True]]).verify(self.VOCAB_SIZE)
+
+    def test_trie_is_mutually_exclusive_with_other_grammar(self):
+        with self.assertRaises(ValueError):
+            self._make(regex="a", trie=[[1]]).verify(self.VOCAB_SIZE)
+
+    def test_beam_width_requires_trie_and_deterministic_decoding(self):
+        with self.assertRaisesRegex(ValueError, "requires a trie"):
+            self._make(beam_width=2, top_k=1).verify(self.VOCAB_SIZE)
+        with self.assertRaisesRegex(ValueError, "deterministic"):
+            self._make(beam_width=2, trie=[[1]], top_k=2).verify(self.VOCAB_SIZE)
+        with self.assertRaisesRegex(ValueError, "cannot be combined with n"):
+            self._make(beam_width=2, trie=[[1]], top_k=1, n=2).verify(
+                self.VOCAB_SIZE
+            )
+
+    def test_beam_width_accepts_deterministic_trie_request(self):
+        self._make(
+            beam_width=2,
+            num_return_sequences=2,
+            trie=[[1], [2]],
+            top_k=1,
+        ).verify(self.VOCAB_SIZE)
+
+    def test_beam_width_rejects_logit_bias_before_beam_ranking_supports_it(self):
+        with self.assertRaisesRegex(ValueError, "does not support logit_bias"):
+            self._make(
+                beam_width=2,
+                trie=[[1], [2]],
+                top_k=1,
+                logit_bias={"1": 1.0},
+            ).verify(self.VOCAB_SIZE)
+
+    def test_beam_width_and_return_sequence_count_are_positive_and_compatible(self):
+        with self.assertRaisesRegex(ValueError, "beam_width must be positive"):
+            self._make(beam_width=0).verify(self.VOCAB_SIZE)
+        with self.assertRaisesRegex(ValueError, "num_return_sequences"):
+            self._make(beam_width=2, num_return_sequences=3).verify(
+                self.VOCAB_SIZE
+            )
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
 

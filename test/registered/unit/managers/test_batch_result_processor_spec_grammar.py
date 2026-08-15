@@ -99,6 +99,20 @@ def _make_result(num_draft_tokens, accept_lens, flat_tokens):
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_terminal_grammar_finishes_in_the_same_decode_step(self):
+        req = _make_req(terminate_after=1)
+        proc = _make_processor()
+
+        # This mirrors the non-spec decode ordering.  The terminal token must
+        # be visible to update_finish_state immediately; delaying grammar
+        # advancement used to schedule one extra unconstrained decode token.
+        req.output_ids.append(101)
+        proc._accept_grammar_tokens(req, 101)
+        req.update_finish_state()
+
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, 101)
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()
