@@ -857,15 +857,20 @@ class TrieBeamGroup:
             selection.completed_token_ids,
             selection.completed_scores,
         )
-        self.last_pruned = materialize(
-            selection.pruned_parent_indices,
-            selection.pruned_token_ids,
-            selection.pruned_scores,
-        )
+        # Discarded candidates have neither a request slot nor KV ownership.
+        # Retain only parent identities required to release a parent that has
+        # no surviving active child.
+        self.last_pruned = []
         for completed in self.last_completed:
             self._record_completed(completed)
         selected_parent_ids = {beam.parent_id for beam in self.active}
-        self.last_pruned_parent_ids = sorted(parent_ids - selected_parent_ids)
+        self.last_pruned_parent_ids = sorted(
+            {
+                previous_active[parent_index].branch_id
+                for parent_index in selection.pruned_parent_indices.tolist()
+                if previous_active[parent_index].branch_id not in selected_parent_ids
+            }
+        )
         self.last_slot_transition = plan_trie_beam_slot_transition(
             parent_ids, self.active
         )

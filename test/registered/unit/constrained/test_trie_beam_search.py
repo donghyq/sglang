@@ -117,9 +117,14 @@ class TestTrieBeamSearch(CustomTestCase):
             [beam.parent_id for beam in accelerated.active],
             [beam.parent_id for beam in reference.active],
         )
+        # The accelerated path intentionally does not materialize discarded
+        # children into Python Beam objects: they have no request-slot or KV
+        # lifecycle. It keeps only the parent identities required for release
+        # planning.
+        self.assertEqual(accelerated.last_pruned, [])
         self.assertEqual(
-            [beam.tokens for beam in accelerated.last_pruned],
-            [beam.tokens for beam in reference.last_pruned],
+            accelerated.last_pruned_parent_ids,
+            reference.last_pruned_parent_ids,
         )
         self.assertEqual(
             accelerated.last_slot_transition, reference.last_slot_transition
