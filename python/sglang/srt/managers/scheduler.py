@@ -1151,9 +1151,9 @@ class Scheduler(
         return state
 
     def _build_trie_beam_decode_batch(
-        self, state: TrieBeamSchedulerExecution
+        self, states: Union[TrieBeamSchedulerExecution, List[TrieBeamSchedulerExecution]]
     ) -> ScheduleBatch:
-        """Build the next isolated Decode batch for all live Beam branches.
+        """Build one Decode batch for all live branches of independent Beam groups.
 
         A selected token is intentionally not part of the branch KV mapping
         yet.  ``prepare_for_decode`` allocates its destination position, and
@@ -1161,9 +1161,18 @@ class Scheduler(
         This mirrors the ordinary scheduler's one-step delayed KV write without
         relying on its sampled-token relay buffer.
         """
-        execution = state.execution
-        beams = execution.group.active
-        reqs = [execution.runtime.branches[beam.branch_id].req for beam in beams]
+        if not isinstance(states, list):
+            states = [states]
+        beams_and_executions = [
+            (beam, state.execution)
+            for state in states
+            for beam in state.execution.group.active
+        ]
+        beams = [beam for beam, _ in beams_and_executions]
+        reqs = [
+            execution.runtime.branches[beam.branch_id].req
+            for beam, execution in beams_and_executions
+        ]
         if not reqs:
             raise RuntimeError("Cannot build a Trie beam Decode batch without live branches.")
         if any(not beam.tokens for beam in beams):
@@ -1196,9 +1205,16 @@ class Scheduler(
         )
         batch.prepare_for_decode()
         try:
-            execution.runtime.append_decode_kv_locations(
-                [beam.branch_id for beam in beams], batch.out_cache_loc
-            )
+            offset = 0
+            for state in states:
+                execution = state.execution
+                group_beams = execution.group.active
+                count = len(group_beams)
+                execution.runtime.append_decode_kv_locations(
+                    [beam.branch_id for beam in group_beams],
+                    batch.out_cache_loc[offset : offset + count],
+                )
+                offset += count
         except Exception:
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
             raise
@@ -1251,7 +1267,7 @@ class Scheduler(
     def _process_trie_beam_logits(
         self, batch: ScheduleBatch, result: GenerationBatchResult
     ) -> None:
-        """Advance one isolated Trie Beam batch without normal result handling.
+        """Advance independent Trie Beam groups without normal result handling.
 
         This method only commits Beam-local request/KV ownership.  The general
         scheduler remains protected by admission control until construction of
@@ -1263,46 +1279,60 @@ class Scheduler(
 
         if not batch.reqs:
             raise RuntimeError("Trie beam logits must contain at least one branch request.")
-        root_rid = getattr(batch.reqs[0], "trie_beam_root_rid", batch.reqs[0].rid)
-        if any(getattr(req, "trie_beam_root_rid", root_rid) != root_rid for req in batch.reqs):
-            raise RuntimeError("Trie beam logits batch mixes different root requests.")
-        state = self.trie_beam_executions.get(root_rid)
-        if state is None:
-            if len(batch.reqs) != 1:
-                raise RuntimeError("The first Trie beam batch must contain one root request.")
-            state = self._start_trie_beam_execution(batch.reqs[0])
-        execution = state.execution
-        expected_reqs = [
-            execution.runtime.branches[beam.branch_id].req
-            for beam in execution.group.active
-        ]
-        if batch.reqs != expected_reqs:
-            raise RuntimeError(
-                "Trie beam Decode batch request order does not match active branches."
-            )
+        root_rids = [getattr(req, "trie_beam_root_rid", req.rid) for req in batch.reqs]
         logits = result.logits_output.next_token_logits
-        if logits.shape[0] != len(execution.group.active):
+        if logits.shape[0] != len(batch.reqs):
             raise RuntimeError(
-                "Trie beam logits rows do not match the active branch count: "
-                f"{logits.shape[0]} != {len(execution.group.active)}."
+                "Trie beam logits rows do not match the batch request count: "
+                f"{logits.shape[0]} != {len(batch.reqs)}."
             )
+        req_indices_by_root: Dict[str, List[int]] = {}
+        for index, root_rid in enumerate(root_rids):
+            req_indices_by_root.setdefault(root_rid, []).append(index)
 
-        active = execution.advance(
-            logits,
-            create_child_req=lambda beam: self._clone_trie_beam_req(
-                execution.runtime.branches[beam.parent_id].req, beam
-            ),
-            shared_prefixes=self._trie_beam_shared_prefixes(execution),
-            create_child_kv_indices=self._fork_trie_beam_kv_mapping,
-            release_unregistered_child_kv_indices=(
-                self._release_unregistered_trie_beam_kv_mapping
-            ),
-        )
-        for beam in active:
-            self._apply_trie_beam_to_req(execution.runtime.branches[beam.branch_id].req, beam)
+        finished_root_rids = set()
+        for root_rid, indices in req_indices_by_root.items():
+            state = self.trie_beam_executions.get(root_rid)
+            if state is None:
+                # Only a fresh external root can be absent from scheduler state.
+                # Internal branches always carry the root marker and are created
+                # by an already registered execution.
+                if len(indices) != 1 or getattr(batch.reqs[indices[0]], "trie_beam_root_rid", None) is not None:
+                    raise RuntimeError(
+                        "Trie beam batch has an unknown internal root request."
+                    )
+                state = self._start_trie_beam_execution(batch.reqs[indices[0]])
+            state = self.trie_beam_executions[root_rid]
+            execution = state.execution
+            expected_reqs = [
+                execution.runtime.branches[beam.branch_id].req
+                for beam in execution.group.active
+            ]
+            actual_reqs = [batch.reqs[index] for index in indices]
+            if actual_reqs != expected_reqs:
+                raise RuntimeError(
+                    "Trie beam Decode batch request order does not match active branches."
+                )
+            active = execution.advance(
+                logits[indices],
+                create_child_req=lambda beam, execution=execution: self._clone_trie_beam_req(
+                    execution.runtime.branches[beam.parent_id].req, beam
+                ),
+                shared_prefixes=self._trie_beam_shared_prefixes(execution),
+                create_child_kv_indices=self._fork_trie_beam_kv_mapping,
+                release_unregistered_child_kv_indices=(
+                    self._release_unregistered_trie_beam_kv_mapping
+                ),
+            )
+            for beam in active:
+                self._apply_trie_beam_to_req(
+                    execution.runtime.branches[beam.branch_id].req, beam
+                )
+            if execution.is_finished:
+                self._finish_trie_beam_execution(state)
+                finished_root_rids.add(root_rid)
 
-        if execution.is_finished:
-            self._finish_trie_beam_execution(state)
+        if finished_root_rids:
             # ``event_loop_normal`` stores this batch as ``last_batch`` after
             # processing its result.  Internal branch requests have already
             # released their request-pool slots, so leaving them in the batch
@@ -1311,7 +1341,12 @@ class Scheduler(
             # non-empty ``last_batch``.  Drop the completed internal batch
             # before it becomes ``last_batch`` and let the root request remain
             # the only externally visible completion.
-            batch.filter_batch(keep_indices=[])
+            batch.filter_batch(
+                keep_indices=[
+                    index for index, root_rid in enumerate(root_rids)
+                    if root_rid not in finished_root_rids
+                ]
+            )
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2250,8 +2285,6 @@ class Scheduler(
                 "Trie-constrained beam search currently supports only "
                 "num_return_sequences == 1; multi-SID response encoding is pending."
             )
-        if self.trie_beam_executions:
-            return "Only one Trie-constrained beam search request may run at a time."
         return None
 
     def _process_and_broadcast_mm_inputs(
@@ -3012,11 +3045,10 @@ class Scheduler(
         # next forward writes those tokens' KV and returns their successor
         # logits.
         if self.trie_beam_executions:
-            if len(self.trie_beam_executions) != 1:
-                raise RuntimeError("Only one isolated Trie beam execution may run at a time.")
-            state = next(iter(self.trie_beam_executions.values()))
             return NextBatchPlan(
-                batch_to_run=self._build_trie_beam_decode_batch(state),
+                batch_to_run=self._build_trie_beam_decode_batch(
+                    list(self.trie_beam_executions.values())
+                ),
                 # The isolated Trie execution is selected before the ordinary
                 # prefill/decode planner, so it does not need to mark the
                 # ordinary running batch as full. Keeping this flag set

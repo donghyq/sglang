@@ -98,7 +98,7 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
             )._trie_beam_request_error(req, self._recv(), None),
         )
 
-    def test_beam_request_rejects_overlap_multi_return_and_concurrent_execution(self):
+    def test_beam_request_rejects_overlap_and_multi_return(self):
         overlap = self._scheduler()
         overlap.enable_overlap = True
         self.assertIn("overlap", overlap._trie_beam_request_error(self._req(), self._recv(), None))
@@ -108,17 +108,18 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
         req.sampling_params.num_return_sequences = 2
         self.assertIn("num_return_sequences", multi_return._trie_beam_request_error(req, self._recv(), None))
 
-        concurrent = self._scheduler()
-        concurrent.trie_beam_executions = {"root": object()}
-        self.assertIn("one Trie-constrained", concurrent._trie_beam_request_error(self._req(), self._recv(), None))
-
-    def test_trie_beam_batch_requires_an_isolated_single_root_request(self):
+    def test_trie_beam_batch_rejects_mixed_internal_and_normal_requests(self):
         beam = self._req(beam_width=2)
         normal = self._req(beam_width=1)
 
         self.assertTrue(ScheduleBatch(reqs=[beam]).is_trie_beam_batch)
         self.assertFalse(ScheduleBatch(reqs=[beam, normal]).is_trie_beam_batch)
         self.assertFalse(ScheduleBatch(reqs=[normal]).is_trie_beam_batch)
+
+    def test_trie_beam_prefill_batch_accepts_multiple_external_roots(self):
+        self.assertTrue(
+            ScheduleBatch(reqs=[self._req(beam_width=2), self._req(beam_width=3)]).is_trie_beam_batch
+        )
 
     def test_trie_beam_root_request_is_identified_before_decode_markers_exist(self):
         trie_root = self._req(beam_width=2)
@@ -129,7 +130,7 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
         self.assertTrue(Scheduler._is_trie_beam_root_request(trie_root))
         self.assertFalse(Scheduler._is_trie_beam_root_request(normal))
 
-    def test_trie_beam_decode_batch_accepts_internal_branches_of_one_root(self):
+    def test_trie_beam_decode_batch_accepts_multiple_independent_roots(self):
         branch_a = self._req(beam_width=2)
         branch_b = self._req(beam_width=2)
         branch_a.trie_beam_root_rid = "root"
@@ -137,7 +138,7 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
         self.assertTrue(ScheduleBatch(reqs=[branch_a, branch_b]).is_trie_beam_batch)
 
         branch_b.trie_beam_root_rid = "other-root"
-        self.assertFalse(ScheduleBatch(reqs=[branch_a, branch_b]).is_trie_beam_batch)
+        self.assertTrue(ScheduleBatch(reqs=[branch_a, branch_b]).is_trie_beam_batch)
 
     def test_completed_trie_beam_batch_can_be_cleared_before_idle(self):
         batch = ScheduleBatch(reqs=[self._req(beam_width=2)])

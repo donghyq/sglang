@@ -2132,28 +2132,6 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # A Trie Beam execution owns a Decode batch exclusively.  New ordinary
-        # P/D handoffs must remain in ``waiting_queue`` until that execution is
-        # complete, otherwise processing them here can merge ordinary requests
-        # into a batch that is about to run the internal Beam branches.
-        if self.trie_beam_executions:
-            if running_batch.is_empty():
-                state = next(iter(self.trie_beam_executions.values()))
-                return NextBatchPlan(
-                    batch_to_run=self._build_trie_beam_decode_batch(state),
-                    running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
-                )
-
-            # This branch is a safe recovery path for a Trie handoff that
-            # arrived while an ordinary Decode batch was already running.
-            # Drain that batch before starting the exclusive Beam execution.
-            running_batch = self.update_running_batch(running_batch)
-            ret = running_batch if not running_batch.is_empty() else None
-            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
-            if ret:
-                set_schedule_time_batch(ret)
-            return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
-
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2175,9 +2153,10 @@ class SchedulerDisaggregationDecodeMixin:
             # normal batch is idle, so its first internal Decode step is also
             # isolated.
             assert running_batch.is_empty()
-            state = next(iter(self.trie_beam_executions.values()))
             return NextBatchPlan(
-                batch_to_run=self._build_trie_beam_decode_batch(state),
+                batch_to_run=self._build_trie_beam_decode_batch(
+                    list(self.trie_beam_executions.values())
+                ),
                 running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
             )
 
@@ -2211,60 +2190,49 @@ class SchedulerDisaggregationDecodeMixin:
             if getattr(req, "trie_beam_handoff_candidates", None) is not None
         ]
         if trie_handoffs:
-            if self.trie_beam_executions:
-                # Trie Decode is intentionally exclusive in the current
-                # implementation.  A later handoff is normal queue pressure,
-                # not a scheduler-fatal invariant violation: leave it queued
-                # until the active execution has released its branch KV.
-                return None
             if not running_batch.is_empty():
-                # Do not create the exclusive Trie execution until all ordinary
-                # Decode work already admitted to this worker has drained.
+            # Do not create Trie Decode work until all ordinary
+            # Decode work already admitted to this worker has drained.
                 # Keeping the handoff in the waiting queue avoids both a mixed
                 # Decode batch and a process-fatal scheduler exception.
                 return None
-            # Several handoffs can complete their KV transfer in one poll.
-            # Admit the earliest queued root only; the remaining requests stay
-            # ordered in ``waiting_queue`` and are handled after it completes.
-            req = trie_handoffs[0]
-            self.waiting_queue.remove(req)
-            logger.info(
-                "LUGR trie handoff admitted: rid=%s candidates=%s pending_trie_rids=%s",
-                req.rid,
-                req.trie_beam_handoff_candidates,
-                [
-                    queued.rid
-                    for queued in trie_handoffs[1:]
-                ],
-            )
-            state = self._start_trie_beam_execution(req)
-            execution = state.execution
-            candidates = req.trie_beam_handoff_candidates
-            execution.group.advance_from_handoff_candidates(candidates)
-            logger.info(
-                "LUGR trie handoff reconstructed: rid=%s active=%s completed=%s",
-                req.rid,
-                [beam.tokens for beam in execution.group.active],
-                [beam.tokens for beam in execution.group.last_completed],
-            )
-            execution.runtime.apply_transition(
-                execution.group.last_slot_transition,
-                create_child_req=lambda beam: self._clone_trie_beam_req(
-                    execution.runtime.branches[beam.parent_id].req, beam
-                ),
-                active_children=execution.group.active,
-                shared_prefixes=self._trie_beam_shared_prefixes(execution),
-                create_child_kv_indices=self._fork_trie_beam_kv_mapping,
-                release_unregistered_child_kv_indices=(
-                    self._release_unregistered_trie_beam_kv_mapping
-                ),
-            )
-            for beam in execution.group.active:
-                self._apply_trie_beam_to_req(
-                    execution.runtime.branches[beam.branch_id].req, beam
+            # Several transfers may become ready in one poll.  Reconstruct all
+            # of them before the next forward so their internal branches share
+            # one GPU Decode batch while their KV ownership remains per root.
+            for req in trie_handoffs:
+                self.waiting_queue.remove(req)
+                logger.info(
+                    "LUGR trie handoff admitted: rid=%s candidates=%s",
+                    req.rid, req.trie_beam_handoff_candidates,
                 )
-            if execution.is_finished:
-                self._finish_trie_beam_execution(state)
+                state = self._start_trie_beam_execution(req)
+                execution = state.execution
+                candidates = req.trie_beam_handoff_candidates
+                execution.group.advance_from_handoff_candidates(candidates)
+                logger.info(
+                    "LUGR trie handoff reconstructed: rid=%s active=%s completed=%s",
+                    req.rid,
+                    [beam.tokens for beam in execution.group.active],
+                    [beam.tokens for beam in execution.group.last_completed],
+                )
+                execution.runtime.apply_transition(
+                    execution.group.last_slot_transition,
+                    create_child_req=lambda beam, execution=execution: self._clone_trie_beam_req(
+                        execution.runtime.branches[beam.parent_id].req, beam
+                    ),
+                    active_children=execution.group.active,
+                    shared_prefixes=self._trie_beam_shared_prefixes(execution),
+                    create_child_kv_indices=self._fork_trie_beam_kv_mapping,
+                    release_unregistered_child_kv_indices=(
+                        self._release_unregistered_trie_beam_kv_mapping
+                    ),
+                )
+                for beam in execution.group.active:
+                    self._apply_trie_beam_to_req(
+                        execution.runtime.branches[beam.branch_id].req, beam
+                    )
+                if execution.is_finished:
+                    self._finish_trie_beam_execution(state)
             return None
 
         if self.enable_priority_scheduling:

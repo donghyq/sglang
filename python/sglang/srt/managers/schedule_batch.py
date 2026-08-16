@@ -2031,20 +2031,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Whether this is one isolated Trie-constrained beam batch.
 
         The prefill batch has one external root request.  Later Decode batches
-        contain several scheduler-internal branch requests, all carrying the
-        same private root marker.  Keeping that marker on ``Req`` instead of
+        contain several scheduler-internal branch requests, each carrying a
+        private root marker.  Keeping that marker on ``Req`` instead of
         inferring from ``beam_width`` prevents an ordinary multi-request batch
         from accidentally bypassing the regular sampler.
         """
         if not self.reqs:
             return False
-        root_rid = getattr(self.reqs[0], "trie_beam_root_rid", None)
-        if root_rid is not None:
+        if getattr(self.reqs[0], "trie_beam_root_rid", None) is not None:
+            # A Decode forward may contain independent Beam groups.  It is
+            # still an all-Trie batch as long as every row is an internal
+            # branch; root identity is used later to partition logits.
             return all(
-                getattr(req, "trie_beam_root_rid", None) == root_rid
+                getattr(req, "trie_beam_root_rid", None) is not None
                 for req in self.reqs
             )
-        return len(self.reqs) == 1 and self.reqs[0].sampling_params.beam_width > 1
+        # Root-prefill rows have not received the private marker yet.  They
+        # can share a prefill forward only when every row is an external Trie
+        # Beam root; the scheduler will partition the returned logits by row.
+        return all(req.sampling_params.beam_width > 1 for req in self.reqs)
 
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
