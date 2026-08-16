@@ -139,6 +139,27 @@ class TestTrieBeamSearch(CustomTestCase):
         self.assertEqual([beam.tokens for beam in group.active], [[1]])
         self.assertEqual([beam.tokens for beam in group.results], [[4]])
 
+    def test_prepared_candidate_layout_matches_late_preparation(self):
+        trie = "[[1,3],[1,4],[2,5]]"
+        prepared = TrieBeamGroup(self.backend.dispatch_trie(trie), width=2)
+        late = TrieBeamGroup(self.backend.dispatch_trie(trie), width=2)
+        logits = torch.tensor(
+            [[0.0, 4.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        )
+
+        layout = prepared.prepare_candidate_layout("cpu")
+        prepared.advance_with_constrained_topk(logits, layout)
+        late.advance_with_constrained_topk(logits)
+
+        self.assertEqual(
+            [beam.tokens for beam in prepared.active],
+            [beam.tokens for beam in late.active],
+        )
+        self.assertEqual(
+            [beam.tokens for beam in prepared.results],
+            [beam.tokens for beam in late.results],
+        )
+
     def test_group_keeps_only_requested_completed_results_and_releases_parent(self):
         root = self.backend.dispatch_trie("[[1],[2],[3]]")
         group = TrieBeamGroup(root, width=2, num_return_sequences=2)

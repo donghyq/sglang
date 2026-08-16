@@ -1206,6 +1206,7 @@ class Scheduler(
         batch.prepare_for_decode()
         try:
             offset = 0
+            candidate_layouts = {}
             for state in states:
                 execution = state.execution
                 group_beams = execution.group.active
@@ -1214,6 +1215,9 @@ class Scheduler(
                     [beam.branch_id for beam in group_beams],
                     batch.out_cache_loc[offset : offset + count],
                 )
+                candidate_layouts[state.root_req.rid] = (
+                    execution.group.prepare_candidate_layout(device)
+                )
                 offset += count
         except Exception:
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc)
@@ -1221,6 +1225,9 @@ class Scheduler(
         batch.input_ids = torch.tensor(
             [beam.tokens[-1] for beam in beams], dtype=torch.int64, device=device
         )
+        # This is scheduler-private state, aligned with the active branches in
+        # each root group.  It avoids rebuilding child metadata after Decode.
+        batch.trie_beam_candidate_layouts = candidate_layouts
         return batch
 
     def _finish_trie_beam_execution(self, state: TrieBeamSchedulerExecution) -> None:
@@ -1322,6 +1329,9 @@ class Scheduler(
                 create_child_kv_indices=self._fork_trie_beam_kv_mapping,
                 release_unregistered_child_kv_indices=(
                     self._release_unregistered_trie_beam_kv_mapping
+                ),
+                candidate_layout=getattr(batch, "trie_beam_candidate_layouts", {}).get(
+                    root_rid
                 ),
             )
             for beam in active:

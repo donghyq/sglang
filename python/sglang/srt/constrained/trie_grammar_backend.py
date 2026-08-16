@@ -45,6 +45,18 @@ class TrieGrammar(BaseGrammarObject):
     def allowed_tokens(self) -> List[int]:
         return list(self.children[self.node_id])
 
+    def allowed_tokens_with_terminal(self) -> tuple[List[int], List[bool]]:
+        """Return legal next Tokens together with their terminal status.
+
+        Beam scheduling needs both pieces of information before model forward.
+        Looking them up directly from the immutable Trie avoids forking one
+        grammar object per child merely to determine whether that child ends a
+        SID path.
+        """
+        children = self.children[self.node_id]
+        tokens = list(children)
+        return tokens, [self.terminal[children[token]] for token in tokens]
+
     def accept_token(self, token: int) -> None:
         if self.is_terminated():
             return

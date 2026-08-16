@@ -767,6 +767,26 @@ class TrieBeamGroup:
         )
         return self.active
 
+    def prepare_candidate_layout(
+        self, device: torch.device | str
+    ) -> TrieBeamCandidateLayout:
+        """Prepare compact legal-child indexes before the Decode forward.
+
+        The layout is valid for the current active branches only.  The
+        scheduler creates it while assembling the next Decode batch, allowing
+        result handling to immediately read and rank legal child scores after
+        the model returns logits.
+        """
+        allowed_tokens = []
+        terminal_children = []
+        for beam in self.active:
+            tokens, terminals = beam.grammar.allowed_tokens_with_terminal()
+            allowed_tokens.append(tokens)
+            terminal_children.append(terminals)
+        return build_trie_beam_candidate_layout(
+            allowed_tokens, terminal_children, device=device
+        )
+
     def advance_with_constrained_topk(
         self,
         logits: torch.Tensor,
@@ -791,25 +811,13 @@ class TrieBeamGroup:
 
         previous_active = self.active
         parent_ids = {beam.branch_id for beam in previous_active}
-        allowed_tokens = [beam.grammar.allowed_tokens for beam in previous_active]
-        terminal_children = []
-        for beam, allowed in zip(previous_active, allowed_tokens):
-            flags = []
-            for token in allowed:
-                grammar = beam.grammar.fork()
-                grammar.accept_token(token)
-                flags.append(grammar.is_terminated())
-            terminal_children.append(flags)
-
         parent_scores = torch.tensor(
             [beam.score for beam in previous_active],
             device=logits.device,
             dtype=logits.dtype,
         )
         if candidate_layout is None:
-            candidate_layout = build_trie_beam_candidate_layout(
-                allowed_tokens, terminal_children, device=logits.device
-            )
+            candidate_layout = self.prepare_candidate_layout(logits.device)
         selection = trie_constrained_beam_topk_from_layout(
             logits,
             parent_scores,
