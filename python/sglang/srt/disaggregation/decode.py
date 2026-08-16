@@ -2132,6 +2132,17 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        # Existing ordinary Decode work must drain before a Trie-only batch is
+        # admitted. Once idle, the normal prebuilt path below can admit more
+        # Trie handoffs into the remaining Beam-branch budget.
+        if self.trie_beam_executions and not running_batch.is_empty():
+            running_batch = self.update_running_batch(running_batch)
+            ret = running_batch if not running_batch.is_empty() else None
+            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+            if ret:
+                set_schedule_time_batch(ret)
+            return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2155,7 +2166,7 @@ class SchedulerDisaggregationDecodeMixin:
             assert running_batch.is_empty()
             return NextBatchPlan(
                 batch_to_run=self._build_trie_beam_decode_batch(
-                    list(self.trie_beam_executions.values())
+                    self._select_trie_beam_executions_for_decode()
                 ),
                 running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
             )
@@ -2196,10 +2207,22 @@ class SchedulerDisaggregationDecodeMixin:
                 # Keeping the handoff in the waiting queue avoids both a mixed
                 # Decode batch and a process-fatal scheduler exception.
                 return None
-            # Several transfers may become ready in one poll.  Reconstruct all
-            # of them before the next forward so their internal branches share
-            # one GPU Decode batch while their KV ownership remains per root.
+            # Several transfers may become ready in one poll. Admit only whole
+            # Beam groups that fit in the Decode branch budget; the rest stay
+            # in the waiting queue for a later round.
+            branch_budget = self._trie_beam_decode_branch_budget()
+            active_branches = sum(
+                len(state.execution.group.active)
+                for state in self.trie_beam_executions.values()
+            )
             for req in trie_handoffs:
+                candidates = req.trie_beam_handoff_candidates
+                expected_branches = min(
+                    req.sampling_params.beam_width,
+                    sum(not terminal for _, _, terminal in candidates),
+                )
+                if active_branches + expected_branches > branch_budget:
+                    continue
                 self.waiting_queue.remove(req)
                 logger.info(
                     "LUGR trie handoff admitted: rid=%s candidates=%s",
@@ -2207,7 +2230,6 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 state = self._start_trie_beam_execution(req)
                 execution = state.execution
-                candidates = req.trie_beam_handoff_candidates
                 execution.group.advance_from_handoff_candidates(candidates)
                 logger.info(
                     "LUGR trie handoff reconstructed: rid=%s active=%s completed=%s",
@@ -2233,6 +2255,8 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                 if execution.is_finished:
                     self._finish_trie_beam_execution(state)
+                else:
+                    active_branches += len(execution.group.active)
             return None
 
         if self.enable_priority_scheduling:

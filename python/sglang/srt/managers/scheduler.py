@@ -1002,6 +1002,61 @@ class Scheduler(
         # but keeping this state separate from ordinary Req objects prevents
         # branch-local lifecycle state from leaking into normal scheduling.
         self.trie_beam_executions: Dict[str, Any] = {}
+        # Root id selected last for a Trie-only Decode batch.  The next batch
+        # starts after it so a wide, long-lived Beam group cannot permanently
+        # occupy the front of the scheduler order.
+        self._trie_beam_decode_cursor: Optional[str] = None
+
+    def _trie_beam_decode_branch_budget(self) -> int:
+        """Return the maximum internal Beam branches for one Decode forward."""
+        return min(self.max_running_requests, self.req_to_token_pool.size)
+
+    def _select_trie_beam_executions_for_decode(self) -> List[TrieBeamSchedulerExecution]:
+        """Select complete Beam groups within one Decode branch budget.
+
+        A group is never split across forwards: its logits must be ranked
+        together to preserve global Beam pruning.  Selection rotates from the
+        root chosen in the previous round and skips groups that do not fit in
+        the remaining capacity, allowing smaller ready groups to make progress.
+        """
+        executions = list(self.trie_beam_executions.items())
+        if not executions:
+            return []
+
+        budget = self._trie_beam_decode_branch_budget()
+        if budget < 1:
+            raise RuntimeError("Trie Beam Decode requires at least one request slot.")
+        root_rids = [root_rid for root_rid, _ in executions]
+        cursor = getattr(self, "_trie_beam_decode_cursor", None)
+        start = (root_rids.index(cursor) + 1) % len(root_rids) if cursor in root_rids else 0
+        ordered = executions[start:] + executions[:start]
+
+        selected = []
+        used = 0
+        for root_rid, state in ordered:
+            branch_count = len(state.execution.group.active)
+            if branch_count < 1:
+                raise RuntimeError(
+                    f"Trie Beam execution {root_rid} has no active branches."
+                )
+            if branch_count > budget:
+                raise RuntimeError(
+                    "Trie Beam group exceeds the Decode branch budget: "
+                    f"rid={root_rid} branches={branch_count} budget={budget}."
+                )
+            if used + branch_count > budget:
+                continue
+            selected.append(state)
+            used += branch_count
+
+        if not selected:
+            raise RuntimeError("No Trie Beam group fits in the Decode branch budget.")
+        self._trie_beam_decode_cursor = selected[-1].root_req.rid
+        logger.debug(
+            "LUGR trie Decode groups selected: roots=%s branches=%s budget=%s",
+            [state.root_req.rid for state in selected], used, budget
+        )
+        return selected
 
     def _fork_trie_beam_kv_mapping(
         self,
@@ -3057,7 +3112,7 @@ class Scheduler(
         if self.trie_beam_executions:
             return NextBatchPlan(
                 batch_to_run=self._build_trie_beam_decode_batch(
-                    list(self.trie_beam_executions.values())
+                    self._select_trie_beam_executions_for_decode()
                 ),
                 # The isolated Trie execution is selected before the ordinary
                 # prefill/decode planner, so it does not need to mark the

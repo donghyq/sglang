@@ -153,6 +153,9 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
     def test_trie_beam_decode_does_not_leave_the_normal_batch_marked_full(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.trie_beam_executions = {"root": object()}
+        scheduler._select_trie_beam_executions_for_decode = MagicMock(
+            return_value=[object()]
+        )
         scheduler._build_trie_beam_decode_batch = MagicMock(
             return_value=ScheduleBatch(reqs=[self._req(beam_width=2)])
         )
@@ -164,6 +167,25 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
 
         self.assertFalse(plan.running_batch.batch_is_full)
         self.assertTrue(plan.running_batch.is_empty())
+
+    def test_trie_beam_decode_selection_rotates_within_branch_budget(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_running_requests = 3
+        scheduler.req_to_token_pool = SimpleNamespace(size=4)
+        scheduler._trie_beam_decode_cursor = None
+        scheduler.trie_beam_executions = {
+            rid: SimpleNamespace(
+                root_req=SimpleNamespace(rid=rid),
+                execution=SimpleNamespace(group=SimpleNamespace(active=[object()] * count)),
+            )
+            for rid, count in [("a", 2), ("b", 1), ("c", 2)]
+        }
+
+        first = scheduler._select_trie_beam_executions_for_decode()
+        second = scheduler._select_trie_beam_executions_for_decode()
+
+        self.assertEqual([state.root_req.rid for state in first], ["a", "b"])
+        self.assertEqual([state.root_req.rid for state in second], ["c", "b"])
 
     def test_trie_beam_handoff_waits_for_an_existing_normal_decode_batch(self):
         scheduler = Scheduler.__new__(Scheduler)
