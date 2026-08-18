@@ -15,6 +15,10 @@ from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    SchedulerMetricsReporter,
+)
+from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,6 +38,34 @@ class TestPagedBeamCOW(CustomTestCase):
         allocator.beam_page_refcounts = {}
         allocator.debug_mode = True
         return allocator
+
+    def test_metrics_snapshot_reports_physical_kv_units_and_references(self):
+        allocator = self._allocator()
+        prefix = torch.tensor([4, 5, 6, 7])
+        allocator.register_beam_pages(prefix)
+        allocator.fork_shared_prefix(prefix, child_count=2)
+
+        reporter = object.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        reporter.stats = SchedulerStats()
+        reporter._update_beam_kv_lifecycle_stats()
+
+        self.assertEqual(reporter.stats.beam_kv_registered_total, 1)
+        self.assertEqual(reporter.stats.beam_kv_released_total, 0)
+        self.assertEqual(reporter.stats.beam_kv_live, 1)
+        self.assertEqual(reporter.stats.beam_kv_live_references, 3)
+
+    def test_metrics_snapshot_keeps_zero_for_non_beam_allocator(self):
+        reporter = object.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(token_to_kv_pool_allocator=object())
+        reporter.stats = SchedulerStats()
+
+        reporter._update_beam_kv_lifecycle_stats()
+
+        self.assertEqual(reporter.stats.beam_kv_registered_total, 0)
+        self.assertEqual(reporter.stats.beam_kv_released_total, 0)
+        self.assertEqual(reporter.stats.beam_kv_live, 0)
+        self.assertEqual(reporter.stats.beam_kv_live_references, 0)
 
     def test_fork_then_prune_frees_pages_once(self):
         allocator = self._allocator()

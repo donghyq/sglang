@@ -674,6 +674,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._update_beam_kv_lifecycle_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -924,9 +925,32 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            self._update_beam_kv_lifecycle_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
+
+    def _update_beam_kv_lifecycle_stats(self) -> None:
+        """Sample trie Beam KV ownership outside the decode hot path.
+
+        The allocator owns the accounting because only it can distinguish a
+        physical KV page/token from an additional shared Beam reference.
+        Non-trie requests do not implement the snapshot method and therefore
+        keep these metrics at zero.
+        """
+        snapshot_fn = getattr(
+            self.scheduler.token_to_kv_pool_allocator,
+            "beam_lifecycle_snapshot",
+            None,
+        )
+        if snapshot_fn is None:
+            return
+
+        snapshot = snapshot_fn()
+        self.stats.beam_kv_registered_total = snapshot["registered"]
+        self.stats.beam_kv_released_total = snapshot["released"]
+        self.stats.beam_kv_live = snapshot["live"]
+        self.stats.beam_kv_live_references = snapshot["live_references"]
 
     def log_batch_result_stats(
         self,

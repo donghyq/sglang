@@ -128,6 +128,13 @@ class SchedulerStats:
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
 
+    # Trie-constrained Beam KV ownership. These count physical KV allocation
+    # units: pages for paged allocators and tokens for non-paged allocators.
+    beam_kv_registered_total: int = 0
+    beam_kv_released_total: int = 0
+    beam_kv_live: int = 0
+    beam_kv_live_references: int = 0
+
     # Utilization
     utilization: float = 0.0
     fwd_occupancy: float = float("nan")
@@ -558,6 +565,33 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
+        )
+
+        # Trie-constrained Beam KV lifecycle. The values are sampled at the
+        # existing scheduler metrics interval, never in the decode hot path.
+        self.beam_kv_registered_total = Gauge(
+            name="sglang:beam_kv_registered_total",
+            documentation="Cumulative physical KV units registered by trie beam requests.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_released_total = Gauge(
+            name="sglang:beam_kv_released_total",
+            documentation="Cumulative physical KV units released by trie beam requests.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_live = Gauge(
+            name="sglang:beam_kv_live",
+            documentation="Physical KV units currently owned by trie beam requests.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_live_references = Gauge(
+            name="sglang:beam_kv_live_references",
+            documentation="Live trie beam references to physical KV units.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         # =================================================================
@@ -1326,6 +1360,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
+        self._log_gauge(self.beam_kv_registered_total, stats.beam_kv_registered_total)
+        self._log_gauge(self.beam_kv_released_total, stats.beam_kv_released_total)
+        self._log_gauge(self.beam_kv_live, stats.beam_kv_live)
+        self._log_gauge(
+            self.beam_kv_live_references, stats.beam_kv_live_references
         )
 
         # Utilization
