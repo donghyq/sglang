@@ -51,6 +51,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.beam_token_refcounts.clear()
+        self.beam_tokens_registered_total = 0
+        self.beam_tokens_released_total = 0
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def available_size(self):
@@ -78,6 +80,29 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         return token_ids
 
+    def beam_lifecycle_snapshot(self) -> dict[str, int]:
+        """Return token ownership counters for Beam KV lifecycle diagnostics.
+
+        With page size one, each registered token is a physical KV unit.
+        ``registered - released`` must equal the number of live units.
+        """
+        registered = getattr(self, "beam_tokens_registered_total", 0)
+        released = getattr(self, "beam_tokens_released_total", 0)
+        return {
+            "registered": registered,
+            "released": released,
+            "live": len(self.beam_token_refcounts),
+            "live_references": sum(self.beam_token_refcounts.values()),
+        }
+
+    def assert_beam_lifecycle_conservation(self) -> None:
+        """Fail fast when Beam token ownership is no longer conserved."""
+        snapshot = self.beam_lifecycle_snapshot()
+        if snapshot["registered"] - snapshot["released"] != snapshot["live"]:
+            raise AssertionError(f"Beam KV token lifecycle is not conserved: {snapshot}")
+        if any(refcount < 1 for refcount in self.beam_token_refcounts.values()):
+            raise AssertionError(f"Beam KV token refcount must stay positive: {snapshot}")
+
     def register_beam_pages(self, kv_indices: torch.Tensor) -> None:
         """Register KV tokens newly owned by a root Beam or private suffix.
 
@@ -94,6 +119,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         for token_id in token_ids:
             self.beam_token_refcounts[token_id] = 1
+        self.beam_tokens_registered_total = (
+            getattr(self, "beam_tokens_registered_total", 0) + len(token_ids)
+        )
+        self.assert_beam_lifecycle_conservation()
 
     def fork_shared_prefix(
         self, kv_indices: torch.Tensor, child_count: int = 1
@@ -141,6 +170,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     released_token_ids, dtype=torch.int64, device=self.device
                 )
             )
+        self.beam_tokens_released_total = (
+            getattr(self, "beam_tokens_released_total", 0) + len(released_token_ids)
+        )
+        self.assert_beam_lifecycle_conservation()
 
     def free(self, free_index: torch.Tensor):
         beam_owned = set(self._beam_token_ids(free_index)) & set(

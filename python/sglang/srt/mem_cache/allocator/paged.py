@@ -271,6 +271,30 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         return page_ids
 
+    def beam_lifecycle_snapshot(self) -> dict[str, int]:
+        """Return page ownership counters for Beam KV lifecycle diagnostics.
+
+        ``registered`` and ``released`` count physical pages, not references.
+        Their difference must equal ``live``. ``live_references`` additionally
+        captures sharing caused by Beam forks.
+        """
+        registered = getattr(self, "beam_pages_registered_total", 0)
+        released = getattr(self, "beam_pages_released_total", 0)
+        return {
+            "registered": registered,
+            "released": released,
+            "live": len(self.beam_page_refcounts),
+            "live_references": sum(self.beam_page_refcounts.values()),
+        }
+
+    def assert_beam_lifecycle_conservation(self) -> None:
+        """Fail fast when Beam page ownership is no longer conserved."""
+        snapshot = self.beam_lifecycle_snapshot()
+        if snapshot["registered"] - snapshot["released"] != snapshot["live"]:
+            raise AssertionError(f"Beam KV page lifecycle is not conserved: {snapshot}")
+        if any(refcount < 1 for refcount in self.beam_page_refcounts.values()):
+            raise AssertionError(f"Beam KV page refcount must stay positive: {snapshot}")
+
     def register_beam_pages(self, kv_indices: torch.Tensor) -> None:
         """Register pages newly owned by a root beam or its private suffix."""
         page_ids = self._beam_page_ids(kv_indices)
@@ -283,6 +307,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         for page_id in page_ids:
             self.beam_page_refcounts[page_id] = 1
+        self.beam_pages_registered_total = (
+            getattr(self, "beam_pages_registered_total", 0) + len(page_ids)
+        )
+        self.assert_beam_lifecycle_conservation()
 
     def fork_shared_prefix(
         self, kv_indices: torch.Tensor, child_count: int = 1
@@ -342,6 +370,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 released_page_ids, dtype=torch.int64, device=self.device
             )
             self._free_unshared(pages * self.page_size)
+        self.beam_pages_released_total = (
+            getattr(self, "beam_pages_released_total", 0) + len(released_page_ids)
+        )
+        self.assert_beam_lifecycle_conservation()
 
     def free(self, free_index: torch.Tensor):
         beam_owned = set(self._beam_page_ids(free_index)) & set(
@@ -378,6 +410,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.beam_page_refcounts.clear()
+        self.beam_pages_registered_total = 0
+        self.beam_pages_released_total = 0
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):

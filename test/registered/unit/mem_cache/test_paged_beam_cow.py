@@ -50,6 +50,29 @@ class TestPagedBeamCOW(CustomTestCase):
         allocator.release_beam_suffix(prefix)
         self.assertEqual(allocator.beam_page_refcounts, {})
         self.assertEqual(sorted(allocator.free_pages.tolist()), [1, 2])
+        self.assertEqual(
+            allocator.beam_lifecycle_snapshot(),
+            {"registered": 2, "released": 2, "live": 0, "live_references": 0},
+        )
+
+    def test_page_lifecycle_counts_physical_pages_not_shared_references(self):
+        allocator = self._allocator()
+        prefix = torch.tensor([4, 5, 6, 7])
+
+        allocator.register_beam_pages(prefix)
+        allocator.fork_shared_prefix(prefix, child_count=2)
+        self.assertEqual(
+            allocator.beam_lifecycle_snapshot(),
+            {"registered": 1, "released": 0, "live": 1, "live_references": 3},
+        )
+
+        allocator.release_beam_suffix(prefix)
+        allocator.release_beam_suffix(prefix)
+        allocator.release_beam_suffix(prefix)
+        self.assertEqual(
+            allocator.beam_lifecycle_snapshot(),
+            {"registered": 1, "released": 1, "live": 0, "live_references": 0},
+        )
 
     def test_direct_free_of_beam_page_is_rejected(self):
         allocator = self._allocator()
@@ -264,6 +287,10 @@ class TestPagedBeamCOW(CustomTestCase):
         runtime.release_all()
         self.assertEqual(allocator.beam_token_refcounts, {})
         self.assertTrue(set([4, 5, 6, 7]).issubset(set(allocator.free_pages.tolist())))
+        self.assertEqual(
+            allocator.beam_lifecycle_snapshot(),
+            {"registered": 4, "released": 4, "live": 0, "live_references": 0},
+        )
 
     def test_runtime_fork_failure_rolls_back_kv_references_and_request_slots(self):
         allocator = self._allocator()
