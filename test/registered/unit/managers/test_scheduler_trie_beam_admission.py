@@ -285,6 +285,7 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
             root_req.rid: SimpleNamespace(root_req=root_req, execution=execution)
         }
         scheduler.tree_cache = MagicMock()
+        scheduler.metrics_reporter = MagicMock()
         scheduler.ipc_channels = MagicMock()
         scheduler.chunked_req = None
         scheduler.partial_rollout_paused_queue = []
@@ -297,10 +298,29 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
         scheduler.abort_request(AbortReq(rid=root_req.rid))
 
         execution.release_all.assert_called_once_with()
+        scheduler.metrics_reporter.report_beam_kv_lifecycle_completion.assert_called_once_with()
         scheduler.tree_cache.dec_lock_ref.assert_called_once_with(root_cache_node)
         self.assertIsNone(root_req.last_node)
         self.assertNotIn(root_req.rid, scheduler.trie_beam_executions)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+
+    def test_abort_non_trie_request_does_not_publish_beam_kv_metrics(self):
+        """Normal aborts must not add a Beam-specific metrics update."""
+        scheduler = self._scheduler()
+        scheduler.tree_cache = MagicMock()
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.ipc_channels = MagicMock()
+        scheduler.chunked_req = None
+        scheduler.partial_rollout_paused_queue = []
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = MagicMock()
+        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.running_batch = None
+        scheduler.last_batch = None
+
+        scheduler.abort_request(AbortReq(rid="ordinary-request"))
+
+        scheduler.metrics_reporter.report_beam_kv_lifecycle_completion.assert_not_called()
 
     def test_missing_trie_logits_marker_uses_normal_result_processor(self):
         scheduler = Scheduler.__new__(Scheduler)

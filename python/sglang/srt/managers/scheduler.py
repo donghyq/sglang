@@ -4527,6 +4527,12 @@ class Scheduler(
                 AbortReq(rid=root_rid), state.root_req
             )
             logger.debug(f"Abort Trie beam request. {root_rid=}")
+        if aborted_trie_roots:
+            # Trie Beam branches are owned outside ``running_batch``. Publish
+            # the allocator snapshot only after every matched root has released
+            # its branches, so an abort-all request never exposes an
+            # intermediate live-KV value through Prometheus.
+            self.metrics_reporter.report_beam_kv_lifecycle_completion()
 
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
