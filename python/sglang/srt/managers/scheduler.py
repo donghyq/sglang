@@ -4524,7 +4524,11 @@ class Scheduler(
             state.execution.release_all()
             self._release_trie_beam_root_cache_lock(state.root_req)
             self.ipc_channels.send_to_tokenizer.send_output(
-                AbortReq(rid=root_rid), state.root_req
+                AbortReq(
+                    rid=root_rid,
+                    abort_message="Abort active Trie Beam request.",
+                ),
+                state.root_req,
             )
             logger.debug(f"Abort Trie beam request. {root_rid=}")
         if aborted_trie_roots:

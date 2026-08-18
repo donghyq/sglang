@@ -303,6 +303,8 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
         self.assertIsNone(root_req.last_node)
         self.assertNotIn(root_req.rid, scheduler.trie_beam_executions)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+        abort_req = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        self.assertEqual(abort_req.abort_message, "Abort active Trie Beam request.")
 
     def test_abort_non_trie_request_does_not_publish_beam_kv_metrics(self):
         """Normal aborts must not add a Beam-specific metrics update."""
