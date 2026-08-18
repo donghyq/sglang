@@ -5,10 +5,54 @@ These tests focus on testing the validation logic in isolation,
 including parameter validation, URL validation, and configuration validation.
 """
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sglang_router.launch_router import RouterArgs, launch_router
+from sglang_router.mini_lb import MiniLoadBalancer
+
+
+class TestMiniLoadBalancerRequestRoutes:
+    @staticmethod
+    def _load_balancer():
+        load_balancer = MiniLoadBalancer.__new__(MiniLoadBalancer)
+        load_balancer.request_routes = {}
+        load_balancer.request_routes_lock = asyncio.Lock()
+        return load_balancer
+
+    def test_abort_uses_the_pair_selected_for_the_request(self):
+        load_balancer = self._load_balancer()
+
+        async def check():
+            await load_balancer._register_request_route(
+                {"rid": "lugr-request"}, "http://prefill-a", "http://decode-b"
+            )
+            return await load_balancer.pop_abort_targets({"rid": "lugr-request"})
+
+        assert asyncio.run(check()) == [("http://prefill-a", "http://decode-b")]
+        assert load_balancer.request_routes == {}
+
+    def test_abort_all_drains_each_active_worker_pair_once(self):
+        load_balancer = self._load_balancer()
+
+        async def check():
+            await load_balancer._register_request_route(
+                {"rid": "one"}, "http://prefill-a", "http://decode-a"
+            )
+            await load_balancer._register_request_route(
+                {"rid": "two"}, "http://prefill-a", "http://decode-a"
+            )
+            await load_balancer._register_request_route(
+                {"rid": "three"}, "http://prefill-b", "http://decode-b"
+            )
+            return await load_balancer.pop_abort_targets({"abort_all": True})
+
+        assert asyncio.run(check()) == [
+            ("http://prefill-a", "http://decode-a"),
+            ("http://prefill-b", "http://decode-b"),
+        ]
+        assert load_balancer.request_routes == {}
 
 
 class TestURLValidation:

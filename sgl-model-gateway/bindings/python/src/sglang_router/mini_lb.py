@@ -50,6 +50,69 @@ class MiniLoadBalancer:
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        # A P/D request is sent to a selected pair of workers. Keep that
+        # ownership until the request completes so cancellation can reach the
+        # same Prefill and Decode workers instead of being re-routed randomly.
+        self.request_routes = {}
+        self.request_routes_lock = asyncio.Lock()
+
+    async def _register_request_route(
+        self, request_data: dict, prefill_server: str, decode_server: str
+    ) -> Optional[str]:
+        rid = request_data.get("rid")
+        if not isinstance(rid, str) or not rid:
+            return None
+        async with self.request_routes_lock:
+            self.request_routes[rid] = (prefill_server, decode_server)
+        return rid
+
+    async def _release_request_route(self, rid: Optional[str]) -> None:
+        if rid is None:
+            return
+        async with self.request_routes_lock:
+            self.request_routes.pop(rid, None)
+
+    async def pop_abort_targets(self, request_data: dict):
+        """Return and remove the worker pair(s) that own an active request."""
+        abort_all = request_data.get("abort_all", False)
+        rid = request_data.get("rid")
+        async with self.request_routes_lock:
+            if abort_all:
+                targets = list(dict.fromkeys(self.request_routes.values()))
+                self.request_routes.clear()
+                return targets
+            if not isinstance(rid, str) or not rid:
+                return []
+            target = self.request_routes.pop(rid, None)
+            return [] if target is None else [target]
+
+    async def abort_request(self, request_data: dict) -> bool:
+        """Forward cancellation to the worker pair that owns the request."""
+        targets = await self.pop_abort_targets(request_data)
+        if not targets:
+            return False
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout)
+        ) as session:
+            responses = await asyncio.gather(
+                *(
+                    session.post(f"{server}/abort_request", json=request_data)
+                    for pair in targets
+                    for server in pair
+                )
+            )
+            for response in responses:
+                if response.status >= HTTPStatus.BAD_REQUEST:
+                    error_text = await response.text()
+                    raise HTTPException(
+                        status_code=HTTPStatus.BAD_GATEWAY,
+                        detail=(
+                            "Backend rejected abort request: "
+                            f"status={response.status}, response={error_text}"
+                        ),
+                    )
+        return True
 
     def _validate_router_args(self, router_args: RouterArgs):
         logger.warning(
@@ -115,60 +178,66 @@ class MiniLoadBalancer:
         self, modified_request, prefill_server, decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+        route_rid = await self._register_request_route(
+            modified_request, prefill_server, decode_server
+        )
 
-        expected_decode_dp_rank = None
-        if self.test_external_dp_routing:
-            await self._ensure_dp_sizes()
-            prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
-                modified_request
-            )
-        else:
-            prefill_req = modified_request
-            decode_req = modified_request
-
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=self.timeout
-            )  # Add timeout for request reliability
-        ) as session:
-
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
-
-            # Wait for both responses to complete. Prefill should end first.
-            prefill_response, decode_response = await asyncio.gather(*tasks)
-
-            if "return_logprob" in modified_request:
-
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
-
-                # merge `meta_info.input_token_logprobs` from prefill to decode
-                if "meta_info" in ret_json:
-                    if "input_token_logprobs" in ret_json["meta_info"]:
-                        ret_json["meta_info"]["input_token_logprobs"] = (
-                            prefill_json["meta_info"]["input_token_logprobs"]
-                            + ret_json["meta_info"]["input_token_logprobs"]
-                        )
+        try:
+            expected_decode_dp_rank = None
+            if self.test_external_dp_routing:
+                await self._ensure_dp_sizes()
+                prefill_req, decode_req, expected_decode_dp_rank = self._fork_dp_requests(
+                    modified_request
+                )
             else:
-                ret_json = await decode_response.json()
+                prefill_req = modified_request
+                decode_req = modified_request
 
-            if expected_decode_dp_rank is not None:
-                actual = ret_json.get("meta_info", {}).get("dp_rank")
-                if actual != expected_decode_dp_rank:
-                    return ORJSONResponse(
-                        content={
-                            "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
-                        },
-                        status_code=500,
-                    )
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=self.timeout
+                )  # Add timeout for request reliability
+            ) as session:
 
-            return ORJSONResponse(
-                content=ret_json,
-                status_code=decode_response.status,
-            )
+                tasks = [
+                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                ]
+
+                # Wait for both responses to complete. Prefill should end first.
+                prefill_response, decode_response = await asyncio.gather(*tasks)
+
+                if "return_logprob" in modified_request:
+
+                    prefill_json = await prefill_response.json()
+                    ret_json = await decode_response.json()
+
+                    # merge `meta_info.input_token_logprobs` from prefill to decode
+                    if "meta_info" in ret_json:
+                        if "input_token_logprobs" in ret_json["meta_info"]:
+                            ret_json["meta_info"]["input_token_logprobs"] = (
+                                prefill_json["meta_info"]["input_token_logprobs"]
+                                + ret_json["meta_info"]["input_token_logprobs"]
+                            )
+                else:
+                    ret_json = await decode_response.json()
+
+                if expected_decode_dp_rank is not None:
+                    actual = ret_json.get("meta_info", {}).get("dp_rank")
+                    if actual != expected_decode_dp_rank:
+                        return ORJSONResponse(
+                            content={
+                                "error": f"DP rank mismatch: expected {expected_decode_dp_rank}, got {actual}"
+                            },
+                            status_code=500,
+                        )
+
+                return ORJSONResponse(
+                    content=ret_json,
+                    status_code=decode_response.status,
+                )
+        finally:
+            await self._release_request_route(route_rid)
 
     async def generate_stream(
         self, modified_request, prefill_server, decode_server, endpoint="generate"
@@ -178,57 +247,63 @@ class MiniLoadBalancer:
             warnings.warn("--test-external-dp-routing is not supported with streaming")
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+        route_rid = await self._register_request_route(
+            modified_request, prefill_server, decode_server
+        )
 
         async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(
-                    total=self.timeout
-                )  # Add timeout for request reliability
-            ) as session:
-                # Create the tasks for both prefill and decode requests
-                tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
-                ]
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(
+                        total=self.timeout
+                    )  # Add timeout for request reliability
+                ) as session:
+                    # Create the tasks for both prefill and decode requests
+                    tasks = [
+                        session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                        session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                    ]
 
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+                    # Wait for both responses to complete. Since this is streaming, they return immediately.
+                    prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                    if modified_request.get("return_logprob", False):
+                        prefill_chunks = []
+                        async for chunk in prefill_response.content:
+                            prefill_chunks.append(chunk)
 
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+                        first_prefill_chunk = (
+                            prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                        )
+                        first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
-                    async for chunk in decode_response.content:
-                        # Note: This is inefficient
-                        # merge prefill input_token_logprobs, output_token_logprobs to decode
-                        decoded_chunk = chunk.decode("utf-8")
-                        if (
-                            decoded_chunk
-                            and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
+                        async for chunk in decode_response.content:
+                            # Note: This is inefficient
+                            # merge prefill input_token_logprobs, output_token_logprobs to decode
+                            decoded_chunk = chunk.decode("utf-8")
+                            if (
+                                decoded_chunk
+                                and decoded_chunk.startswith("data:")
+                                and "[DONE]" not in decoded_chunk
+                            ):
+                                ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                                ret_json["meta_info"]["input_token_logprobs"] = (
+                                    first_prefill_chunk_json["meta_info"][
+                                        "input_token_logprobs"
+                                    ]
+                                    + ret_json["meta_info"]["input_token_logprobs"]
+                                )
+
+                                yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                            else:
+                                yield chunk
+                    else:
+                        async for chunk in decode_response.content.iter_chunked(
+                            AIOHTTP_STREAM_READ_CHUNK_SIZE
                         ):
-                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
-                                + ret_json["meta_info"]["input_token_logprobs"]
-                            )
-
-                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
-                        else:
                             yield chunk
-                else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
-                    ):
-                        yield chunk
+            finally:
+                await self._release_request_route(route_rid)
 
         return StreamingResponse(
             stream_results(),
@@ -266,6 +341,16 @@ async def flush_cache():
             tasks.append(session.post(f"{server}/flush_cache"))
         for i, response in enumerate(asyncio.as_completed(tasks)):
             await response
+    return Response(status_code=200)
+
+
+@app.post("/abort_request")
+async def abort_request(request_data: dict):
+    if not await lb.abort_request(request_data):
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail="No active request route found for the supplied rid.",
+        )
     return Response(status_code=200)
 
 
