@@ -47,7 +47,11 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
-        self.test_external_dp_routing = router_args.test_external_dp_routing
+        # Older RouterArgs versions do not carry this test-only option. Keep
+        # MiniLB usable with those deployments by treating it as disabled.
+        self.test_external_dp_routing = getattr(
+            router_args, "test_external_dp_routing", False
+        )
         self.prefill_dp_size = None
         self.decode_dp_size = None
         # A P/D request is sent to a selected pair of workers. Keep that
