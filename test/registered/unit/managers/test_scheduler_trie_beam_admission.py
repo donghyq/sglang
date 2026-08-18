@@ -324,6 +324,45 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
 
         scheduler.metrics_reporter.report_beam_kv_lifecycle_completion.assert_not_called()
 
+    def test_abort_decode_pd_queues_cancels_kv_receivers(self):
+        """P/D handoff cancellation must stop both Decode-side receivers."""
+        scheduler = self._scheduler(disaggregation_mode=DisaggregationMode.DECODE)
+        rid = "lugr-pd-handoff"
+        prealloc_receiver = MagicMock()
+        transfer_receiver = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[
+                SimpleNamespace(
+                    req=SimpleNamespace(rid=rid),
+                    kv_receiver=prealloc_receiver,
+                )
+            ],
+            retracted_queue=[],
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[
+                SimpleNamespace(
+                    req=SimpleNamespace(rid=rid),
+                    kv_receiver=transfer_receiver,
+                )
+            ]
+        )
+        scheduler.tree_cache = MagicMock()
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.ipc_channels = MagicMock()
+        scheduler.chunked_req = None
+        scheduler.partial_rollout_paused_queue = []
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = MagicMock()
+        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.running_batch = None
+        scheduler.last_batch = None
+
+        scheduler.abort_request(AbortReq(rid=rid))
+
+        prealloc_receiver.abort.assert_called_once_with()
+        transfer_receiver.abort.assert_called_once_with()
+
     def test_missing_trie_logits_marker_uses_normal_result_processor(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
