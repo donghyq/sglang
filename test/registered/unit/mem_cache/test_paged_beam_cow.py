@@ -67,6 +67,36 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_live, 0)
         self.assertEqual(reporter.stats.beam_kv_live_references, 0)
 
+    def test_completion_metrics_publish_reclaimed_beam_pages(self):
+        allocator = self._allocator()
+        prefix = torch.tensor([4, 5, 6, 7])
+        allocator.register_beam_pages(prefix)
+        allocator.release_beam_suffix(prefix)
+
+        collector = SimpleNamespace(log_beam_kv_lifecycle_stats=lambda stats: None)
+        reporter = object.__new__(SchedulerMetricsReporter)
+        reporter.scheduler = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+        reporter.stats = SchedulerStats()
+        reporter.current_scheduler_metrics_enabled = True
+        reporter.metrics_collector = collector
+
+        observed = []
+        collector.log_beam_kv_lifecycle_stats = observed.append
+        reporter.report_beam_kv_lifecycle_completion()
+
+        self.assertEqual(reporter.stats.beam_kv_registered_total, 1)
+        self.assertEqual(reporter.stats.beam_kv_released_total, 1)
+        self.assertEqual(reporter.stats.beam_kv_live, 0)
+        self.assertEqual(reporter.stats.beam_kv_live_references, 0)
+        self.assertEqual(observed, [reporter.stats])
+
+    def test_completion_metrics_skip_disabled_collectors(self):
+        reporter = object.__new__(SchedulerMetricsReporter)
+        reporter.current_scheduler_metrics_enabled = False
+        reporter.metrics_collector = None
+
+        reporter.report_beam_kv_lifecycle_completion()
+
     def test_fork_then_prune_frees_pages_once(self):
         allocator = self._allocator()
         prefix = torch.tensor([4, 5, 6, 7])

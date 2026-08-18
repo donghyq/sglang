@@ -1309,6 +1309,7 @@ class Scheduler(
         root_req.finished_reason = FINISH_MATCHED_TOKEN(matched=best.tokens[-1])
         root_req.finished_len = len(best.tokens)
         state.execution.release_all()
+        self.metrics_reporter.report_beam_kv_lifecycle_completion()
         self._release_trie_beam_root_cache_lock(root_req)
         self.trie_beam_executions.pop(root_req.rid, None)
         self.output_streamer.stream_output([root_req], return_logprob=False)

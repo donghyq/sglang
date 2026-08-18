@@ -1413,6 +1413,21 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         self.last_log_time = time.perf_counter()
 
+    def log_beam_kv_lifecycle_stats(self, stats: SchedulerStats) -> None:
+        """Publish Beam KV ownership at a lifecycle boundary.
+
+        Decode-wide metrics are normally emitted at ``decode_log_interval``.
+        A short trie-constrained Beam request can start and finish before that
+        interval elapses, so publish only its four ownership gauges when the
+        Beam execution is reclaimed.
+        """
+        self._log_gauge(self.beam_kv_registered_total, stats.beam_kv_registered_total)
+        self._log_gauge(self.beam_kv_released_total, stats.beam_kv_released_total)
+        self._log_gauge(self.beam_kv_live, stats.beam_kv_live)
+        self._log_gauge(
+            self.beam_kv_live_references, stats.beam_kv_live_references
+        )
+
     def log_grammar_stats(self, grammar_stats) -> None:
         if grammar_stats.compilation_time is not None:
             self._log_histogram(

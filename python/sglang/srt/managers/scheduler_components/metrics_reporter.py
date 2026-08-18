@@ -952,6 +952,22 @@ class SchedulerMetricsReporter:
         self.stats.beam_kv_live = snapshot["live"]
         self.stats.beam_kv_live_references = snapshot["live_references"]
 
+    def report_beam_kv_lifecycle_completion(self) -> None:
+        """Export final Beam KV ownership without waiting for periodic stats.
+
+        Trie Beam requests may complete in fewer Decode rounds than
+        ``decode_log_interval``.  The allocator counters are sampled after
+        all branch KV has been released, then only the lifecycle gauges are
+        published.  This keeps the Decode hot path unchanged.
+        """
+        if (
+            not self.current_scheduler_metrics_enabled
+            or self.metrics_collector is None
+        ):
+            return
+        self._update_beam_kv_lifecycle_stats()
+        self.metrics_collector.log_beam_kv_lifecycle_stats(self.stats)
+
     def log_batch_result_stats(
         self,
         batch: ScheduleBatch,
