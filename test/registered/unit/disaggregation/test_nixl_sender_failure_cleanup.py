@@ -1,10 +1,18 @@
+from collections import defaultdict
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVSender,
+)
 from sglang.srt.disaggregation.nixl.conn import NixlKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -77,6 +85,82 @@ class TestMooncakeSenderFailureCleanup(unittest.TestCase):
         self.assertNotIn(room, sender.kv_mgr.req_to_decode_prefix_len)
         self.assertNotIn(room, sender.kv_mgr.transfer_infos)
         self.assertNotIn(room, sender.kv_mgr.failure_records)
+
+    def test_transfer_worker_failure_is_cleaned_by_sender(self):
+        room = 9
+        session_id = "decode-session"
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.enable_trace = False
+        mgr.enable_staging = False
+        mgr.request_status = {room: KVPoll.Transferring}
+        mgr.transfer_infos = {
+            room: {
+                session_id: SimpleNamespace(
+                    room=room,
+                    endpoint="127.0.0.1",
+                    dst_port=31010,
+                    mooncake_session_id=session_id,
+                    dst_kv_indices=np.array([4], dtype=np.int32),
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+        }
+        mgr.req_to_decode_prefix_len = {room: 5}
+        mgr.decode_kv_args_table = {
+            session_id: SimpleNamespace(
+                dst_kv_ptrs=[0],
+                dst_attn_tp_size=1,
+            )
+        }
+        mgr.attn_tp_rank = 0
+        mgr.attn_cp_rank = 0
+        mgr.attn_dp_rank = 0
+        mgr.attn_cp_size = 1
+        mgr.pp_rank = 0
+        mgr.pp_size = 1
+        mgr.attn_tp_size = 1
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.session_lock = threading.Lock()
+        mgr.session_failures = defaultdict(int)
+        mgr.failed_sessions = set()
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr.send_kvcache = MagicMock(return_value=-1)
+        mgr.sync_status_to_decode_endpoint = MagicMock()
+
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array([3], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=False,
+            prefill_aux_index=None,
+            state_indices=None,
+        )
+        queue = SimpleNamespace(get=MagicMock(side_effect=[chunk, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue, executor=MagicMock())
+
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertIn(session_id, mgr.failed_sessions)
+        self.assertIn("Failed to send kv chunk", mgr.failure_records[room])
+        mgr.sync_status_to_decode_endpoint.assert_called_once_with(
+            "127.0.0.1", 31010, room, KVPoll.Failed, 0
+        )
+
+        sender = MooncakeKVSender.__new__(MooncakeKVSender)
+        sender.bootstrap_room = room
+        sender.conclude_state = None
+        sender.kv_mgr = mgr
+        with self.assertRaises(KVTransferError):
+            sender.failure_exception()
+
+        self.assertNotIn(room, mgr.request_status)
+        self.assertNotIn(room, mgr.req_to_decode_prefix_len)
+        self.assertNotIn(room, mgr.transfer_infos)
+        self.assertNotIn(room, mgr.failure_records)
 
 
 if __name__ == "__main__":
