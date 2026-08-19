@@ -1936,12 +1936,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                is_request_abort = False
                 if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
+                        is_request_abort = getattr(e, "is_aborted_by_request", False)
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -1964,7 +1966,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
-                if self.scheduler.metrics_reporter.enable_metrics:
+                if (
+                    self.scheduler.metrics_reporter.enable_metrics
+                    and not is_request_abort
+                ):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:

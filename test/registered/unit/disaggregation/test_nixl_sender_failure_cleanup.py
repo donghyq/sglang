@@ -80,11 +80,17 @@ class TestMooncakeSenderFailureCleanup(unittest.TestCase):
         self.assertEqual(cm.exception.bootstrap_room, room)
         self.assertIn("bootstrap_room=8", str(cm.exception))
         self.assertIn("RDMA transfer failed", str(cm.exception))
+        self.assertFalse(cm.exception.is_aborted_by_request)
         self.assertEqual(sender.conclude_state, KVPoll.Failed)
         self.assertNotIn(room, sender.kv_mgr.request_status)
         self.assertNotIn(room, sender.kv_mgr.req_to_decode_prefix_len)
         self.assertNotIn(room, sender.kv_mgr.transfer_infos)
         self.assertNotIn(room, sender.kv_mgr.failure_records)
+
+    def test_abort_error_is_classified_without_counting_as_transfer_failure(self):
+        error = KVTransferError(10, "Aborted by AbortReq.")
+
+        self.assertTrue(error.is_aborted_by_request)
 
     def test_transfer_worker_failure_is_cleaned_by_sender(self):
         room = 9

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -166,7 +167,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_decode_hicache = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
-        scheduler.metrics_reporter.enable_metrics = False
+        scheduler.metrics_reporter.enable_metrics = True
         queue.scheduler = scheduler
 
         mock_poll.return_value = [KVPoll.Failed]
@@ -178,6 +179,52 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_transfer_abort_does_not_increment_failure_metric(
+        self, mock_poll, mock_prepare_abort, mock_release_kv_cache
+    ):
+        class AbortReceiver(FakeReceiver):
+            def failure_exception(self):
+                raise KVTransferError(7, "Aborted by AbortReq.")
+
+        receiver = AbortReceiver()
+        req = SimpleNamespace(
+            rid="aborted-transfer",
+            bootstrap_room=7,
+            return_logprob=False,
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=receiver,
+            metadata_buffer_index=3,
+            hicache_restore_status=HiCacheRestoreResult.READY,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.enable_staging = False
+        queue.gloo_group = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.tp_rank = 0
+        queue.tree_cache = MagicMock()
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[None] * 4)
+        queue.spec_algorithm = MagicMock()
+        queue.spec_algorithm.is_none.return_value = True
+        queue._clean_hicache_prefetch_resources = MagicMock()
+        scheduler = MagicMock()
+        scheduler.enable_decode_hicache = False
+        scheduler.enable_hisparse = False
+        scheduler.output_streamer = MagicMock()
+        scheduler.metrics_reporter.enable_metrics = True
+        queue.scheduler = scheduler
+        mock_poll.return_value = [KVPoll.Failed]
+
+        queue.pop_transferred()
+
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_not_called()
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )

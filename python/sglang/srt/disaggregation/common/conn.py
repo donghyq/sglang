@@ -59,6 +59,11 @@ class KVTransferError(Exception):
         self.failure_reason = failure_reason
         self.is_from_another_rank = is_from_another_rank
 
+    @property
+    def is_aborted_by_request(self) -> bool:
+        """Whether this terminal state was initiated by ``/abort_request``."""
+        return self.failure_reason == "Aborted by AbortReq."
+
     def __str__(self):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 

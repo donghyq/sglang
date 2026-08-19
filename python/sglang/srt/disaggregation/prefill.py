@@ -951,7 +951,9 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not getattr(
+            exc, "is_aborted_by_request", False
+        ):
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
