@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common.conn import KVTransferError
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVSender
 from sglang.srt.disaggregation.nixl.conn import NixlKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -48,6 +50,33 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         self.assertNotIn((room, 0, "session-a"), staging_ctx.prefetch_requested)
         self.assertIn(8, staging_ctx.prefetched_rooms)
         self.assertIn((8, 0, "session-b"), staging_ctx.prefetch_requested)
+
+
+class TestMooncakeSenderFailureCleanup(unittest.TestCase):
+    def test_failure_exception_cleans_room_state_before_raising(self):
+        room = 8
+        sender = MooncakeKVSender.__new__(MooncakeKVSender)
+        sender.bootstrap_room = room
+        sender.conclude_state = None
+        sender.kv_mgr = SimpleNamespace(
+            request_status={room: KVPoll.Failed},
+            req_to_decode_prefix_len={room: 5},
+            transfer_infos={room: object()},
+            failure_records={room: "RDMA transfer failed"},
+            failure_lock=threading.Lock(),
+        )
+
+        with self.assertRaises(KVTransferError) as cm:
+            sender.failure_exception()
+
+        self.assertEqual(cm.exception.bootstrap_room, room)
+        self.assertIn("bootstrap_room=8", str(cm.exception))
+        self.assertIn("RDMA transfer failed", str(cm.exception))
+        self.assertEqual(sender.conclude_state, KVPoll.Failed)
+        self.assertNotIn(room, sender.kv_mgr.request_status)
+        self.assertNotIn(room, sender.kv_mgr.req_to_decode_prefix_len)
+        self.assertNotIn(room, sender.kv_mgr.transfer_infos)
+        self.assertNotIn(room, sender.kv_mgr.failure_records)
 
 
 if __name__ == "__main__":
