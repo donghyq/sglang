@@ -1937,6 +1937,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 is_propagated = False
                 is_request_abort = False
+                failure_category = "unknown"
                 if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
@@ -1944,6 +1945,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
                         is_request_abort = getattr(e, "is_aborted_by_request", False)
+                        failure_category = getattr(e, "failure_category", "unknown")
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -1970,7 +1972,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_reporter.enable_metrics
                     and not is_request_abort
                 ):
-                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs(
+                        failure_category
+                    )
                 continue
             elif poll == KVPoll.Success:
                 if (

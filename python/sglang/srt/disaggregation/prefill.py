@@ -954,7 +954,9 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics and not getattr(
             exc, "is_aborted_by_request", False
         ):
-            self.metrics_collector.increment_transfer_failed_reqs()
+            self.metrics_collector.increment_transfer_failed_reqs(
+                getattr(exc, "failure_category", "unknown")
+            )
         return exc
 
     def get_transferred_rids(self: Scheduler) -> List[str]:

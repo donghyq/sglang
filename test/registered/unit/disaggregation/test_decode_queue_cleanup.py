@@ -138,7 +138,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
     def test_transfer_failure_clears_receiver_before_removing_request(
         self, mock_poll, mock_prepare_abort, mock_release_kv_cache
     ):
-        receiver = FakeReceiver()
+        class RDMAFailureReceiver(FakeReceiver):
+            def failure_exception(self):
+                raise KVTransferError(7, "RDMA transfer failed")
+
+        receiver = RDMAFailureReceiver()
         req = SimpleNamespace(
             rid="failed-transfer",
             bootstrap_room=7,
@@ -179,7 +183,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
-        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+        scheduler.metrics_collector.increment_transfer_failed_reqs.assert_called_once_with(
+            "rdma_transfer"
+        )
 
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")

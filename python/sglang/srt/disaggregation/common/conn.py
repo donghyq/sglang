@@ -64,6 +64,42 @@ class KVTransferError(Exception):
         """Whether this terminal state was initiated by ``/abort_request``."""
         return self.failure_reason == "Aborted by AbortReq."
 
+    @property
+    def failure_category(self) -> str:
+        """Return a bounded category suitable for a Prometheus label.
+
+        Failure details remain in logs and the client error. Metrics use a small
+        fixed set of categories so request-specific error text cannot create
+        unbounded Prometheus time-series.
+        """
+        if self.is_aborted_by_request:
+            return "request_aborted"
+
+        reason = self.failure_reason.lower()
+        if any(
+            marker in reason
+            for marker in (
+                "lost connection",
+                "could be dead",
+                "not alive",
+                "unknown reason from another rank",
+            )
+        ):
+            return "peer_unreachable"
+        if any(marker in reason for marker in ("rdma", "send kv chunk")):
+            return "rdma_transfer"
+        if any(
+            marker in reason
+            for marker in (
+                "bootstrap",
+                "parallel info",
+                "metadata",
+                "rebootstrap",
+            )
+        ):
+            return "bootstrap"
+        return "unknown"
+
     def __str__(self):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 

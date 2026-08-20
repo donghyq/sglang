@@ -81,6 +81,7 @@ class TestMooncakeSenderFailureCleanup(unittest.TestCase):
         self.assertIn("bootstrap_room=8", str(cm.exception))
         self.assertIn("RDMA transfer failed", str(cm.exception))
         self.assertFalse(cm.exception.is_aborted_by_request)
+        self.assertEqual(cm.exception.failure_category, "rdma_transfer")
         self.assertEqual(sender.conclude_state, KVPoll.Failed)
         self.assertNotIn(room, sender.kv_mgr.request_status)
         self.assertNotIn(room, sender.kv_mgr.req_to_decode_prefix_len)
@@ -91,6 +92,18 @@ class TestMooncakeSenderFailureCleanup(unittest.TestCase):
         error = KVTransferError(10, "Aborted by AbortReq.")
 
         self.assertTrue(error.is_aborted_by_request)
+        self.assertEqual(error.failure_category, "request_aborted")
+
+    def test_transfer_error_categories_are_bounded(self):
+        self.assertEqual(
+            KVTransferError(1, "Lost connection with prefill instance").failure_category,
+            "peer_unreachable",
+        )
+        self.assertEqual(
+            KVTransferError(2, "Could not fetch prefill parallel info").failure_category,
+            "bootstrap",
+        )
+        self.assertEqual(KVTransferError(3, "unexpected").failure_category, "unknown")
 
     def test_transfer_worker_failure_is_cleaned_by_sender(self):
         room = 9

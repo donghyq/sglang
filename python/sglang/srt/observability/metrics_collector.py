@@ -543,6 +543,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
+        self.num_transfer_failed_reqs_by_reason = Counter(
+            name="sglang:num_transfer_failed_reqs_by_reason_total",
+            documentation=(
+                "The number of KV cache transfer failures by bounded reason "
+                "category."
+            ),
+            labelnames=[*labels.keys(), "reason"],
+        )
         self.num_prefill_retries_total = Counter(
             name="sglang:num_prefill_retries_total",
             documentation="Total number of prefill retries.",
@@ -1156,8 +1164,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
 
-    def increment_transfer_failed_reqs(self) -> None:
+    def increment_transfer_failed_reqs(self, reason: str = "unknown") -> None:
+        """Count a failed KV transfer without increasing metric cardinality."""
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+        self.num_transfer_failed_reqs_by_reason.labels(
+            **self.labels, reason=reason
+        ).inc(1)
 
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
