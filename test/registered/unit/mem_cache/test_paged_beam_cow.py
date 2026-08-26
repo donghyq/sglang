@@ -54,6 +54,10 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_released_total, 0)
         self.assertEqual(reporter.stats.beam_kv_live, 1)
         self.assertEqual(reporter.stats.beam_kv_live_references, 3)
+        self.assertEqual(reporter.stats.beam_kv_live_tokens, 4)
+        self.assertEqual(reporter.stats.beam_kv_live_reference_tokens, 12)
+        self.assertEqual(reporter.stats.beam_kv_shared_tokens, 8)
+        self.assertAlmostEqual(reporter.stats.beam_kv_sharing_ratio, 2 / 3)
 
     def test_metrics_snapshot_keeps_zero_for_non_beam_allocator(self):
         reporter = object.__new__(SchedulerMetricsReporter)
@@ -66,6 +70,10 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_released_total, 0)
         self.assertEqual(reporter.stats.beam_kv_live, 0)
         self.assertEqual(reporter.stats.beam_kv_live_references, 0)
+        self.assertEqual(reporter.stats.beam_kv_live_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_live_reference_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_shared_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_sharing_ratio, 0.0)
 
     def test_completion_metrics_publish_reclaimed_beam_pages(self):
         allocator = self._allocator()
@@ -88,6 +96,10 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_released_total, 1)
         self.assertEqual(reporter.stats.beam_kv_live, 0)
         self.assertEqual(reporter.stats.beam_kv_live_references, 0)
+        self.assertEqual(reporter.stats.beam_kv_live_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_live_reference_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_shared_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_sharing_ratio, 0.0)
         self.assertEqual(observed, [reporter.stats])
 
     def test_completion_metrics_skip_disabled_collectors(self):

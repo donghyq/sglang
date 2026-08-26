@@ -134,6 +134,12 @@ class SchedulerStats:
     beam_kv_released_total: int = 0
     beam_kv_live: int = 0
     beam_kv_live_references: int = 0
+    # Beam KV usage normalized to tokens. These are comparable with the
+    # scheduler-wide KV pool token metrics even when the allocator is paged.
+    beam_kv_live_tokens: int = 0
+    beam_kv_live_reference_tokens: int = 0
+    beam_kv_shared_tokens: int = 0
+    beam_kv_sharing_ratio: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -598,6 +604,30 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.beam_kv_live_references = Gauge(
             name="sglang:beam_kv_live_references",
             documentation="Live trie beam references to physical KV units.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_live_tokens = Gauge(
+            name="sglang:beam_kv_live_tokens",
+            documentation="Physical KV tokens currently owned by trie beam requests.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_live_reference_tokens = Gauge(
+            name="sglang:beam_kv_live_reference_tokens",
+            documentation="Logical trie beam KV tokens without prefix sharing.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_shared_tokens = Gauge(
+            name="sglang:beam_kv_shared_tokens",
+            documentation="Trie beam logical KV tokens avoided through prefix sharing.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.beam_kv_sharing_ratio = Gauge(
+            name="sglang:beam_kv_sharing_ratio",
+            documentation="Fraction of trie beam logical KV tokens avoided through prefix sharing.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1379,6 +1409,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.beam_kv_live_references, stats.beam_kv_live_references
         )
+        self._log_gauge(self.beam_kv_live_tokens, stats.beam_kv_live_tokens)
+        self._log_gauge(
+            self.beam_kv_live_reference_tokens,
+            stats.beam_kv_live_reference_tokens,
+        )
+        self._log_gauge(self.beam_kv_shared_tokens, stats.beam_kv_shared_tokens)
+        self._log_gauge(self.beam_kv_sharing_ratio, stats.beam_kv_sharing_ratio)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1439,6 +1476,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.beam_kv_live_references, stats.beam_kv_live_references
         )
+        self._log_gauge(self.beam_kv_live_tokens, stats.beam_kv_live_tokens)
+        self._log_gauge(
+            self.beam_kv_live_reference_tokens,
+            stats.beam_kv_live_reference_tokens,
+        )
+        self._log_gauge(self.beam_kv_shared_tokens, stats.beam_kv_shared_tokens)
+        self._log_gauge(self.beam_kv_sharing_ratio, stats.beam_kv_sharing_ratio)
 
     def log_grammar_stats(self, grammar_stats) -> None:
         if grammar_stats.compilation_time is not None:

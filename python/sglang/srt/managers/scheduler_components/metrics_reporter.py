@@ -952,6 +952,22 @@ class SchedulerMetricsReporter:
         self.stats.beam_kv_live = snapshot["live"]
         self.stats.beam_kv_live_references = snapshot["live_references"]
 
+        # Ownership counters use pages with a paged allocator and tokens with
+        # a token allocator. Normalize them here so the Beam footprint can be
+        # compared directly with kv_*_tokens in SchedulerStats. This sampling
+        # stays on the periodic metrics path, outside Decode's hot path.
+        page_size = getattr(self.scheduler.token_to_kv_pool_allocator, "page_size", 1)
+        physical_tokens = snapshot["live"] * page_size
+        logical_tokens = snapshot["live_references"] * page_size
+        self.stats.beam_kv_live_tokens = physical_tokens
+        self.stats.beam_kv_live_reference_tokens = logical_tokens
+        self.stats.beam_kv_shared_tokens = logical_tokens - physical_tokens
+        self.stats.beam_kv_sharing_ratio = (
+            (logical_tokens - physical_tokens) / logical_tokens
+            if logical_tokens
+            else 0.0
+        )
+
     def report_beam_kv_lifecycle_completion(self) -> None:
         """Export final Beam KV ownership without waiting for periodic stats.
 
