@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+TRIE_BEAM_MAX_CANDIDATES = 128
 _IS_HIP = is_hip()
 
 
@@ -276,13 +277,13 @@ class MetadataBuffers:
             # dedicated buffer makes the Beam handoff unambiguous and avoids
             # overloading user-visible logprob fields.
             self.trie_beam_token_ids = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
+                (size, TRIE_BEAM_MAX_CANDIDATES), dtype=torch.int32, device=device
             )
             self.trie_beam_scores = torch.zeros(
-                (size, 16), dtype=torch.float32, device=device
+                (size, TRIE_BEAM_MAX_CANDIDATES), dtype=torch.float32, device=device
             )
             self.trie_beam_terminal = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
+                (size, TRIE_BEAM_MAX_CANDIDATES), dtype=torch.int32, device=device
             )
             self.trie_beam_count = torch.zeros((size, 16), dtype=torch.int32, device=device)
             self.cached_tokens = torch.zeros(

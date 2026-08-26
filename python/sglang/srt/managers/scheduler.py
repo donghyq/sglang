@@ -69,6 +69,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    TRIE_BEAM_MAX_CANDIDATES,
     get_dsa_seed_metadata_dim,
     prepare_abort,
 )
@@ -1009,7 +1010,15 @@ class Scheduler(
 
     def _trie_beam_decode_branch_budget(self) -> int:
         """Return the maximum internal Beam branches for one Decode forward."""
-        return min(self.max_running_requests, self.req_to_token_pool.size)
+        max_running_requests = getattr(self, "max_running_requests", None)
+        req_to_token_pool_size = (
+            self.req_to_token_pool.size
+            if hasattr(self, "req_to_token_pool")
+            else None
+        )
+        if max_running_requests is None or req_to_token_pool_size is None:
+            return 0
+        return min(max_running_requests, req_to_token_pool_size)
 
     def _select_trie_beam_executions_for_decode(self) -> List[TrieBeamSchedulerExecution]:
         """Select complete Beam groups within one Decode branch budget.
@@ -2333,11 +2342,11 @@ class Scheduler(
             return "Trie-constrained beam search does not support multimodal inputs yet."
         if (
             self.disaggregation_mode != DisaggregationMode.NULL
-            and req.sampling_params.beam_width > 15
+            and req.sampling_params.beam_width > TRIE_BEAM_MAX_CANDIDATES
         ):
             return (
                 "Trie-constrained Beam P/D handoff currently supports at most "
-                "16 first-step candidates."
+                f"{TRIE_BEAM_MAX_CANDIDATES} first-step candidates."
             )
         if not self.spec_algorithm.is_none():
             return (

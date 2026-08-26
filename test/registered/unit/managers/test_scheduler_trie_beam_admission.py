@@ -89,10 +89,18 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
             self._scheduler()._trie_beam_request_error(self._req(), self._recv(), None)
         )
 
+    def test_pd_handoff_admits_a_beam_width_that_fits_metadata_capacity(self):
+        req = self._req(beam_width=128)
+        self.assertIsNone(
+            self._scheduler(
+                disaggregation_mode=DisaggregationMode.DECODE
+            )._trie_beam_request_error(req, self._recv(), None),
+        )
+
     def test_pd_handoff_rejects_a_beam_width_that_exceeds_metadata_capacity(self):
-        req = self._req(beam_width=16)
+        req = self._req(beam_width=129)
         self.assertIn(
-            "16 first-step candidates",
+            "128 first-step candidates",
             self._scheduler(
                 disaggregation_mode=DisaggregationMode.DECODE
             )._trie_beam_request_error(req, self._recv(), None),
@@ -207,11 +215,22 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
 
     def test_pending_trie_handoff_waits_instead_of_crashing_during_active_execution(self):
         scheduler = self._scheduler(disaggregation_mode=DisaggregationMode.DECODE)
-        handoff = SimpleNamespace(trie_beam_handoff_candidates=[])
+        handoff = SimpleNamespace(
+            rid="pending-root",
+            req_pool_idx=0,
+            kv_committed_len=0,
+            grammar=MagicMock(spec=TrieGrammar),
+            trie_beam_handoff_candidates=[(1, 0.0, False)],
+            sampling_params=SimpleNamespace(beam_width=1),
+        )
         scheduler.waiting_queue = [handoff]
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
-        scheduler.trie_beam_executions = {"active-root": object()}
+        scheduler.trie_beam_executions = {
+            "active-root": SimpleNamespace(
+                execution=SimpleNamespace(group=SimpleNamespace(active=[]))
+            )
+        }
 
         result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
             scheduler, ScheduleBatch(reqs=[])
