@@ -239,6 +239,52 @@ class TestSchedulerTrieBeamAdmission(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(scheduler.waiting_queue, [handoff])
 
+    def test_trie_beam_handoff_waits_for_kv_budget(self):
+        scheduler = self._scheduler(disaggregation_mode=DisaggregationMode.DECODE)
+        scheduler.page_size = 1
+        scheduler.max_running_requests = 10
+        scheduler.req_to_token_pool = SimpleNamespace(size=10)
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.token_to_kv_pool_allocator.available_size.return_value = 9
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+
+        handoff = SimpleNamespace(
+            rid="pending-root",
+            trie_beam_handoff_candidates=[
+                (1, 0.0, False),
+                (2, 0.0, False),
+            ],
+            sampling_params=SimpleNamespace(
+                beam_width=2,
+                max_new_tokens=5,
+                num_return_sequences=1,
+            ),
+        )
+        scheduler.waiting_queue = [handoff]
+        scheduler.trie_beam_executions = {
+            "active-root": SimpleNamespace(
+                root_req=SimpleNamespace(
+                    sampling_params=SimpleNamespace(max_new_tokens=5)
+                ),
+                execution=SimpleNamespace(
+                    group=SimpleNamespace(active=[SimpleNamespace(tokens=[1, 2])])
+                ),
+            )
+        }
+
+        result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+            scheduler, ScheduleBatch(reqs=[])
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(scheduler.waiting_queue, [handoff])
+        report_deferred = (
+            scheduler.metrics_reporter.report_trie_beam_admission_deferred
+        )
+        report_deferred.assert_called_once_with()
+
     def test_private_kv_suffix_is_copied_after_page_aligned_prefix(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.page_size = 4

@@ -1003,6 +1003,15 @@ class SchedulerMetricsReporter:
         self._update_beam_kv_lifecycle_stats()
         self.metrics_collector.log_beam_kv_lifecycle_stats(self.stats)
 
+    def report_trie_beam_admission_deferred(self) -> None:
+        """Count a Trie Beam handoff delayed by the KV admission budget."""
+        if (
+            not getattr(self, "current_scheduler_metrics_enabled", False)
+            or getattr(self, "metrics_collector", None) is None
+        ):
+            return
+        self.metrics_collector.increment_trie_beam_admission_deferred()
+
     def log_batch_result_stats(
         self,
         batch: ScheduleBatch,

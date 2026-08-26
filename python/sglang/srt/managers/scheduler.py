@@ -1020,6 +1020,48 @@ class Scheduler(
             return 0
         return min(max_running_requests, req_to_token_pool_size)
 
+    def _trie_beam_paged_tokens(self, tokens: int) -> int:
+        """Round a Beam private-tail length up to the allocator page size."""
+        return -(-max(tokens, 0) // self.page_size) * self.page_size
+
+    def _trie_beam_active_kv_reserve(self) -> int:
+        """Estimate KV tokens still needed by active Beam branches."""
+        reserve = 0
+        for state in self.trie_beam_executions.values():
+            max_new_tokens = state.root_req.sampling_params.max_new_tokens
+            for beam in state.execution.group.active:
+                remaining_tokens = max(max_new_tokens - len(beam.tokens), 0)
+                reserve += self._trie_beam_paged_tokens(remaining_tokens)
+        return reserve
+
+    def _trie_beam_handoff_kv_reserve(self, req: Req, branch_count: int) -> int:
+        """Estimate KV tokens needed by a Beam group waiting for handoff."""
+        max_new_tokens = req.sampling_params.max_new_tokens
+        return branch_count * self._trie_beam_paged_tokens(max_new_tokens)
+
+    def _trie_beam_kv_admission_allows(
+        self, req: Req, expected_branches: int
+    ) -> bool:
+        """Gate Decode handoff by the remaining private-tail KV budget."""
+        required_tokens = (
+            self._trie_beam_active_kv_reserve()
+            + self._trie_beam_handoff_kv_reserve(req, expected_branches)
+        )
+        available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if required_tokens <= available_tokens:
+            return True
+
+        logger.info(
+            "LUGR trie handoff deferred by KV budget: rid=%s "
+            "required_tokens=%s available_tokens=%s branches=%s",
+            req.rid,
+            required_tokens,
+            available_tokens,
+            expected_branches,
+        )
+        self.metrics_reporter.report_trie_beam_admission_deferred()
+        return False
+
     def _select_trie_beam_executions_for_decode(self) -> List[TrieBeamSchedulerExecution]:
         """Select complete Beam groups within one Decode branch budget.
 

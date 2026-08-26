@@ -2232,6 +2232,8 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 if active_branches + expected_branches > branch_budget:
                     continue
+                if not self._trie_beam_kv_admission_allows(req, expected_branches):
+                    continue
                 self.waiting_queue.remove(req)
                 logger.info(
                     "LUGR trie handoff admitted: rid=%s candidates=%s",

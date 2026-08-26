@@ -673,6 +673,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.num_trie_beam_admission_deferred_total = Counter(
+            name="sglang:num_trie_beam_admission_deferred_total",
+            documentation="Total Trie Beam handoffs deferred by the KV admission budget.",
+            labelnames=labels.keys(),
+        )
 
         # =================================================================
         # Utilization
@@ -1246,6 +1251,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def increment_trie_beam_admission_deferred(self) -> None:
+        self.num_trie_beam_admission_deferred_total.labels(**self.labels).inc(1)
 
     def observe_kv_transfer_metrics(
         self,

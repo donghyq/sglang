@@ -447,6 +447,26 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def test_trie_beam_prefill_reserves_each_branch_tail(self):
+        self.mock_token_allocator.available_size.return_value = 60
+
+        adder = self.create_adder(self.create_running_batch())
+        req = self.create_mock_req("trie-root", priority=0, max_new_tokens=5)
+        req.host_hit_length = 0
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(10))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.sampling_params.beam_width = 10
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        # 10 prompt tokens + 10 branches * 5 output tokens + 1 page overhead.
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(len(adder.can_run_list), 0)
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

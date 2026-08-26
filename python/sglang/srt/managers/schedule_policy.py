@@ -1008,7 +1008,18 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        output_reserve = max_new
+        beam_width = getattr(req.sampling_params, "beam_width", 1)
+        if beam_width > 1:
+            # A Trie Beam request keeps one shared prefix but allocates a
+            # private KV tail for every live branch.  Reserve the paged output
+            # budget per branch, not just for one ordinary request.
+            output_reserve = beam_width * self.ceil_paged_tokens(max_new)
+        total_tokens = (
+            self.ceil_paged_tokens(cand_extend_input_len)
+            + output_reserve
+            + self.page_size
+        )
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
