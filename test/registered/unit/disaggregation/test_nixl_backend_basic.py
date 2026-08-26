@@ -683,6 +683,8 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertIn(3, mgr.failure_records)
         self.assertIn(4, mgr.failure_records)
         self.assertNotIn(5, mgr.failure_records)
+        self.assertIn("Lost connection with prefill instance", mgr.failure_records[3])
+        self.assertIn("Lost connection with prefill instance", mgr.failure_records[4])
 
     def test_late_failed_update_does_not_resurrect_cleared_room(self):
         mgr = object.__new__(CommonKVManager)
