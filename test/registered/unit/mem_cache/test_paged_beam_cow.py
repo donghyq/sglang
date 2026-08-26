@@ -58,6 +58,12 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_live_reference_tokens, 12)
         self.assertEqual(reporter.stats.beam_kv_shared_tokens, 8)
         self.assertAlmostEqual(reporter.stats.beam_kv_sharing_ratio, 2 / 3)
+        self.assertEqual(reporter.stats.beam_kv_peak_live, 1)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_references, 3)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_tokens, 4)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_reference_tokens, 12)
+        self.assertEqual(reporter.stats.beam_kv_peak_shared_tokens, 8)
+        self.assertAlmostEqual(reporter.stats.beam_kv_peak_sharing_ratio, 2 / 3)
 
     def test_metrics_snapshot_keeps_zero_for_non_beam_allocator(self):
         reporter = object.__new__(SchedulerMetricsReporter)
@@ -74,6 +80,12 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_live_reference_tokens, 0)
         self.assertEqual(reporter.stats.beam_kv_shared_tokens, 0)
         self.assertEqual(reporter.stats.beam_kv_sharing_ratio, 0.0)
+        self.assertEqual(reporter.stats.beam_kv_peak_live, 0)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_references, 0)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_reference_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_peak_shared_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_peak_sharing_ratio, 0.0)
 
     def test_completion_metrics_publish_reclaimed_beam_pages(self):
         allocator = self._allocator()
@@ -100,6 +112,12 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(reporter.stats.beam_kv_live_reference_tokens, 0)
         self.assertEqual(reporter.stats.beam_kv_shared_tokens, 0)
         self.assertEqual(reporter.stats.beam_kv_sharing_ratio, 0.0)
+        self.assertEqual(reporter.stats.beam_kv_peak_live, 1)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_references, 1)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_tokens, 4)
+        self.assertEqual(reporter.stats.beam_kv_peak_live_reference_tokens, 4)
+        self.assertEqual(reporter.stats.beam_kv_peak_shared_tokens, 0)
+        self.assertEqual(reporter.stats.beam_kv_peak_sharing_ratio, 0.0)
         self.assertEqual(observed, [reporter.stats])
 
     def test_completion_metrics_skip_disabled_collectors(self):
@@ -126,7 +144,14 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertEqual(sorted(allocator.free_pages.tolist()), [1, 2])
         self.assertEqual(
             allocator.beam_lifecycle_snapshot(),
-            {"registered": 2, "released": 2, "live": 0, "live_references": 0},
+            {
+                "registered": 2,
+                "released": 2,
+                "live": 0,
+                "live_references": 0,
+                "peak_live": 2,
+                "peak_live_references": 3,
+            },
         )
 
     def test_page_lifecycle_counts_physical_pages_not_shared_references(self):
@@ -137,7 +162,14 @@ class TestPagedBeamCOW(CustomTestCase):
         allocator.fork_shared_prefix(prefix, child_count=2)
         self.assertEqual(
             allocator.beam_lifecycle_snapshot(),
-            {"registered": 1, "released": 0, "live": 1, "live_references": 3},
+            {
+                "registered": 1,
+                "released": 0,
+                "live": 1,
+                "live_references": 3,
+                "peak_live": 1,
+                "peak_live_references": 3,
+            },
         )
 
         allocator.release_beam_suffix(prefix)
@@ -145,7 +177,14 @@ class TestPagedBeamCOW(CustomTestCase):
         allocator.release_beam_suffix(prefix)
         self.assertEqual(
             allocator.beam_lifecycle_snapshot(),
-            {"registered": 1, "released": 1, "live": 0, "live_references": 0},
+            {
+                "registered": 1,
+                "released": 1,
+                "live": 0,
+                "live_references": 0,
+                "peak_live": 1,
+                "peak_live_references": 3,
+            },
         )
 
     def test_direct_free_of_beam_page_is_rejected(self):
@@ -363,7 +402,14 @@ class TestPagedBeamCOW(CustomTestCase):
         self.assertTrue(set([4, 5, 6, 7]).issubset(set(allocator.free_pages.tolist())))
         self.assertEqual(
             allocator.beam_lifecycle_snapshot(),
-            {"registered": 4, "released": 4, "live": 0, "live_references": 0},
+            {
+                "registered": 4,
+                "released": 4,
+                "live": 0,
+                "live_references": 0,
+                "peak_live": 4,
+                "peak_live_references": 4,
+            },
         )
 
     def test_runtime_fork_failure_rolls_back_kv_references_and_request_slots(self):

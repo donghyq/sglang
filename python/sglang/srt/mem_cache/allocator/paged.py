@@ -127,6 +127,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Beam COW ownership is intentionally separate from RadixCache locks.
         # Keys are physical page ids; values are live beam references.
         self.beam_page_refcounts: dict[int, int] = {}
+        self.beam_pages_peak_live = 0
+        self.beam_pages_peak_live_references = 0
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -285,6 +287,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "released": released,
             "live": len(self.beam_page_refcounts),
             "live_references": sum(self.beam_page_refcounts.values()),
+            "peak_live": getattr(self, "beam_pages_peak_live", 0),
+            "peak_live_references": getattr(
+                self, "beam_pages_peak_live_references", 0
+            ),
         }
 
     def assert_beam_lifecycle_conservation(self) -> None:
@@ -309,6 +315,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.beam_page_refcounts[page_id] = 1
         self.beam_pages_registered_total = (
             getattr(self, "beam_pages_registered_total", 0) + len(page_ids)
+        )
+        self.beam_pages_peak_live = max(
+            getattr(self, "beam_pages_peak_live", 0),
+            len(self.beam_page_refcounts),
+        )
+        self.beam_pages_peak_live_references = max(
+            getattr(self, "beam_pages_peak_live_references", 0),
+            sum(self.beam_page_refcounts.values()),
         )
         self.assert_beam_lifecycle_conservation()
 
@@ -338,6 +352,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         for page_id in page_ids:
             self.beam_page_refcounts[page_id] += child_count
+        self.beam_pages_peak_live_references = max(
+            getattr(self, "beam_pages_peak_live_references", 0),
+            sum(self.beam_page_refcounts.values()),
+        )
 
     def release_beam_suffix(self, kv_indices: torch.Tensor) -> None:
         """Release one beam's references and free pages at refcount zero.
@@ -412,6 +430,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.beam_page_refcounts.clear()
         self.beam_pages_registered_total = 0
         self.beam_pages_released_total = 0
+        self.beam_pages_peak_live = 0
+        self.beam_pages_peak_live_references = 0
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def get_cpu_copy(self, indices, mamba_indices=None):

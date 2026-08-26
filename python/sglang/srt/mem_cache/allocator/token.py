@@ -41,6 +41,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # page_size is one. Keep Beam ownership separate from normal allocator
         # bookkeeping so shared-prefix references cannot be freed normally.
         self.beam_token_refcounts: dict[int, int] = {}
+        self.beam_tokens_peak_live = 0
+        self.beam_tokens_peak_live_references = 0
         self.clear()
 
     def clear(self):
@@ -53,6 +55,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.beam_token_refcounts.clear()
         self.beam_tokens_registered_total = 0
         self.beam_tokens_released_total = 0
+        self.beam_tokens_peak_live = 0
+        self.beam_tokens_peak_live_references = 0
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def available_size(self):
@@ -93,6 +97,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "released": released,
             "live": len(self.beam_token_refcounts),
             "live_references": sum(self.beam_token_refcounts.values()),
+            "peak_live": getattr(self, "beam_tokens_peak_live", 0),
+            "peak_live_references": getattr(
+                self, "beam_tokens_peak_live_references", 0
+            ),
         }
 
     def assert_beam_lifecycle_conservation(self) -> None:
@@ -122,6 +130,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.beam_tokens_registered_total = (
             getattr(self, "beam_tokens_registered_total", 0) + len(token_ids)
         )
+        self.beam_tokens_peak_live = max(
+            getattr(self, "beam_tokens_peak_live", 0),
+            len(self.beam_token_refcounts),
+        )
+        self.beam_tokens_peak_live_references = max(
+            getattr(self, "beam_tokens_peak_live_references", 0),
+            sum(self.beam_token_refcounts.values()),
+        )
         self.assert_beam_lifecycle_conservation()
 
     def fork_shared_prefix(
@@ -144,6 +160,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         for token_id in token_ids:
             self.beam_token_refcounts[token_id] += child_count
+        self.beam_tokens_peak_live_references = max(
+            getattr(self, "beam_tokens_peak_live_references", 0),
+            sum(self.beam_token_refcounts.values()),
+        )
 
     def release_beam_suffix(self, kv_indices: torch.Tensor) -> None:
         """Release one Beam's KV references and recycle final references."""

@@ -968,6 +968,25 @@ class SchedulerMetricsReporter:
             else 0.0
         )
 
+        peak_physical_units = snapshot.get("peak_live", snapshot["live"])
+        peak_logical_units = snapshot.get(
+            "peak_live_references", snapshot["live_references"]
+        )
+        peak_physical_tokens = peak_physical_units * page_size
+        peak_logical_tokens = peak_logical_units * page_size
+        self.stats.beam_kv_peak_live = peak_physical_units
+        self.stats.beam_kv_peak_live_references = peak_logical_units
+        self.stats.beam_kv_peak_live_tokens = peak_physical_tokens
+        self.stats.beam_kv_peak_live_reference_tokens = peak_logical_tokens
+        self.stats.beam_kv_peak_shared_tokens = (
+            peak_logical_tokens - peak_physical_tokens
+        )
+        self.stats.beam_kv_peak_sharing_ratio = (
+            (peak_logical_tokens - peak_physical_tokens) / peak_logical_tokens
+            if peak_logical_tokens
+            else 0.0
+        )
+
     def report_beam_kv_lifecycle_completion(self) -> None:
         """Export final Beam KV ownership without waiting for periodic stats.
 
