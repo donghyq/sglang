@@ -1802,6 +1802,8 @@ class MooncakeKVSender(CommonKVSender):
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
+                if status == KVPoll.Success:
+                    self._record_transfer_success()
                 self.trace_ctx.trace_req_finish()
             elif status == KVPoll.Bootstrapping:
                 timeout_result = self._check_bootstrap_timeout()

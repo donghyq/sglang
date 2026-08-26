@@ -1008,6 +1008,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._first_transfer_submit_time: Optional[float] = None
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1082,11 +1083,23 @@ class CommonKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List],
     ):
+        if self._first_transfer_submit_time is None:
+            self._first_transfer_submit_time = time.perf_counter()
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
             for component_indices in state_indices:
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+
+    def _record_transfer_success(self) -> None:
+        """Record the interval from first chunk submission to transfer success."""
+        if (
+            self._transfer_metric.transfer_latency_s is None
+            and self._first_transfer_submit_time is not None
+        ):
+            self._transfer_metric.transfer_latency_s = (
+                time.perf_counter() - self._first_transfer_submit_time
+            )
 
     def _prepare_send_indices(
         self,

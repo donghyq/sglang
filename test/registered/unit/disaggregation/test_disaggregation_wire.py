@@ -1,10 +1,13 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVTransferMetric
+from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
@@ -96,6 +99,32 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestCommonKVSenderTransferMetric(unittest.TestCase):
+    def test_transfer_metric_reports_bytes_and_transfer_latency(self):
+        sender = object.__new__(CommonKVSender)
+        sender._transfer_metric = KVTransferMetric()
+        sender._transfer_num_kv_indices = 0
+        sender._transfer_num_state_indices = 0
+        sender._first_transfer_submit_time = None
+        sender.kv_mgr = SimpleNamespace(
+            kv_item_lens_sum=128,
+            state_item_lens_sum=64,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.common.conn.time.perf_counter",
+            side_effect=[10.0, 10.25],
+        ):
+            sender._record_transfer_indices(
+                np.array([1, 2, 3], dtype=np.int32), state_indices=None
+            )
+            sender._record_transfer_success()
+
+        metric = sender.get_transfer_metric()
+        self.assertEqual(metric.transfer_total_bytes, 3 * 128)
+        self.assertAlmostEqual(metric.transfer_latency_s, 0.25)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):

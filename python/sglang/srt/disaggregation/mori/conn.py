@@ -1540,6 +1540,7 @@ class MoriKVSender(CommonKVSender):
 
         if status == KVPoll.Success:
             self.conclude_state = KVPoll.Success
+            self._record_transfer_success()
             return KVPoll.Success
 
         return status
