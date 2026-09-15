@@ -175,6 +175,9 @@ class BaseGrammarBackend:
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         return self._not_supported("structural_tag", key_string)
 
+    def dispatch_trie(self, key_string: str) -> BaseGrammarObject:
+        return self._not_supported("trie", key_string)
+
     def _init_value_dispatch(
         self, key: Tuple[str, str], require_reasoning: bool
     ) -> BaseGrammarObject:
@@ -188,6 +191,8 @@ class BaseGrammarBackend:
             grammar = self.dispatch_ebnf(key_string)
         elif key_type == "structural_tag":
             grammar = self.dispatch_structural_tag(key_string)
+        elif key_type == "trie":
+            grammar = self.dispatch_trie(key_string)
         else:
             grammar = self.dispatch_fallback(key_type, key_string)
 
@@ -282,6 +287,10 @@ def create_grammar_backend(
             any_whitespace=not server_args.constrained_json_disable_any_whitespace,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
+    elif name == "trie":
+        from sglang.srt.constrained.trie_grammar_backend import TrieGrammarBackend
+
+        grammar_backend = TrieGrammarBackend(vocab_size=vocab_size)
     elif name == "none":
         if server_args.enable_strict_thinking:
             raise ValueError(

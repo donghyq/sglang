@@ -818,6 +818,34 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
+    def backup_and_evict_node(self, node: TreeNode) -> int:
+        """Synchronously preserve one device leaf in host KV, then evict it.
+
+        A write-through insertion may already have an asynchronous backup for
+        the node. Reuse that transfer instead of submitting the same node ID a
+        second time, which would produce duplicate acknowledgements.
+        """
+        pending_write_id = node.write_through_pending_id
+        if pending_write_id is not None:
+            # Blocking completion does not release write-through locks because
+            # it is also used by write-back eviction, whose transfers have no
+            # such lock. Snapshot and release all outstanding write-through
+            # locks after the shared acknowledgement queue is drained.
+            pending_lock_nodes = [
+                lock_node for lock_node, _, _ in self.ongoing_write_through.values()
+            ]
+            self.writing_check(write_back=True)
+            for lock_node in pending_lock_nodes:
+                self.dec_lock_ref(lock_node)
+        elif not node.backuped:
+            if self.write_backup(node, write_back=True) == 0:
+                return 0
+            self.writing_check(write_back=True)
+
+        if not node.backuped or node.evicted:
+            return 0
+        return self._evict_backuped(node)
+
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:
         node.write_through_pending_id = node.id
         self.ongoing_write_through[node.id] = (node, backup_len, [node])
@@ -1828,7 +1856,11 @@ class HiRadixCache(RadixCache):
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
-        return InsertResult(prefix_len=total_prefix_length)
+            node = new_node
+        return InsertResult(
+            prefix_len=total_prefix_length,
+            last_device_node=node,
+        )
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request

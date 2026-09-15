@@ -42,6 +42,9 @@ class GenerationBatchResult:
     next_token_ids: Optional[
         Union[torch.Tensor, List[torch.Tensor], List[List[int]]]
     ] = None
+    # True when the worker deliberately returns raw logits for the scheduler's
+    # trie-beam coordinator instead of running the ordinary one-token sampler.
+    is_trie_beam_logits: bool = False
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0

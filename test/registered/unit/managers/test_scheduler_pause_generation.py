@@ -12,10 +12,15 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
+    PauseReq,
     PauseGenerationReqInput,
+    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=9, suite="base-c-test-cpu")
@@ -33,8 +38,10 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
         scheduler.running_batch.batch_is_full = False
+        scheduler.ps = SimpleNamespace(pp_size=1)
         scheduler.partial_rollout_paused_queue = []
         scheduler.waiting_queue = []
+        scheduler.grammar_manager = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
@@ -58,7 +65,23 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.kv_events_publisher = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler._pp_microbatches_drained = MagicMock(return_value=True)
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
         return scheduler
+
+    def _new_weight_updater(self, scheduler: Scheduler):
+        return SchedulerWeightUpdaterManager(
+            tp_worker=MagicMock(),
+            draft_worker=None,
+            tp_cpu_group=MagicMock(),
+            memory_saver_adapter=MagicMock(),
+            flush_cache=MagicMock(),
+            is_fully_idle=scheduler.is_fully_idle,
+            scheduler=scheduler,
+        )
 
     def test_abort_removes_paused_request_without_double_free(self):
         scheduler = self._new_scheduler()
@@ -79,6 +102,74 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
 
         self.assertFalse(scheduler.is_fully_idle(for_health_check=True))
+
+    def test_paused_retract_waiting_queue_allows_kv_only_release(self):
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.waiting_queue = [SimpleNamespace(rid="retracted-rid")]
+        updater = self._new_weight_updater(scheduler)
+
+        updater.release_memory_occupation(
+            ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+        )
+
+        updater.memory_saver_adapter.pause.assert_called_once_with("kv_cache")
+        updater.flush_cache.assert_called_once()
+
+    def test_unpaused_waiting_queue_rejects_kv_release(self):
+        scheduler = self._new_scheduler()
+        scheduler.waiting_queue = [SimpleNamespace(rid="waiting-rid")]
+        updater = self._new_weight_updater(scheduler)
+
+        with self.assertRaisesRegex(AssertionError, "quiescent globally-paused"):
+            updater.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
+
+    def test_paused_running_batch_rejects_kv_release(self):
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.running_batch.is_empty.return_value = False
+        updater = self._new_weight_updater(scheduler)
+
+        with self.assertRaisesRegex(AssertionError, "quiescent globally-paused"):
+            updater.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
+
+    def test_paused_overlap_result_rejects_kv_release(self):
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.enable_overlap = True
+        scheduler.result_queue.append((MagicMock(), MagicMock()))
+        updater = self._new_weight_updater(scheduler)
+
+        with self.assertRaisesRegex(AssertionError, "quiescent globally-paused"):
+            updater.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
+
+    def test_paused_request_handle_rejects_kv_release(self):
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.partial_rollout_paused_queue = [SimpleNamespace(rid="paused-rid")]
+        updater = self._new_weight_updater(scheduler)
+
+        with self.assertRaisesRegex(AssertionError, "quiescent globally-paused"):
+            updater.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
+            )
+
+    def test_paused_waiting_queue_does_not_allow_weight_release(self):
+        scheduler = self._new_scheduler()
+        scheduler._engine_paused = True
+        scheduler.waiting_queue = [SimpleNamespace(rid="retracted-rid")]
+        updater = self._new_weight_updater(scheduler)
+
+        with self.assertRaisesRegex(AssertionError, "quiescent globally-paused"):
+            updater.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["weights"])
+            )
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
@@ -204,6 +295,27 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
+
+    def test_pause_request_retracts_duplicate_req_only_once(self):
+        """Overlap bookkeeping may expose the same request twice temporarily."""
+        scheduler = self._new_scheduler()
+        req = SimpleNamespace(
+            rid="duplicate-rid",
+            req_pool_idx=1,
+            retract_mode="discard",
+        )
+        scheduler.running_batch.reqs = [req, req]
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.server_args = MagicMock()
+        scheduler.hisparse_coordinator = MagicMock()
+
+        with unittest.mock.patch(
+            "sglang.srt.managers.schedule_batch.retract_all", return_value=[req]
+        ) as retract_all:
+            scheduler.pause_request(PauseReq(rid="duplicate-rid"))
+
+        self.assertEqual(retract_all.call_args.kwargs["reqs"], [req])
+        self.assertEqual(scheduler.partial_rollout_paused_queue, [req])
 
     def test_abort_drains_overlap_queue(self):
         """abort with overlap enabled should drain the result_queue."""

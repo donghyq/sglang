@@ -182,14 +182,21 @@ class SchedulerWeightUpdaterManager:
         return GetWeightsByNameReqOutput(parameter=parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
-
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+
+        kv_only_release = set(tags) == {GPU_MEMORY_TYPE_KV_CACHE}
+        paused_for_kv_release = (
+            kv_only_release
+            and self.scheduler is not None
+            and self.scheduler.is_paused_for_kv_cache_release()
+        )
+        assert self.is_fully_idle() or paused_for_kv_release, (
+            "release_memory_occupation should be called only when server is idle, "
+            "except for a quiescent globally-paused KV-cache-only release."
+        )
 
         for tag in tags:
             self.offload_tags.add(tag)

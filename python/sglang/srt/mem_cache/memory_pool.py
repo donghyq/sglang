@@ -305,6 +305,58 @@ class ReqToTokenPool:
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
+    def fork_beam_slots_from_prefix(
+        self,
+        parent: Req,
+        children: list[Req],
+        shared_prefix_len: int,
+        page_size: int,
+    ) -> list[int]:
+        """Allocate child request slots and copy a page-aligned KV prefix.
+
+        This operation only duplicates the request-to-token mapping. Callers
+        must separately retain the corresponding physical KV pages through the
+        paged allocator before a child can outlive its parent. The caller must
+        pass a page-aligned prefix, so a child decode cannot write into a
+        shared partially filled page.
+        """
+        if parent.req_pool_idx is None:
+            raise ValueError("The parent beam must have an allocated request slot.")
+        if shared_prefix_len < 0 or shared_prefix_len > self.max_context_len:
+            raise ValueError(
+                "shared_prefix_len must be within the request-to-token table, got "
+                f"{shared_prefix_len}."
+            )
+        if page_size < 1:
+            raise ValueError(f"page_size must be positive, got {page_size}.")
+        if shared_prefix_len % page_size:
+            raise ValueError(
+                "A shared beam prefix must end at a KV page boundary; "
+                "the partial tail requires a private page."
+            )
+        if any(child.req_pool_idx is not None for child in children):
+            raise ValueError("A child beam already owns a request slot.")
+        if len(children) > len(self.free_slots):
+            raise RuntimeError(
+                "Not enough request slots to fork beam children. "
+                f"{self.available_size()=}, {len(children)=}."
+            )
+
+        child_slots = self.free_slots[: len(children)]
+        self.free_slots = self.free_slots[len(children) :]
+        for child, slot in zip(children, child_slots):
+            child.req_pool_idx = slot
+            self.req_generation[slot] += 1
+
+        if shared_prefix_len:
+            child_slots_device = torch.tensor(
+                child_slots, dtype=torch.int64, device=self.device
+            )
+            self.req_to_token[child_slots_device, :shared_prefix_len] = (
+                self.req_to_token[parent.req_pool_idx, :shared_prefix_len]
+            )
+        return child_slots
+
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()

@@ -485,6 +485,24 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+        if (
+            is_insert
+            and getattr(req, "retract_mode", "discard") == "preserve_kv"
+            and session_leaf is not None
+        ):
+            demoted_tokens = self.backup_and_evict_node(session_leaf)
+            logger.info(
+                "Partial rollout preserved request KV on host: rid=%s "
+                "leaf_id=%s demoted_tokens=%d",
+                req.rid,
+                session_leaf.id,
+                demoted_tokens,
+            )
+
+    def backup_and_evict_node(self, node: TreeNode) -> int:
+        """Back up and evict one node when a cache supports host KV storage."""
+        return 0
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:

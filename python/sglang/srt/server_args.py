@@ -239,7 +239,13 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake_tcp",
 ]
 
-GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+GRAMMAR_BACKEND_CHOICES = [
+    "xgrammar",
+    "outlines",
+    "llguidance",
+    "trie",
+    "none",
+]
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item

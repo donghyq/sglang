@@ -123,6 +123,10 @@ def test_per_request_pause_resume(base_url):
         f"{base_url}/pause_request", json={"rid": "test-req-001", "pause_all": False}
     )
     assert resp.status_code == 200, f"pause_request 失败: {resp.status_code} {resp.text}"
+    # A small number of chunks may already be buffered between the scheduler
+    # and HTTP streaming client when the pause acknowledgement arrives. Drain
+    # them before checking that generation itself has stopped.
+    time.sleep(0.2)
     paused_chunks = results["chunks"]
     time.sleep(1)
     assert results["chunks"] == paused_chunks, (

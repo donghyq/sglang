@@ -234,7 +234,18 @@ class SchedulerBatchResultProcessor:
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
+                    # A terminal trie token completes the request in the
+                    # prefill pass.  Advance its grammar before checking the
+                    # finish state; otherwise the scheduler would admit one
+                    # unconstrained decode step after a legal SID had already
+                    # been produced.
+                    if req.grammar is not None:
+                        self._apply_prefill_grammar(
+                            req=req, next_token_id=next_token_id
+                        )
                     req.update_finish_state()
+                    if req.grammar is not None:
+                        req.grammar.finished = req.finished()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -269,11 +280,6 @@ class SchedulerBatchResultProcessor:
                             req=req,
                             logits_output=logits_output,
                             hidden_state_offset=hidden_state_offset,
-                        )
-
-                    if req.grammar is not None:
-                        self._apply_prefill_grammar(
-                            req=req, next_token_id=next_token_id
                         )
 
                 else:
@@ -498,7 +504,6 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
             )
             req.to_finish = FINISH_ABORT()
-        req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
         self,
@@ -710,6 +715,12 @@ class SchedulerBatchResultProcessor:
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
+            # Normal decode has one newly sampled token.  Advance the grammar
+            # first so a terminal Trie node is finished in this same step and
+            # cannot cause a following unmasked decode.  Speculative decode
+            # already advanced the grammar in _resolve_spec_v2_tokens.
+            if req.grammar is not None and not is_spec:
+                self._accept_grammar_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
@@ -742,10 +753,6 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                if not is_spec:
-                    # Normal decode advances the grammar for its single token
-                    # here; spec already advanced it in _resolve_spec_v2_tokens.
-                    self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)

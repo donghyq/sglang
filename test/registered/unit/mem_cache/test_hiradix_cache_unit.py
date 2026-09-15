@@ -3,6 +3,8 @@
 import os
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -21,6 +23,61 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 
 PAGE_SIZE = 2
+
+
+class TestHiRadixCacheHostDemotion(unittest.TestCase):
+    def test_pending_write_through_is_reused_before_evict(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        node = SimpleNamespace(
+            write_through_pending_id=7,
+            backuped=False,
+            evicted=False,
+        )
+        other_lock_node = object()
+        cache.ongoing_write_through = {
+            7: (node, 4, [node]),
+            8: (other_lock_node, 2, []),
+        }
+        cache.write_backup = MagicMock()
+        cache.dec_lock_ref = MagicMock()
+        cache._evict_backuped = MagicMock(return_value=4)
+
+        def finish_writes(*, write_back):
+            self.assertTrue(write_back)
+            node.backuped = True
+            cache.ongoing_write_through.clear()
+
+        cache.writing_check = MagicMock(side_effect=finish_writes)
+
+        demoted = cache.backup_and_evict_node(node)
+
+        self.assertEqual(demoted, 4)
+        cache.write_backup.assert_not_called()
+        cache.writing_check.assert_called_once_with(write_back=True)
+        cache.dec_lock_ref.assert_any_call(node)
+        cache.dec_lock_ref.assert_any_call(other_lock_node)
+        cache._evict_backuped.assert_called_once_with(node)
+
+    def test_new_backup_is_completed_before_evict(self):
+        cache = HiRadixCache.__new__(HiRadixCache)
+        node = SimpleNamespace(
+            write_through_pending_id=None,
+            backuped=False,
+            evicted=False,
+        )
+        cache.ongoing_write_through = {}
+        cache.write_backup = MagicMock(return_value=3)
+        cache._evict_backuped = MagicMock(return_value=3)
+
+        def finish_writes(*, write_back):
+            self.assertTrue(write_back)
+            node.backuped = True
+
+        cache.writing_check = MagicMock(side_effect=finish_writes)
+
+        self.assertEqual(cache.backup_and_evict_node(node), 3)
+        cache.write_backup.assert_called_once_with(node, write_back=True)
+        cache._evict_backuped.assert_called_once_with(node)
 
 
 class TestHiRadixCacheKVEvents(CustomTestCase):
@@ -119,6 +176,15 @@ class TestHiRadixCacheKVEvents(CustomTestCase):
         )
         self.assertIsNone(stored_cpu[0].parent_block_hash)
         self.assertEqual(stored_cpu[1].parent_block_hash, stored_cpu[0].block_hashes[0])
+
+    def test_insert_returns_new_suffix_leaf(self):
+        cache, allocator = self._build_cache()
+
+        result = self._insert(cache, allocator, [1, 2, 3, 4])
+        leaf = self._leaf_for(cache, [1, 2, 3, 4])
+
+        self.assertIs(result.last_device_node, leaf)
+        self.assertEqual(list(result.last_device_node.key.token_ids), [1, 2, 3, 4])
 
 
 if __name__ == "__main__":

@@ -98,10 +98,16 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     repetition_penalty: float = 1.0
     min_new_tokens: int = 0
     n: int = 1
+    # Width of trie-constrained beam search. This is intentionally separate
+    # from n, which represents independent parallel sampling requests.
+    beam_width: int = 1
+    num_return_sequences: int = 1
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     structural_tag: Optional[str] = None
+    # Token-id paths accepted by the trie-constrained decoding backend.
+    trie: Optional[List[List[int]]] = None
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
@@ -151,6 +157,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.min_new_tokens if self.min_new_tokens is not None else 0
         )
         self.n = self.n if self.n is not None else 1
+        self.beam_width = self.beam_width if self.beam_width is not None else 1
+        self.num_return_sequences = (
+            self.num_return_sequences
+            if self.num_return_sequences is not None
+            else 1
+        )
         self.ignore_eos = self.ignore_eos if self.ignore_eos is not None else False
         self.skip_special_tokens = (
             self.skip_special_tokens if self.skip_special_tokens is not None else True
@@ -173,6 +185,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.beam_width < 1:
+            raise ValueError(f"beam_width must be positive, got {self.beam_width}.")
+        if not 1 <= self.num_return_sequences <= self.beam_width:
+            raise ValueError(
+                "num_return_sequences must be in [1, beam_width], got "
+                f"{self.num_return_sequences} for beam_width={self.beam_width}."
+            )
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -226,9 +245,54 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.json_schema,
             self.regex,
             self.ebnf,
+            self.structural_tag,
+            self.trie,
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
-            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+            raise ValueError(
+                "Only one of regex, json_schema, ebnf, structural_tag, or trie can be set."
+            )
+        if self.trie is not None:
+            if not self.trie:
+                raise ValueError("trie must contain at least one token-id path.")
+            for path_index, path in enumerate(self.trie):
+                if not path:
+                    raise ValueError(
+                        f"trie path at index {path_index} must not be empty."
+                    )
+                for token in path:
+                    if isinstance(token, bool) or not isinstance(token, int):
+                        raise ValueError("trie token IDs must be integers.")
+                    if not 0 <= token < vocab_size:
+                        raise ValueError(
+                            f"trie token IDs must be in [0, {vocab_size - 1}], got {token}."
+                        )
+
+        if self.beam_width > 1:
+            if self.trie is None:
+                raise ValueError("beam_width > 1 requires a trie constraint.")
+            if self.n != 1:
+                raise ValueError(
+                    "beam_width > 1 cannot be combined with n; n is reserved "
+                    "for independent parallel sampling."
+                )
+            if (
+                self.top_k != 1
+                or self.top_p != 1.0
+                or self.min_p != 0.0
+                or self.frequency_penalty != 0.0
+                or self.presence_penalty != 0.0
+                or self.repetition_penalty != 1.0
+            ):
+                raise ValueError(
+                    "beam_width > 1 currently requires deterministic decoding "
+                    "(top_k=1, top_p=1, min_p=0, and no token penalties)."
+                )
+            if self.logit_bias is not None:
+                raise ValueError(
+                    "beam_width > 1 does not support logit_bias until the "
+                    "scheduler beam path applies it before constrained ranking."
+                )
 
     def normalize(self, tokenizer):
         # Process stop strings

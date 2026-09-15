@@ -179,6 +179,58 @@ class DecodeReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def fork_beam_slots_from_prefix(
+        self,
+        parent: Req,
+        children: list[Req],
+        shared_prefix_len: int,
+        page_size: int,
+    ) -> list[int]:
+        """Allocate Decode-side child slots and copy a page-aligned KV prefix.
+
+        Trie-constrained beam search creates internal Decode requests after a
+        P/D handoff.  The Decode pool has the same request-to-token mapping
+        contract as ``ReqToTokenPool``, including its extra pre-allocation
+        capacity, so the fork must preserve that contract rather than falling
+        back to the ordinary pool implementation.
+        """
+        if parent.req_pool_idx is None:
+            raise ValueError("The parent beam must have an allocated request slot.")
+        if shared_prefix_len < 0 or shared_prefix_len > self.max_context_len:
+            raise ValueError(
+                "shared_prefix_len must be within the request-to-token table, got "
+                f"{shared_prefix_len}."
+            )
+        if page_size < 1:
+            raise ValueError(f"page_size must be positive, got {page_size}.")
+        if shared_prefix_len % page_size:
+            raise ValueError(
+                "A shared beam prefix must end at a KV page boundary; "
+                "the partial tail requires a private page."
+            )
+        if any(child.req_pool_idx is not None for child in children):
+            raise ValueError("A child beam already owns a request slot.")
+        if len(children) > len(self.free_slots):
+            raise RuntimeError(
+                "Not enough request slots to fork beam children. "
+                f"{self.available_size()=}, {len(children)=}."
+            )
+
+        child_slots = self.free_slots[: len(children)]
+        self.free_slots = self.free_slots[len(children) :]
+        for child, slot in zip(children, child_slots):
+            child.req_pool_idx = slot
+            self.req_generation[slot] += 1
+
+        if shared_prefix_len:
+            child_slots_device = torch.tensor(
+                child_slots, dtype=torch.int64, device=self.device
+            )
+            self.req_to_token[child_slots_device, :shared_prefix_len] = (
+                self.req_to_token[parent.req_pool_idx, :shared_prefix_len]
+            )
+        return child_slots
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
@@ -1629,6 +1681,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         idx = decode_req.metadata_buffer_index
         (
             output_id,
+            trie_beam_token_ids,
+            trie_beam_scores,
+            trie_beam_terminal,
+            trie_beam_count,
             cached_tokens,
             output_token_logprobs_val,
             output_token_logprobs_idx,
@@ -1704,16 +1760,45 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # under the new policy). A rebootstrap with no boundary token (retracted
         # before emitting any output) falls through to the normal path so its
         # first token and logprob are committed as usual.
+        trie_beam_count_value = int(trie_beam_count[0].item())
+        if trie_beam_count_value:
+            if trie_beam_count_value > trie_beam_token_ids.numel():
+                prepare_abort(
+                    decode_req.req,
+                    "Trie Beam P/D metadata candidate count exceeds buffer capacity.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
+            decode_req.req.trie_beam_handoff_candidates = [
+                (
+                    int(trie_beam_token_ids[i].item()),
+                    float(trie_beam_scores[i].item()),
+                    bool(trie_beam_terminal[i].item()),
+                )
+                for i in range(trie_beam_count_value)
+            ]
+            logger.info(
+                "LUGR trie handoff metadata received: rid=%s metadata_idx=%s candidates=%s",
+                decode_req.req.rid,
+                idx,
+                decode_req.req.trie_beam_handoff_candidates,
+            )
+
         replayed_boundary = (
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
         )
-        if replayed_boundary:
+        if trie_beam_count_value:
+            committed_output_id = None
+        elif replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
         else:
             committed_output_id = output_id[0].item()
-        decode_req.req.output_ids.append(committed_output_id)
+        if committed_output_id is not None:
+            decode_req.req.output_ids.append(committed_output_id)
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -1741,7 +1826,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
 
-        if decode_req.req.return_logprob and not replayed_boundary:
+        if (
+            decode_req.req.return_logprob
+            and not replayed_boundary
+            and not trie_beam_count_value
+        ):
             decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )
@@ -1758,7 +1847,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
-        if decode_req.req.return_sampling_mask:
+        if decode_req.req.return_sampling_mask and not trie_beam_count_value:
             assert (
                 output_token_sampling_mask_idx is not None
             ), "sampling mask buffer disabled on decode side"
@@ -2043,6 +2132,28 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        # A Trie Beam execution owns a Decode batch exclusively.  New ordinary
+        # P/D handoffs must remain in ``waiting_queue`` until that execution is
+        # complete, otherwise processing them here can merge ordinary requests
+        # into a batch that is about to run the internal Beam branches.
+        if self.trie_beam_executions:
+            if running_batch.is_empty():
+                state = next(iter(self.trie_beam_executions.values()))
+                return NextBatchPlan(
+                    batch_to_run=self._build_trie_beam_decode_batch(state),
+                    running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
+                )
+
+            # This branch is a safe recovery path for a Trie handoff that
+            # arrived while an ordinary Decode batch was already running.
+            # Drain that batch before starting the exclusive Beam execution.
+            running_batch = self.update_running_batch(running_batch)
+            ret = running_batch if not running_batch.is_empty() else None
+            ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+            if ret:
+                set_schedule_time_batch(ret)
+            return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -2058,6 +2169,17 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+
+        if self.trie_beam_executions:
+            # ``get_new_prebuilt_batch`` only starts a Trie execution when the
+            # normal batch is idle, so its first internal Decode step is also
+            # isolated.
+            assert running_batch.is_empty()
+            state = next(iter(self.trie_beam_executions.values()))
+            return NextBatchPlan(
+                batch_to_run=self._build_trie_beam_decode_batch(state),
+                running_batch=ScheduleBatch(reqs=[], batch_is_full=False),
+            )
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -2081,6 +2203,68 @@ class SchedulerDisaggregationDecodeMixin:
                 self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
+            return None
+
+        trie_handoffs = [
+            req
+            for req in self.waiting_queue
+            if getattr(req, "trie_beam_handoff_candidates", None) is not None
+        ]
+        if trie_handoffs:
+            if self.trie_beam_executions:
+                # Trie Decode is intentionally exclusive in the current
+                # implementation.  A later handoff is normal queue pressure,
+                # not a scheduler-fatal invariant violation: leave it queued
+                # until the active execution has released its branch KV.
+                return None
+            if not running_batch.is_empty():
+                # Do not create the exclusive Trie execution until all ordinary
+                # Decode work already admitted to this worker has drained.
+                # Keeping the handoff in the waiting queue avoids both a mixed
+                # Decode batch and a process-fatal scheduler exception.
+                return None
+            # Several handoffs can complete their KV transfer in one poll.
+            # Admit the earliest queued root only; the remaining requests stay
+            # ordered in ``waiting_queue`` and are handled after it completes.
+            req = trie_handoffs[0]
+            self.waiting_queue.remove(req)
+            logger.info(
+                "LUGR trie handoff admitted: rid=%s candidates=%s pending_trie_rids=%s",
+                req.rid,
+                req.trie_beam_handoff_candidates,
+                [
+                    queued.rid
+                    for queued in trie_handoffs[1:]
+                ],
+            )
+            state = self._start_trie_beam_execution(req)
+            execution = state.execution
+            candidates = req.trie_beam_handoff_candidates
+            execution.group.advance_from_handoff_candidates(candidates)
+            logger.info(
+                "LUGR trie handoff reconstructed: rid=%s active=%s completed=%s",
+                req.rid,
+                [beam.tokens for beam in execution.group.active],
+                [beam.tokens for beam in execution.group.last_completed],
+            )
+            execution.runtime.apply_transition(
+                execution.group.last_slot_transition,
+                create_child_req=lambda beam: self._clone_trie_beam_req(
+                    execution.runtime.branches[beam.parent_id].req, beam
+                ),
+                active_children=execution.group.active,
+                shared_prefixes=self._trie_beam_shared_prefixes(execution),
+                create_child_kv_indices=self._fork_trie_beam_kv_mapping,
+                release_unregistered_child_kv_indices=(
+                    self._release_unregistered_trie_beam_kv_mapping
+                ),
+            )
+            for beam in execution.group.active:
+                self._apply_trie_beam_to_req(
+                    execution.runtime.branches[beam.branch_id].req, beam
+                )
+            if execution.is_finished:
+                self._finish_trie_beam_execution(state)
             return None
 
         if self.enable_priority_scheduling:
