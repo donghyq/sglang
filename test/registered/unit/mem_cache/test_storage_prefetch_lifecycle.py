@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -170,11 +171,13 @@ def _cache_mode_hit_fixture(capacity):
     cache._resolve_storage_prefetch_tokens = Mock()
     cache._log_storage_prefetch_deferred = Mock()
     cache.evict_host = Mock(return_value=0)
+    cache._all_reduce_storage_admission = lambda tensor: None
     host_pool = SimpleNamespace(
         alloc=Mock(
             side_effect=lambda count: torch.arange(count) if count <= capacity else None
         ),
         available_size=Mock(return_value=capacity),
+        free=Mock(),
     )
     cache.cache_controller.mem_pool_host = host_pool
     cache.cache_controller.prefetch_buffer = Queue()
@@ -276,20 +279,85 @@ def _two_rank_cache_mode_capacity_trace(rank, rendezvous):
         timeout=timedelta(seconds=30),
     )
     try:
-        cache, operation = _cache_mode_hit_fixture(8 if rank == 0 else 4)
-        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
-        launched = not cache.cache_controller.prefetch_buffer.empty()
-        states = [None, None]
-        torch.distributed.all_gather_object(
-            states, (launched, operation.storage_hit_count)
-        )
-        assert states == [(True, 8), (False, 8)], states
+        for scenario in (
+            "capacity",
+            "pp_capacity",
+            "aux_capacity",
+            "ready",
+            "aborted",
+            "different_hit",
+        ):
+            capacity = 4 if scenario in ("capacity", "pp_capacity") and rank == 1 else 8
+            cache, operation = _cache_mode_hit_fixture(capacity)
+            del cache._all_reduce_storage_admission
+            cache.attn_cp_group = None
+            cache.attn_tp_group = None
+            cache.tp_world_size = 1 if scenario == "pp_capacity" else 2
+            cache.tp_group = (
+                None if scenario == "pp_capacity" else torch.distributed.group.WORLD
+            )
+            cache.pp_size = 2 if scenario == "pp_capacity" else 1
+            cache.pp_group = (
+                torch.distributed.group.WORLD if scenario == "pp_capacity" else None
+            )
+            if scenario == "aborted" and rank == 1:
+                cache.ongoing_prefetch.clear()
+            if scenario == "aux_capacity" and rank == 1:
+                cache._alloc_prefetch_aux_staging.return_value = False
+            if scenario == "different_hit" and rank == 1:
+                operation.handle = CacheRequestHandle("other-hit", 0)
+            cache.cache_controller.append_host_mem_release.side_effect = (
+                lambda host_indices=None, **kwargs: (
+                    cache.cache_controller.host_mem_release_queue.put(host_indices)
+                    if host_indices is not None
+                    else None
+                )
+            )
+            failed_closed = False
+            try:
+                cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+            except RuntimeError as exc:
+                assert scenario == "different_hit" and "order differs" in str(exc)
+                failed_closed = True
+            states = [None, None]
+            torch.distributed.all_gather_object(
+                states,
+                (
+                    not cache.cache_controller.prefetch_buffer.empty(),
+                    operation.storage_hit_count,
+                    cache.revoke_pending_prefetch.call_count,
+                    cache.cache_controller.append_host_mem_release.call_count,
+                    failed_closed,
+                ),
+            )
+            if scenario == "ready":
+                assert states == [(True, 8, 0, 0, False)] * 2, states
+            elif scenario == "different_hit":
+                assert states[0] == (False, 8, 1, 1, True), states
+                assert states[1] == (False, 8, 0, 0, True), states
+            else:
+                assert states[0] == (False, 8, 1, 1, False), states
+                assert states[1] == (
+                    False,
+                    8,
+                    0 if scenario == "aborted" else 1,
+                    1 if scenario == "aux_capacity" else 0,
+                    False,
+                ), states
+            released = cache.cache_controller.host_mem_release_queue.qsize()
+            cache._drain_storage_control_queues_impl(0, 0, 0, released, {}, False)
+            if released:
+                cache.cache_controller.mem_pool_host.free.assert_called_once()
+                assert torch.equal(
+                    cache.cache_controller.mem_pool_host.free.call_args.args[0],
+                    torch.arange(8),
+                )
     finally:
         torch.distributed.destroy_process_group()
 
 
-class TestStagedPrefetchLifecycle(unittest.TestCase):
-    def test_two_rank_cache_mode_capacity_can_diverge_before_global_admission(self):
+class TestStagedPrefetchLifecycle(CustomTestCase):
+    def test_two_rank_cache_mode_capacity_votes_before_transfer(self):
         with tempfile.TemporaryDirectory(prefix="cache-mode-rank-") as directory:
             torch.multiprocessing.spawn(
                 _two_rank_cache_mode_capacity_trace,

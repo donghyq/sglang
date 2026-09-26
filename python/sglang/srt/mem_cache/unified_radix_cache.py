@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import threading
 import time
@@ -334,6 +335,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.pp_rank == 0:
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
+
+    def _all_reduce_storage_admission(self, data: torch.Tensor) -> None:
+        """Reduce a storage-hit admission vote across every participating rank."""
+        self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        if self.pp_size > 1:
+            torch.distributed.all_reduce(
+                data, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
 
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
@@ -2946,7 +2955,112 @@ class UnifiedRadixCache(BasePrefixCache):
             cc.prefetch_buffer.put(operation)
             return True
 
+        def _drain_cache_storage_hits():
+            # Every rank consumes the same number of hit slots. Keep the vote
+            # outside local eligibility branches: one rank may have aborted a
+            # request or run out of host pages while its peer can still stage it.
+            for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                request = operation.handle
+                hit_tokens = operation.storage_hit_count
+                info = self.ongoing_prefetch.get(request)
+                if info is not None and hit_tokens > 0:
+                    self._record_storage_prefetch_hit(request, hit_tokens)
+
+                host_indices = None
+                locally_ready = (
+                    info is not None
+                    and not operation.is_terminated()
+                    and hit_tokens >= self.prefetch_threshold
+                )
+                if locally_ready:
+                    host_indices = cc.mem_pool_host.alloc(hit_tokens)
+                    if host_indices is None:
+                        self.evict_host(hit_tokens)
+                        host_indices = cc.mem_pool_host.alloc(hit_tokens)
+                    locally_ready = host_indices is not None
+                    if locally_ready and not self._alloc_prefetch_aux_staging(
+                        info, hit_tokens
+                    ):
+                        cc.append_host_mem_release(host_indices=host_indices)
+                        host_indices = None
+                        locally_ready = False
+
+                # Operation IDs are local counters. The request handle and the
+                # ordered page hashes identify the same hit on every rank.
+                fingerprint = hashlib.blake2b(digest_size=8)
+                for part in (
+                    request.rid,
+                    request.attempt_id,
+                    operation.storage_start,
+                    hit_tokens,
+                    *(operation.hash_value or ()),
+                ):
+                    value = str(part).encode("utf-8")
+                    fingerprint.update(len(value).to_bytes(8, "little"))
+                    fingerprint.update(value)
+                digest = int.from_bytes(fingerprint.digest(), "little") & (
+                    (1 << 63) - 1
+                )
+                vote = torch.tensor(
+                    [int(locally_ready), digest, -digest],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                self._all_reduce_storage_admission(vote)
+                same_hit = digest == int(vote[1]) == -int(vote[2])
+                if not same_hit:
+                    if host_indices is not None:
+                        cc.append_host_mem_release(host_indices=host_indices)
+                    if info is not None:
+                        self.revoke_pending_prefetch(request)
+                    raise RuntimeError(
+                        "Storage prefetch hit order differs across ranks"
+                    )
+
+                if int(vote[0]):
+                    self._invalidate_absent_from_hit_query(operation)
+                    self._account_prefetch_outcome(operation, revoked=False)
+                    operation.host_indices = host_indices
+                    self.ongoing_prefetch[request] = info._replace(
+                        host_indices=host_indices
+                    )
+                    cc.prefetch_buffer.put(operation)
+                    continue
+
+                if host_indices is not None:
+                    cc.append_host_mem_release(host_indices=host_indices)
+                if info is None:
+                    self._invalidate_absent_from_hit_query(operation)
+                    if hit_tokens > 0:
+                        self.discard_storage_prefetch_accounting(request)
+                    continue
+
+                self._invalidate_absent_from_hit_query(operation)
+                self._account_prefetch_outcome(operation, revoked=True)
+                if hit_tokens > 0:
+                    if hit_tokens < self.prefetch_threshold:
+                        reason = "below_threshold"
+                    elif operation.is_terminated():
+                        reason = None
+                    else:
+                        reason = "host_capacity"
+                    self._finish_storage_prefetch(
+                        request, fulfilled_tokens=0, reason=reason
+                    )
+                    if reason == "host_capacity":
+                        self._log_storage_prefetch_deferred(hit_tokens, reason)
+                if operation.is_terminated() or hit_tokens < self.prefetch_threshold:
+                    self.storage_prefetch_retries.poll_miss(request.rid)
+                else:
+                    self.storage_prefetch_retries.poll_miss(
+                        request.rid, operation.storage_start + hit_tokens
+                    )
+                self.revoke_pending_prefetch(request)
+
         def _drain_and_alloc_storage_hit():
+            if not buffer_mode:
+                _drain_cache_storage_hits()
+                return
             # Parked hits first (FIFO fairness with retries; buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
