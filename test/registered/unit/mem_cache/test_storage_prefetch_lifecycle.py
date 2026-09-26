@@ -1,6 +1,7 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
 import tempfile
+import threading
 import unittest
 from array import array
 from collections import defaultdict, deque
@@ -11,6 +12,7 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController, StorageOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     InitLoadBackParams,
@@ -19,9 +21,16 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    StorageOperation as HybridStorageOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -220,6 +229,160 @@ def _two_rank_retry_trace(rank, rendezvous):
 
 
 class TestStagedPrefetchLifecycle(unittest.TestCase):
+    def test_backup_ack_reports_unwritten_tail(self):
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache.buffer_pipeline.finish_storage_write_ack = Mock()
+        cache.tree_core = SimpleNamespace(page_size=2)
+        operation = SimpleNamespace(
+            id=1,
+            hash_value=["h0", "h1", "h2"],
+            completed_tokens=2,
+            backup_failed=True,
+        )
+        cache.cache_controller.ack_backup_queue.put(operation)
+
+        cache._drain_storage_control_queues_impl(0, 0, 1, 0, {}, True)
+
+        cache.storage_metrics_collector.log_backuped_tokens.assert_called_once_with(2)
+        cache.storage_metrics_collector.log_backup_failed_tokens.assert_called_once_with(
+            4
+        )
+
+    def test_hybrid_backup_retries_incomplete_sidecar(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 1
+        controller.backup_skip = False
+        controller.storage_stop_event = threading.Event()
+        controller.mem_pool_host = SimpleNamespace(layout_lease=Mock())
+        controller.mem_pool_host.layout_lease.return_value.__enter__ = Mock()
+        controller.mem_pool_host.layout_lease.return_value.__exit__ = Mock(
+            return_value=False
+        )
+        controller.page_set_func = Mock(return_value=True)
+        controller.storage_backend = SimpleNamespace(
+            batch_set_v2=Mock(
+                side_effect=[
+                    {PoolName.MAMBA: [True, False]},
+                    {PoolName.MAMBA: [True, True]},
+                ]
+            )
+        )
+        operation = HybridStorageOperation(
+            host_indices=torch.arange(2),
+            token_ids=[0, 1],
+            hash_value=["h0", "h1"],
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["h0", "h1"],
+                    host_indices=torch.arange(2),
+                )
+            ],
+        )
+
+        self.assertTrue(controller._page_backup(operation))
+        self.assertFalse(operation.backup_failed)
+        self.assertEqual(operation.completed_tokens, 2)
+        self.assertEqual(controller.storage_backend.batch_set_v2.call_count, 2)
+
+    def test_hybrid_backup_terminal_sidecar_failure_skips_primary(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 1
+        controller.backup_skip = False
+        controller.storage_stop_event = threading.Event()
+        controller.mem_pool_host = SimpleNamespace(layout_lease=Mock())
+        controller.mem_pool_host.layout_lease.return_value.__enter__ = Mock()
+        controller.mem_pool_host.layout_lease.return_value.__exit__ = Mock(
+            return_value=False
+        )
+        controller.page_set_func = Mock(return_value=True)
+        controller.storage_backend = SimpleNamespace(
+            batch_set_v2=Mock(return_value={PoolName.MAMBA: [True, False]})
+        )
+        operation = HybridStorageOperation(
+            host_indices=torch.arange(2),
+            token_ids=[0, 1],
+            hash_value=["h0", "h1"],
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["h0", "h1"],
+                    host_indices=torch.arange(2),
+                )
+            ],
+        )
+
+        self.assertFalse(controller._page_backup(operation))
+        self.assertTrue(operation.backup_failed)
+        self.assertEqual(operation.completed_tokens, 0)
+        controller.page_set_func.assert_not_called()
+
+    def test_storage_backup_middle_batch_failure_is_not_silent(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.page_size = 1
+        controller.backup_skip = False
+        controller.storage_stop_event = threading.Event()
+        controller.backup_queue = Queue()
+        controller.ack_backup_queue = Queue()
+        pages = STORAGE_BATCH_SIZE + 1
+        operation = StorageOperation(
+            host_indices=torch.arange(pages),
+            token_ids=list(range(pages)),
+            hash_value=[f"page-{index}" for index in range(pages)],
+        )
+        responses = iter([True, False, False, False])
+        controller.page_set_func = Mock(side_effect=lambda *_: next(responses))
+        controller.backup_queue.put(operation)
+        thread = threading.Thread(target=controller.backup_thread_func, daemon=True)
+        thread.start()
+        try:
+            acknowledged = controller.ack_backup_queue.get(timeout=5)
+            self.assertIs(acknowledged, operation)
+            self.assertTrue(acknowledged.backup_failed)
+            self.assertEqual(acknowledged.completed_tokens, STORAGE_BATCH_SIZE)
+        finally:
+            controller.storage_stop_event.set()
+            controller.backup_queue.put(None)
+            thread.join(timeout=5)
+
+    def test_storage_backup_worker_survives_exception_and_handles_next_write(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.page_size = 1
+        controller.backup_skip = False
+        controller.storage_stop_event = threading.Event()
+        controller.backup_queue = Queue()
+        controller.ack_backup_queue = Queue()
+        controller.page_set_func = Mock(
+            side_effect=[OSError("store unavailable")] * 3 + [True]
+        )
+        operations = [
+            StorageOperation(
+                host_indices=torch.arange(2),
+                token_ids=[0, 1],
+                hash_value=["h0", "h1"],
+            )
+            for _ in range(2)
+        ]
+        for operation in operations:
+            controller.backup_queue.put(operation)
+        thread = threading.Thread(target=controller.backup_thread_func, daemon=True)
+        thread.start()
+        try:
+            first = controller.ack_backup_queue.get(timeout=5)
+            second = controller.ack_backup_queue.get(timeout=5)
+            self.assertIs(first, operations[0])
+            self.assertTrue(first.backup_failed)
+            self.assertEqual(first.completed_tokens, 0)
+            self.assertIs(second, operations[1])
+            self.assertFalse(second.backup_failed)
+            self.assertEqual(second.completed_tokens, 2)
+        finally:
+            controller.storage_stop_event.set()
+            controller.backup_queue.put(None)
+            thread.join(timeout=5)
+
     def test_trim_and_stage_preserve_raw_token_boundaries(self):
         for bigram in (False, True):
             for trims in ((2,), (2, 2), (8,), (2, 6)):
