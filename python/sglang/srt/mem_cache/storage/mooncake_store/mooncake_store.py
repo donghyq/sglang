@@ -632,6 +632,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     @staticmethod
     def _iter_host_pool_buffers(host_pool: HostKVCache):
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        if isinstance(host_pool, MHATokenToKVPoolHost):
+            yield host_pool.kv_buffer
+            return
         get_buffers = getattr(
             host_pool,
             "get_hybrid_pool_buffer",
@@ -1334,7 +1339,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pass
 
     def clear(self) -> None:
-        self.store.remove_all()
+        ret_code = self.store.remove_all(True)
+        if ret_code < 0:
+            raise RuntimeError(
+                f"Failed to clear Mooncake storage backend, error code: {ret_code}"
+            )
 
     def _put_batch_zero_copy_impl(
         self,

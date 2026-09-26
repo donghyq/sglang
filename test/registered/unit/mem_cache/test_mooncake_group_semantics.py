@@ -79,6 +79,9 @@ def _fake_store_class():
 
         def __init__(self):
             self.batch_put_calls = []
+            self.batch_put_results = None
+            self.remove_all_calls = []
+            self.remove_all_result = 0
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
@@ -102,6 +105,12 @@ def _fake_store_class():
         def batch_is_exist(self, keys):
             return [1 if key in self.existing_keys else 0 for key in keys]
 
+        def remove_all(self, force=False):
+            self.remove_all_calls.append(force)
+            if self.remove_all_result >= 0 and force:
+                self.existing_keys.clear()
+            return self.remove_all_result
+
         def batch_put_from(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
                 {
@@ -112,8 +121,11 @@ def _fake_store_class():
                     "args": args,
                 }
             )
-            self.existing_keys.update(keys)
-            return [0] * len(keys)
+            results = self.batch_put_results or [0] * len(keys)
+            self.existing_keys.update(
+                key for key, result in zip(keys, results) if result == 0
+            )
+            return results
 
         def batch_put_from_multi_buffers(self, keys, ptrs, sizes, *args):
             self.batch_put_calls.append(
@@ -274,6 +286,83 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_mha_registration_uses_full_kv_allocation(self):
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        pool = object.__new__(MHATokenToKVPoolHost)
+        pool.kv_buffer = torch.empty((2, 4, 8), dtype=torch.float32)
+        buffers = list(MooncakeStore._iter_host_pool_buffers(pool))
+
+        self.assertEqual(len(buffers), 1)
+        self.assertIs(buffers[0], pool.kv_buffer)
+        self.assertEqual(buffers[0].numel(), pool.k_buffer.numel() * 2)
+
+    def test_partial_physical_write_does_not_report_complete_page(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_results = [0, -1]
+
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [False])
+        self.assertIn("page0_0_k", fake_store.existing_keys)
+        self.assertNotIn("page0_0_v", fake_store.existing_keys)
+        self.assertEqual(store.batch_exists(["page0"]), 0)
+
+    def test_retry_fills_missing_member_without_rewriting_existing_one(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_results = [0, -1]
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [False])
+
+        fake_store.batch_put_results = None
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        self.assertEqual(fake_store.batch_put_calls[-1]["keys"], ["page0_0_v"])
+        self.assertEqual(store.batch_exists(["page0"]), 1)
+
+    def test_group_ids_do_not_prevent_cross_generation_member_mix(self):
+        store, fake_store = _make_store()
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_results = [0, -1]
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [False])
+        first_call = fake_store.batch_put_calls[-1]
+
+        fake_store.batch_put_results = None
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([1])), [True])
+        second_call = fake_store.batch_put_calls[-1]
+
+        self.assertEqual(first_call["keys"], ["page0_0_k", "page0_0_v"])
+        self.assertEqual(second_call["keys"], ["page0_0_v"])
+        self.assertEqual(first_call["args"][0].group_ids, ["sglang-hicache:page0"] * 2)
+        self.assertEqual(second_call["args"][0].group_ids, ["sglang-hicache:page0"])
+        self.assertEqual(store.batch_exists(["page0"]), 1)
+
+    def test_incomplete_page_is_not_a_storage_hit(self):
+        store, fake_store = _make_store()
+        fake_store.existing_keys.add("page0_0_k")
+
+        self.assertEqual(store.batch_exists(["page0"]), 0)
+
+        fake_store.existing_keys.add("page0_0_v")
+        self.assertEqual(store.batch_exists(["page0"]), 1)
+
+    def test_admin_clear_removes_unexpired_objects(self):
+        store, fake_store = _make_store()
+        fake_store.existing_keys.add("recent-object")
+
+        store.clear()
+
+        self.assertEqual(fake_store.remove_all_calls, [True])
+        self.assertEqual(fake_store.existing_keys, set())
+
+    def test_admin_clear_rejects_backend_failure(self):
+        store, fake_store = _make_store()
+        fake_store.remove_all_result = -1
+
+        with self.assertRaisesRegex(RuntimeError, "-1"):
+            store.clear()
+
     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
         fake_store_cls = _fake_store_class()
         with patch.dict(
