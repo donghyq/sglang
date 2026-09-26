@@ -155,6 +155,42 @@ def _hit_drain_fixture():
     return cache
 
 
+def _cache_mode_hit_fixture(capacity):
+    cache = _hit_drain_fixture()
+    cache.host_memory_mode = "cache"
+    cache.buffer_pipeline = None
+    cache.tree_core = SimpleNamespace(page_size=2)
+    cache._invalidate_absent_from_hit_query = Mock()
+    cache._account_prefetch_outcome = Mock()
+    cache._record_storage_prefetch_hit = Mock()
+    cache._alloc_prefetch_aux_staging = Mock(return_value=True)
+    cache._finish_storage_prefetch = Mock()
+    cache._resolve_storage_prefetch_tokens = Mock()
+    cache._log_storage_prefetch_deferred = Mock()
+    cache.evict_host = Mock(return_value=0)
+    host_pool = SimpleNamespace(
+        alloc=Mock(
+            side_effect=lambda count: torch.arange(count) if count <= capacity else None
+        ),
+        available_size=Mock(return_value=capacity),
+    )
+    cache.cache_controller.mem_pool_host = host_pool
+    cache.cache_controller.prefetch_buffer = Queue()
+    cache.cache_controller.append_host_mem_release = Mock()
+    handle = CacheRequestHandle("full-hit", 0)
+    operation = SimpleNamespace(
+        handle=handle,
+        storage_start=0,
+        storage_hit_count=8,
+        hash_value=["h0", "h1", "h2", "h3"],
+        is_terminated=lambda: False,
+    )
+    cache.ongoing_prefetch[handle] = _OngoingPrefetch(
+        0, RadixKey(array("q", range(8))), None, operation, None, {}
+    )
+    cache.cache_controller.prefetch_hit_queue.put(operation)
+    return cache, operation
+
 def _terminated_query(cache, rid, hit_tokens):
     handle = CacheRequestHandle(rid, 0)
     operation = SimpleNamespace(
@@ -228,7 +264,86 @@ def _two_rank_retry_trace(rank, rendezvous):
         torch.distributed.destroy_process_group()
 
 
+def _two_rank_cache_mode_capacity_trace(rank, rendezvous):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        cache, operation = _cache_mode_hit_fixture(8 if rank == 0 else 4)
+        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+        launched = not cache.cache_controller.prefetch_buffer.empty()
+        states = [None, None]
+        torch.distributed.all_gather_object(
+            states, (launched, operation.storage_hit_count)
+        )
+        assert states == [(True, 8), (False, 8)], states
+    finally:
+        torch.distributed.destroy_process_group()
+
 class TestStagedPrefetchLifecycle(unittest.TestCase):
+    def test_two_rank_cache_mode_capacity_can_diverge_before_global_admission(self):
+        with tempfile.TemporaryDirectory(prefix="cache-mode-rank-") as directory:
+            torch.multiprocessing.spawn(
+                _two_rank_cache_mode_capacity_trace,
+                args=(f"{directory}/store",),
+                nprocs=2,
+                join=True,
+            )
+
+    def test_cache_mode_full_hit_never_shrinks_for_host_capacity(self):
+        for capacity in (4, 8):
+            with self.subTest(capacity=capacity):
+                cache, operation = _cache_mode_hit_fixture(capacity)
+                cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+                self.assertEqual(operation.storage_hit_count, 8)
+                self.assertEqual(operation.hash_value, ["h0", "h1", "h2", "h3"])
+                if capacity < 8:
+                    self.assertTrue(cache.cache_controller.prefetch_buffer.empty())
+                    cache._finish_storage_prefetch.assert_called_once_with(
+                        operation.handle, fulfilled_tokens=0, reason="host_capacity"
+                    )
+                else:
+                    self.assertIs(
+                        cache.cache_controller.prefetch_buffer.get_nowait(), operation
+                    )
+
+    def test_cache_mode_non_head_retries_full_hit_after_capacity_returns(self):
+        cache, operation = _cache_mode_hit_fixture(4)
+        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+        self.assertTrue(cache.cache_controller.prefetch_buffer.empty())
+        head = SimpleNamespace(rid="head", storage_prefetch_retry_attempts=0)
+        waiting = SimpleNamespace(
+            rid=operation.handle.rid, storage_prefetch_retry_attempts=0
+        )
+        retries = cache.storage_prefetch_retries
+        self.assertEqual(retries.pop_ready([head, waiting], 2, 8), [])
+        self.assertEqual(retries.pop_ready([head, waiting], 2, 8), [])
+        self.assertEqual(retries.pop_ready([head, waiting], 2, 8), [(waiting, 8)])
+
+        cache.cache_controller.mem_pool_host.alloc.side_effect = torch.arange
+        cache.cache_controller.prefetch_hit_queue.put(operation)
+        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+        self.assertEqual(operation.storage_hit_count, 8)
+        self.assertIs(cache.cache_controller.prefetch_buffer.get_nowait(), operation)
+
+    def test_cache_mode_head_falls_back_without_partial_staging(self):
+        cache, operation = _cache_mode_hit_fixture(4)
+        cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+        head = SimpleNamespace(
+            rid=operation.handle.rid, storage_prefetch_retry_attempts=0
+        )
+
+        self.assertEqual(cache.storage_prefetch_retries.pop_ready([head], 2, 8), [])
+        self.assertEqual(operation.storage_hit_count, 8)
+        self.assertTrue(cache.cache_controller.prefetch_buffer.empty())
+        cache._finish_storage_prefetch.assert_called_once_with(
+            operation.handle, fulfilled_tokens=0, reason="host_capacity"
+        )
+
     def test_backup_ack_reports_unwritten_tail(self):
         cache = _hit_drain_fixture()
         cache.enable_storage_metrics = True
