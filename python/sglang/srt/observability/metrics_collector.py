@@ -1903,6 +1903,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.backup_failed_tokens_total = Counter(
+            name="sglang:backup_failed_tokens_total",
+            documentation="Host-to-storage backup tokens not persisted after retry exhaustion.",
+            labelnames=labels.keys(),
+        )
+
         self.storage_prefetch_hit_tokens_total = Counter(
             name="sglang:storage_prefetch_hit_tokens_total",
             documentation="Storage-hit tokens returned by an L3 query before "
@@ -2027,6 +2033,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_backup_failed_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.backup_failed_tokens_total.labels(**self.labels).inc(num_tokens)
 
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:

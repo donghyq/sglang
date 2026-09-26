@@ -1365,14 +1365,38 @@ class HybridCacheController(BaseHiCacheController):
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys, operation.hash_value, backup_transfers
             ):
-                results.update(
-                    self.storage_backend.batch_set_v2(transfers, extra_info=extra_info)
-                )
+                write_result = {}
+
+                def write_sidecars():
+                    nonlocal write_result
+                    write_result = self.storage_backend.batch_set_v2(
+                        transfers, extra_info=extra_info
+                    )
+                    for transfer in transfers:
+                        values = write_result.get(transfer.name)
+                        if values is None:
+                            values = write_result.get(transfer.name.value)
+                        expected = len(transfer.keys or [])
+                        if expected == 0 and transfer.host_indices is not None:
+                            expected = int(transfer.host_indices.numel())
+                        if (
+                            not isinstance(values, (list, tuple))
+                            or len(values) != expected
+                        ):
+                            return False
+                        if not all(values):
+                            return False
+                    return True
+
+                if not self._retry_storage_write(write_sidecars):
+                    operation.backup_failed = True
+                    return False
+                results.update(write_result)
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
         if not self.backup_skip:
-            super()._page_backup(operation)
+            return super()._page_backup(operation)
         else:
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:
@@ -1393,6 +1417,8 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+            operation.backup_failed = bool(backup_transfers) and not sidecar_ok
+            return not operation.backup_failed
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
@@ -1428,7 +1454,22 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                try:
+                    success = self._page_backup(operation)
+                except Exception:
+                    success = False
+                    logger.exception(
+                        "Hybrid storage backup operation %s raised", operation.id
+                    )
+                operation.backup_failed = not success
+                if operation.backup_failed:
+                    logger.error(
+                        "Hybrid storage backup operation %s failed: "
+                        "completed_tokens=%d requested_tokens=%d",
+                        operation.id,
+                        operation.completed_tokens,
+                        len(operation.hash_value) * self.page_size,
+                    )
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue

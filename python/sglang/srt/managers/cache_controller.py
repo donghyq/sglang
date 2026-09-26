@@ -47,6 +47,9 @@ from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+STORAGE_BACKUP_MAX_ATTEMPTS = 3
+STORAGE_BACKUP_RETRY_DELAY = 0.1
+
 device_module = get_device_module()
 
 
@@ -227,6 +230,7 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        self.backup_failed = False
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -1074,7 +1078,9 @@ class HiCacheController:
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
-        prefix_keys = operation.prefix_keys
+        prefix_keys = (
+            operation.prefix_keys.copy() if operation.prefix_keys is not None else None
+        )
         kv_derived_transfers = [
             transfer
             for transfer in getattr(operation, "pool_transfers", None) or []
@@ -1286,9 +1292,31 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _retry_storage_write(self, write: Callable[[], bool]) -> bool:
+        for attempt in range(1, STORAGE_BACKUP_MAX_ATTEMPTS + 1):
+            if self.storage_stop_event.is_set():
+                return False
+            try:
+                if write():
+                    return True
+            except Exception:
+                logger.warning(
+                    "Storage write raised (attempt %d/%d)",
+                    attempt,
+                    STORAGE_BACKUP_MAX_ATTEMPTS,
+                    exc_info=True,
+                )
+            if attempt < STORAGE_BACKUP_MAX_ATTEMPTS and self.storage_stop_event.wait(
+                STORAGE_BACKUP_RETRY_DELAY * attempt
+            ):
+                return False
+        return False
+
     # Backup batch by batch
-    def _page_backup(self, operation):
+    def _page_backup(self, operation) -> bool:
         # Backup batch by batch
+        if self.backup_skip:
+            return True
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
@@ -1298,16 +1326,17 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = self._retry_storage_write(
+                lambda: self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            )
             if not success:
-                logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
-                )
-                break
+                operation.backup_failed = True
+                return False
 
             if prefix_keys is not None:
                 prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+        return True
 
     def backup_thread_func(self):
         """
@@ -1319,8 +1348,19 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
+                try:
+                    success = self._page_backup(operation)
+                except Exception:
+                    success = False
+                    logger.exception("Storage backup operation %s raised", operation.id)
+                operation.backup_failed = not success
+                if operation.backup_failed:
+                    logger.error(
+                        "Storage backup operation %s failed: completed_tokens=%d requested_tokens=%d",
+                        operation.id,
+                        operation.completed_tokens,
+                        len(operation.hash_value) * self.page_size,
+                    )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

@@ -3051,6 +3051,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    if operation.backup_failed:
+                        self.storage_metrics_collector.log_backup_failed_tokens(
+                            len(operation.hash_value) * self.page_size
+                            - operation.completed_tokens
+                        )
             return drained
 
         def _drain_release():
