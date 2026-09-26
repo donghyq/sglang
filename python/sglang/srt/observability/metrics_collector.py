@@ -1916,6 +1916,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.storage_prefetch_hit_duration_seconds = Histogram(
+            name="sglang:storage_prefetch_hit_duration_seconds",
+            documentation="Time from a rank-agreed positive L3 query result to its final prefetch accounting decision. Excludes lookup and may include scheduling/admission delay.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+
         self.storage_prefetch_unfulfilled_tokens_total = Counter(
             name="sglang:storage_prefetch_unfulfilled_tokens_total",
             documentation="Attempt-level storage-hit tokens that did not become "
@@ -2041,6 +2047,13 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:
             self.storage_prefetch_hit_tokens_total.labels(**self.labels).inc(num_tokens)
+
+    def observe_storage_prefetch_hit_duration(
+        self, duration_seconds: float, outcome: str
+    ) -> None:
+        self.storage_prefetch_hit_duration_seconds.labels(
+            **self.labels, outcome=outcome
+        ).observe(duration_seconds)
 
     def log_storage_prefetch_unfulfilled_tokens(
         self, num_tokens: int, reason: str

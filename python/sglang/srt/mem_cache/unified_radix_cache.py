@@ -386,6 +386,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._storage_prefetch_hit_remaining_by_reqid: dict[
             CacheRequestHandle, int
         ] = {}
+        self._storage_prefetch_hit_started_at: dict[CacheRequestHandle, float] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
@@ -2487,6 +2488,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.discard_storage_prefetch_accounting(request)
         self._storage_prefetch_hit_remaining_by_reqid[request] = num_tokens
+        self._storage_prefetch_hit_started_at[request] = time.monotonic()
         self.storage_metrics_collector.log_storage_prefetch_hit_tokens(num_tokens)
 
     def _resolve_storage_prefetch_tokens(
@@ -2516,13 +2518,25 @@ class UnifiedRadixCache(BasePrefixCache):
             self._storage_prefetch_hit_remaining_by_reqid[request] = remaining
         else:
             self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
+            started_at = self._storage_prefetch_hit_started_at.pop(request, None)
+            if started_at is not None and self.storage_metrics_collector is not None:
+                self.storage_metrics_collector.observe_storage_prefetch_hit_duration(
+                    time.monotonic() - started_at,
+                    "superseded" if reason is None else "unfulfilled",
+                )
 
     def _finish_storage_prefetch(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
+        started_at = self._storage_prefetch_hit_started_at.pop(request, None)
         remaining = self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         if remaining is None:
             return
+        if started_at is not None and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.observe_storage_prefetch_hit_duration(
+                time.monotonic() - started_at,
+                "fulfilled" if fulfilled_tokens >= remaining else "unfulfilled",
+            )
         if fulfilled_tokens > remaining:
             logger.warning(
                 "Storage-prefetch fulfilled accounting exceeded remaining "
@@ -2550,6 +2564,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def discard_storage_prefetch_accounting(self, request: CacheRequestHandle) -> None:
         """Drop lifecycle state for cases intentionally excluded from metrics."""
+        self._storage_prefetch_hit_started_at.pop(request, None)
         self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
 
     def _handle_storage_prefetch_anchor_loss(self, request: CacheRequestHandle) -> None:
@@ -2586,6 +2601,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
+        # An aborted request has no completed restore outcome to measure.
+        self.discard_storage_prefetch_accounting(request)
         if (
             self.buffer_pipeline is not None
             and self.cache_controller.pp_prefetch_command_group is not None
@@ -2597,7 +2614,6 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.buffer_pipeline.release_staged_hold(request)
         ):
             return
-        self.discard_storage_prefetch_accounting(request)
         if request not in self.ongoing_prefetch:
             return
 

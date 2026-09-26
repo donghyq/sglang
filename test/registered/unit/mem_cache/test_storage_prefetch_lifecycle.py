@@ -67,6 +67,7 @@ def _staged_fixture(full_match=2):
     cache.prefetch_loaded_tokens_by_reqid = {_REQ: 6}
     cache.prefetch_loaded_storage_start_by_reqid = {_REQ: 2}
     cache._storage_prefetch_hit_remaining_by_reqid = {}
+    cache._storage_prefetch_hit_started_at = {}
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None
     cache.ongoing_prefetch = {}
@@ -141,6 +142,7 @@ def _hit_drain_fixture():
     cache.storage_prefetch_retries = StoragePrefetchRetries()
     cache._prefetch_outcome_stats = defaultdict(int)
     cache._storage_prefetch_hit_remaining_by_reqid = {}
+    cache._storage_prefetch_hit_started_at = {}
     cache._record_storage_prefetch_hit = Mock()
     cache.revoke_pending_prefetch = Mock()
     cache.buffer_pipeline = SimpleNamespace(pending_hit_allocs=deque())
@@ -190,6 +192,7 @@ def _cache_mode_hit_fixture(capacity):
     )
     cache.cache_controller.prefetch_hit_queue.put(operation)
     return cache, operation
+
 
 def _terminated_query(cache, rid, hit_tokens):
     handle = CacheRequestHandle(rid, 0)
@@ -283,6 +286,7 @@ def _two_rank_cache_mode_capacity_trace(rank, rendezvous):
         assert states == [(True, 8), (False, 8)], states
     finally:
         torch.distributed.destroy_process_group()
+
 
 class TestStagedPrefetchLifecycle(unittest.TestCase):
     def test_two_rank_cache_mode_capacity_can_diverge_before_global_admission(self):
@@ -497,6 +501,85 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
             controller.storage_stop_event.set()
             controller.backup_queue.put(None)
             thread.join(timeout=5)
+
+    def test_l3_hit_duration_records_outcome_and_cleans_up(self):
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._record_storage_prefetch_hit = lambda handle, count: (
+            UnifiedRadixCache._record_storage_prefetch_hit(cache, handle, count)
+        )
+        handle = CacheRequestHandle("timed", 0)
+
+        cache._record_storage_prefetch_hit(handle, 8)
+        cache._finish_storage_prefetch(
+            handle, fulfilled_tokens=0, reason="host_capacity"
+        )
+
+        cache.storage_metrics_collector.observe_storage_prefetch_hit_duration.assert_called_once()
+        self.assertEqual(
+            cache.storage_metrics_collector.observe_storage_prefetch_hit_duration.call_args.args[
+                1
+            ],
+            "unfulfilled",
+        )
+        self.assertEqual(cache._storage_prefetch_hit_started_at, {})
+
+        cache._record_storage_prefetch_hit(handle, 8)
+        cache._finish_storage_prefetch(handle, fulfilled_tokens=8, reason=None)
+        self.assertEqual(
+            cache.storage_metrics_collector.observe_storage_prefetch_hit_duration.call_args.args[
+                1
+            ],
+            "fulfilled",
+        )
+        self.assertEqual(cache._storage_prefetch_hit_started_at, {})
+
+        cache._record_storage_prefetch_hit(handle, 8)
+        cache.discard_storage_prefetch_accounting(handle)
+        self.assertEqual(cache._storage_prefetch_hit_started_at, {})
+        self.assertEqual(cache._storage_prefetch_hit_remaining_by_reqid, {})
+
+        cache._record_storage_prefetch_hit(handle, 8)
+        cache._resolve_storage_prefetch_tokens(handle, 8, reason="device_covered")
+        self.assertEqual(cache._storage_prefetch_hit_started_at, {})
+        self.assertEqual(
+            cache.storage_metrics_collector.observe_storage_prefetch_hit_duration.call_args.args[
+                1
+            ],
+            "unfulfilled",
+        )
+
+        cache._record_storage_prefetch_hit(handle, 8)
+        cache._resolve_storage_prefetch_tokens(handle, 8)
+        self.assertEqual(
+            cache.storage_metrics_collector.observe_storage_prefetch_hit_duration.call_args.args[
+                1
+            ],
+            "superseded",
+        )
+        self.assertEqual(cache._storage_prefetch_hit_started_at, {})
+
+    def test_aborted_staged_hit_does_not_report_restore_duration(self):
+        cache = _hit_drain_fixture()
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._record_storage_prefetch_hit = lambda handle, count: (
+            UnifiedRadixCache._record_storage_prefetch_hit(cache, handle, count)
+        )
+        cache.linker = None
+        cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
+        cache.cache_controller.pp_prefetch_command_group = None
+        cache.buffer_pipeline.release_staged_hold = Mock(return_value=True)
+        handle = CacheRequestHandle("aborted", 0)
+        cache._record_storage_prefetch_hit(handle, 8)
+
+        cache.release_aborted_request(handle)
+
+        self.assertEqual(cache._storage_prefetch_hit_started_at, {})
+        self.assertEqual(cache._storage_prefetch_hit_remaining_by_reqid, {})
+        cache.storage_metrics_collector.observe_storage_prefetch_hit_duration.assert_not_called()
 
     def test_trim_and_stage_preserve_raw_token_boundaries(self):
         for bigram in (False, True):
