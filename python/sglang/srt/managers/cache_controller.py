@@ -1103,13 +1103,20 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                except Exception:
+                    logger.exception(
+                        "HiCache storage prefetch batch failed for request %s",
+                        operation.request_id,
+                    )
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False

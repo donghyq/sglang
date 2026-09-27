@@ -357,6 +357,43 @@ def _two_rank_cache_mode_capacity_trace(rank, rendezvous):
 
 
 class TestStagedPrefetchLifecycle(CustomTestCase):
+    def test_storage_prefetch_exception_emits_remaining_rank_acks(self):
+        pages = STORAGE_BATCH_SIZE + 1
+        for successful_batches, expected_tokens in ((0, 0), (1, STORAGE_BATCH_SIZE)):
+            with self.subTest(successful_batches=successful_batches):
+                controller = HiCacheController.__new__(HiCacheController)
+                controller.page_size = 1
+                controller.prefetch_sync_queue = Queue()
+                controller._page_transfer_kv_batch = Mock(
+                    side_effect=[STORAGE_BATCH_SIZE] * successful_batches
+                    + [OSError("injected storage read failure")]
+                )
+                operation = SimpleNamespace(
+                    prefix_keys=None,
+                    pool_transfers=[],
+                    hash_value=[f"page-{index}" for index in range(pages)],
+                    host_indices=torch.arange(pages),
+                    request_id="prefetch-fault",
+                    is_terminated=lambda: False,
+                )
+
+                self.assertEqual(controller._page_transfer(operation), expected_tokens)
+                self.assertEqual(
+                    controller._page_transfer_kv_batch.call_count,
+                    successful_batches + 1,
+                )
+                acknowledgements = [
+                    controller.prefetch_sync_queue.get_nowait() for _ in range(2)
+                ]
+                self.assertTrue(controller.prefetch_sync_queue.empty())
+                self.assertEqual(
+                    [ack.completed_tokens for ack in acknowledgements],
+                    [expected_tokens] * 2,
+                )
+                self.assertTrue(
+                    all(ack.operation is operation for ack in acknowledgements)
+                )
+
     def test_two_rank_cache_mode_capacity_votes_before_transfer(self):
         with tempfile.TemporaryDirectory(prefix="cache-mode-rank-") as directory:
             torch.multiprocessing.spawn(
