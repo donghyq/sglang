@@ -1078,6 +1078,7 @@ class HiCacheController:
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
+        transfer_start = time.monotonic()
         prefix_keys = (
             operation.prefix_keys.copy() if operation.prefix_keys is not None else None
         )
@@ -1129,6 +1130,15 @@ class HiCacheController:
                 operation=operation,
             )
             self.prefetch_sync_queue.put(ack)
+        if (
+            getattr(self, "enable_storage_metrics", False)
+            and getattr(self, "storage_metrics_collector", None) is not None
+        ):
+            getattr(
+                self, "storage_metrics_collector"
+            ).observe_storage_prefetch_phase_duration(
+                time.monotonic() - transfer_start, "transfer"
+            )
         return completed_pages
 
     def _page_transfer_kv_batch(
@@ -1245,10 +1255,29 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                if (
+                    getattr(self, "enable_storage_metrics", False)
+                    and getattr(self, "storage_metrics_collector", None) is not None
+                ):
+                    getattr(
+                        self, "storage_metrics_collector"
+                    ).observe_storage_prefetch_phase_duration(
+                        time.monotonic() - operation.start_time, "queue"
+                    )
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
+                    lookup_start = time.monotonic()
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    if (
+                        getattr(self, "enable_storage_metrics", False)
+                        and getattr(self, "storage_metrics_collector", None) is not None
+                    ):
+                        getattr(
+                            self, "storage_metrics_collector"
+                        ).observe_storage_prefetch_phase_duration(
+                            time.monotonic() - lookup_start, "lookup"
+                        )
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1387,6 +1416,7 @@ class HiCacheController:
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         """Synchronize all ranks to agree on a PrefetchAck."""
+        sync_start = time.monotonic()
         if ack.completed_tokens is not None:
             # Determine the minimal successful prefix of tokens.
             completed_tokens_tensor = torch.tensor(
@@ -1398,3 +1428,12 @@ class HiCacheController:
                 self.prefetch_completion_sync_groups,
             )
             ack.completed_tokens = completed_tokens_tensor.item()
+        if (
+            getattr(self, "enable_storage_metrics", False)
+            and getattr(self, "storage_metrics_collector", None) is not None
+        ):
+            getattr(
+                self, "storage_metrics_collector"
+            ).observe_storage_prefetch_phase_duration(
+                time.monotonic() - sync_start, "sync"
+            )

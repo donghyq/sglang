@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.mem_cache.unified_cache.session_ref_tracker import SessionLifecycleState
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -378,6 +379,29 @@ class SessionController:
 
     def get(self, session_id: str) -> Optional[Session]:
         return self.sessions.get(session_id)
+
+    def mark_tool_waiting(self, session_id: str) -> None:
+        self._set_lifecycle(session_id, SessionLifecycleState.TOOL_WAITING)
+
+    def mark_ready_soon(self, session_id: str) -> Optional[bool]:
+        self._set_lifecycle(session_id, SessionLifecycleState.READY_SOON)
+        session = self.sessions.get(session_id)
+        if session is None or not session.req_nodes:
+            return None
+        latest_req = next(reversed(session.req_nodes.values())).req
+        return self.tree_cache.prefetch_session(session_id, latest_req)
+
+    def mark_active(self, session_id: str) -> None:
+        self._set_lifecycle(session_id, SessionLifecycleState.ACTIVE)
+
+    def mark_completed(self, session_id: str) -> None:
+        self._set_lifecycle(session_id, SessionLifecycleState.COMPLETED)
+
+    def _set_lifecycle(self, session_id: str, state: SessionLifecycleState) -> None:
+        if session_id not in self.sessions:
+            logger.warning("session id %s does not exist", session_id)
+            return
+        self.tree_cache.set_session_lifecycle(session_id, state)
 
     def open(self, recv_req: OpenSessionReqInput) -> OpenSessionReqOutput:
         session_id = recv_req.session_id

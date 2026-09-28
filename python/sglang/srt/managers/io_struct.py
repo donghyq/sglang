@@ -2314,6 +2314,17 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
+class UpdateSessionLifecycleReqInput(BaseReq, kw_only=True):
+    session_id: str
+    state: str
+
+
+class UpdateSessionLifecycleReqOutput(BaseReq, kw_only=True):
+    session_id: str
+    success: bool
+    prefetch_started: Optional[bool] = None
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool

@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
+    SessionLifecycleState,
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
@@ -2252,6 +2253,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.revoke_pending_prefetch(request)
         else:
             self._handle_prefetch_result(operation)
+        if (
+            getattr(self, "enable_storage_metrics", False)
+            and getattr(self, "storage_metrics_collector", None) is not None
+        ):
+            getattr(
+                self, "storage_metrics_collector"
+            ).observe_storage_prefetch_phase_duration(
+                time.monotonic() - operation.start_time, "scheduler_ready"
+            )
         return True
 
     def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
@@ -2311,6 +2321,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 request, completed_tokens, hash_value
             )
 
+        install_start = time.monotonic()
         fetched_key = prefetch_key[:completed_tokens]
         insert_result = self.tree_core.insert_host(
             last_host_node_id,
@@ -2352,6 +2363,15 @@ class UnifiedRadixCache(BasePrefixCache):
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
             self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+        if (
+            getattr(self, "enable_storage_metrics", False)
+            and getattr(self, "storage_metrics_collector", None) is not None
+        ):
+            getattr(
+                self, "storage_metrics_collector"
+            ).observe_storage_prefetch_phase_duration(
+                time.monotonic() - install_start, "install"
+            )
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
@@ -2897,6 +2917,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             else:
                 aux_hit_tokens = hit_tokens
+            host_stage_start = time.monotonic()
             alloc_len = hit_tokens
             host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
@@ -2952,6 +2973,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
             if buffer_mode:
                 cc.prefetch_tokens_occupied += alloc_len
+            if (
+                getattr(self, "enable_storage_metrics", False)
+                and getattr(self, "storage_metrics_collector", None) is not None
+            ):
+                getattr(
+                    self, "storage_metrics_collector"
+                ).observe_storage_prefetch_phase_duration(
+                    time.monotonic() - host_stage_start, "host_stage"
+                )
             cc.prefetch_buffer.put(operation)
             return True
 
@@ -3527,7 +3557,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            h2d_start = time.monotonic()
+            load_back_result = self.load_back(best_match_node_id, mem_quota, req=req)
+            if (
+                getattr(self, "enable_storage_metrics", False)
+                and getattr(self, "storage_metrics_collector", None) is not None
+            ):
+                getattr(
+                    self, "storage_metrics_collector"
+                ).observe_storage_prefetch_phase_duration(
+                    time.monotonic() - h2d_start, "h2d"
+                )
+            if load_back_result:
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
@@ -3703,6 +3744,41 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_radix_session(self, session_id: str) -> int:
         return self.session_refs.release_radix_session(session_id)
+
+    def set_session_lifecycle(
+        self, session_id: str, state: SessionLifecycleState
+    ) -> None:
+        self.session_refs.set_session_lifecycle(session_id, state)
+
+    def prefetch_session(self, session_id: str, req: Req) -> Optional[bool]:
+        if not self.enable_storage or self.cache_controller is None:
+            return None
+        if req.last_node is None:
+            return None
+        # The saved request node can be removed or split while the session
+        # waits. Match its tokens again to find the current host/device copy.
+        tokens = req.origin_input_ids[:]
+        match = self.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(tokens, extra_key=req.extra_key, cache_salt=req.cache_salt)
+            )
+        )
+        if match.host_hit_length > 0:
+            return self.load_back(match.best_match_node)
+        if len(match.device_indices) >= len(tokens):
+            return False
+        synthetic_handle = CacheRequestHandle(f"_agent_prefetch_{session_id}", 0)
+        decision = self.prefetch_from_storage(
+            synthetic_handle,
+            self.root_node_handle(req.extra_key),
+            tokens,
+            matched_prefix_tokens=[],
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+        )
+        if decision is None:
+            return self.has_ongoing_prefetch(synthetic_handle)
+        return decision
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 

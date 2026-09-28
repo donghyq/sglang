@@ -149,6 +149,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateSessionLifecycleReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1645,6 +1646,21 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
     try:
         await _global_state.tokenizer_manager.close_session(obj, request)
         return Response(status_code=200)
+    except Exception as e:
+        return _create_error_response(e)
+
+
+@app.post("/update_session_lifecycle")
+async def update_session_lifecycle(
+    obj: Annotated[UpdateSessionLifecycleReqInput, Body()], request: Request
+):
+    """Apply an Agent lifecycle hint to an existing session."""
+    try:
+        result = await _global_state.tokenizer_manager.update_session_lifecycle(
+            obj, request
+        )
+        status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+        return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
     except Exception as e:
         return _create_error_response(e)
 

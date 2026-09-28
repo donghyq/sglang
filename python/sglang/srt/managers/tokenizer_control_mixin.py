@@ -73,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateSessionLifecycleReqInput,
+    UpdateSessionLifecycleReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -1006,6 +1008,21 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    async def update_session_lifecycle(
+        self: TokenizerManager,
+        obj: UpdateSessionLifecycleReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> UpdateSessionLifecycleReqOutput:
+        self.auto_create_handle_loop()
+        obj.rid = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.session_lifecycle_futures[obj.rid] = future
+        try:
+            self._dispatch_to_scheduler(obj)
+            return await asyncio.wait_for(future, timeout=30)
+        finally:
+            self.session_lifecycle_futures.pop(obj.rid, None)
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput

@@ -182,6 +182,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateSessionLifecycleReqInput,
+    UpdateSessionLifecycleReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1720,6 +1722,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (UpdateSessionLifecycleReqInput, self.update_session_lifecycle),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -5856,6 +5859,42 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def update_session_lifecycle(self, recv_req: UpdateSessionLifecycleReqInput):
+        controller = self.session_controller
+        success = recv_req.session_id in controller and hasattr(
+            controller.tree_cache, "set_session_lifecycle"
+        )
+        prefetch_started = None
+        if success:
+            if recv_req.state == "ACTIVE":
+                controller.mark_active(recv_req.session_id)
+            elif recv_req.state == "TOOL_WAITING":
+                controller.mark_tool_waiting(recv_req.session_id)
+            elif recv_req.state == "READY_SOON":
+                try:
+                    prefetch_started = controller.mark_ready_soon(recv_req.session_id)
+                except Exception:
+                    logger.exception(
+                        "Session %s background prefetch failed", recv_req.session_id
+                    )
+                    prefetch_started = False
+            elif recv_req.state == "COMPLETED":
+                controller.mark_completed(recv_req.session_id)
+            else:
+                success = False
+        if (
+            get_parallel().pp_rank == 0
+            and get_parallel().tp_rank == 0
+            and get_parallel().attn_cp_rank == 0
+        ):
+            return UpdateSessionLifecycleReqOutput(
+                rid=recv_req.rid,
+                session_id=recv_req.session_id,
+                success=success,
+                prefetch_started=prefetch_started,
+            )
+        return None
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.session_ref_tracker import SessionLifecycleState
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -189,7 +190,23 @@ class FullComponent(TreeComponent):
 
     def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
         ref = self.session_ref(node)
-        return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
+        session_ids = node.component_data[self.component_type].session_ids or ()
+        lifecycle_states = {
+            self.cache.session_refs.get_session_lifecycle(session_id)
+            for session_id in session_ids
+        }
+        tool_waiting_only = bool(
+            lifecycle_states
+            and SessionLifecycleState.TOOL_WAITING in lifecycle_states
+            and SessionLifecycleState.ACTIVE not in lifecycle_states
+            and SessionLifecycleState.READY_SOON not in lifecycle_states
+        )
+        return (
+            not tool_waiting_only,
+            ref > 0,
+            ref,
+            self.tree_core.eviction_strategy.get_priority(node),
+        )
 
     def _evict_device_start(self, request_cnt: int) -> None:
         self._ensure_eviction_strategy()

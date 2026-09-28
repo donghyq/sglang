@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -18,6 +19,14 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
 logger = logging.getLogger(__name__)
+
+
+class SessionLifecycleState(str, Enum):
+    ACTIVE = "ACTIVE"
+    TOOL_WAITING = "TOOL_WAITING"
+    READY_SOON = "READY_SOON"
+    COMPLETED = "COMPLETED"
+
 
 # Bounded guard against a request finishing after close. If a session id falls
 # out of this LRU after 8192 later closes, an extremely late finish can tag
@@ -42,6 +51,7 @@ class UnifiedSessionRefTracker:
         self._closed_session_ids: OrderedDict[str, None] = OrderedDict()
         self._session_incarnation_counter: int = 0
         self._session_generations: dict[str, int] = {}
+        self._session_lifecycle: dict[str, SessionLifecycleState] = {}
         for component in self.components:
             component.reset_session_state()
 
@@ -95,6 +105,16 @@ class UnifiedSessionRefTracker:
         if generation is None:
             generation = self.open_radix_session(session_id)
         return generation
+
+    def set_session_lifecycle(
+        self, session_id: str, state: SessionLifecycleState
+    ) -> None:
+        if not self.enable_session_radix_cache or session_id is None:
+            return
+        self._session_lifecycle[session_id] = state
+
+    def get_session_lifecycle(self, session_id: str) -> SessionLifecycleState:
+        return self._session_lifecycle.get(session_id, SessionLifecycleState.ACTIVE)
 
     def release_radix_session(self, session_id: str) -> int:
         if not self.enable_session_radix_cache or session_id is None:

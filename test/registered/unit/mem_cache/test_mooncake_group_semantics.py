@@ -102,6 +102,12 @@ def _fake_store_class():
         def get(self, key):
             return self.objects.get(key)
 
+        def batch_get_into(self, keys, ptrs, sizes):
+            return [
+                sizes[i] if key in self.existing_keys else -1
+                for i, key in enumerate(keys)
+            ]
+
         def batch_is_exist(self, keys):
             return [1 if key in self.existing_keys else 0 for key in keys]
 
@@ -211,6 +217,7 @@ class FakeMultiBufferPool:
 def _make_config(
     *,
     enable_group_semantics=True,
+    enable_generation_commit=False,
     extra_backend_tag=None,
     model_name=None,
     is_mla_model=False,
@@ -224,6 +231,7 @@ def _make_config(
         "check_server": False,
         "global_segment_size": 1024 * 1024,
         "enable_group_semantics": enable_group_semantics,
+        "enable_generation_commit": enable_generation_commit,
     }
     if extra_backend_tag is not None:
         extra_config["extra_backend_tag"] = extra_backend_tag
@@ -248,6 +256,7 @@ def _make_config(
 def _make_store(
     *,
     enable_group_semantics=True,
+    enable_generation_commit=False,
     replicate_config_cls=ReplicateConfigWithGroupIds,
     extra_backend_tag=None,
     model_name=None,
@@ -260,6 +269,7 @@ def _make_store(
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
         enable_group_semantics=enable_group_semantics,
+        enable_generation_commit=enable_generation_commit,
         extra_backend_tag=extra_backend_tag,
         model_name=model_name,
         is_mla_model=is_mla_model,
@@ -286,6 +296,88 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_generation_commit_success_writes_manifest_last(self):
+        store, fake_store = _make_store(enable_generation_commit=True)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        manifest_key = store._manifest_key("page0")
+        manifest = store._read_manifest("page0")
+
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["logical_key"], "page0")
+        self.assertEqual(len(manifest["members"]), 2)
+        self.assertIn(manifest_key, fake_store.objects)
+        self.assertIsInstance(fake_store.objects[manifest_key], bytes)
+        self.assertEqual(store.batch_exists(["page0"]), 1)
+
+    def test_generation_commit_manifest_is_rank_scoped(self):
+        rank0, _ = _make_store(enable_generation_commit=True, tp_rank=0, tp_size=2)
+        rank1, _ = _make_store(enable_generation_commit=True, tp_rank=1, tp_size=2)
+
+        self.assertNotEqual(rank0._manifest_key("page0"), rank1._manifest_key("page0"))
+
+    def test_generation_commit_read_requires_manifest(self):
+        store, fake_store = _make_store(enable_generation_commit=True)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+
+        self.assertEqual(store.batch_get_v1(["page0"], torch.tensor([0])), [True])
+
+        fake_store.objects.pop(store._manifest_key("page0"))
+        self.assertEqual(store.batch_get_v1(["page0"], torch.tensor([0])), [False])
+
+    def test_generation_commit_partial_write_does_not_publish_manifest(self):
+        store, fake_store = _make_store(enable_generation_commit=True)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_results = [0, -1]
+
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [False])
+        self.assertIsNone(store._read_manifest("page0"))
+        self.assertEqual(store.batch_exists(["page0"]), 0)
+
+    def test_generation_commit_retry_uses_new_generation(self):
+        store, fake_store = _make_store(enable_generation_commit=True)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        fake_store.batch_put_results = [0, -1]
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [False])
+        first_keys = list(fake_store.existing_keys)
+
+        fake_store.batch_put_results = None
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        second_keys = fake_store.batch_put_calls[-1]["keys"]
+
+        self.assertNotEqual(first_keys, second_keys)
+        self.assertEqual(store.batch_exists(["page0"]), 1)
+        self.assertIsNotNone(store._read_manifest("page0"))
+
+    def test_generation_commit_rejects_corrupt_manifest(self):
+        store, fake_store = _make_store(enable_generation_commit=True)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        for invalid_manifest in (
+            b"not-json",
+            b"[]",
+            b"\xff",
+            b'{"schema_version":1,"logical_key":"page0","generation":"g","members":[1]}',
+            b'{"schema_version":1,"logical_key":"page0","generation":"g","members":["k","k"]}',
+        ):
+            with self.subTest(invalid_manifest=invalid_manifest):
+                fake_store.objects[store._manifest_key("page0")] = invalid_manifest
+                self.assertIsNone(store._read_manifest("page0"))
+                self.assertEqual(store.batch_exists(["page0"]), 0)
+
+    def test_generation_commit_existing_manifest_skips_rewrite(self):
+        store, fake_store = _make_store(enable_generation_commit=True)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        calls_before = len(fake_store.batch_put_calls)
+        keys_before = set(fake_store.existing_keys)
+
+        self.assertEqual(store.batch_set_v1(["page0"], torch.tensor([0])), [True])
+
+        self.assertEqual(len(fake_store.batch_put_calls), calls_before)
+        self.assertEqual(fake_store.existing_keys, keys_before)
+
     def test_mha_registration_uses_full_kv_allocation(self):
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (

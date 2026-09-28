@@ -1922,6 +1922,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["outcome"],
         )
 
+        self.storage_prefetch_phase_duration_seconds = Histogram(
+            name="sglang:storage_prefetch_phase_duration_seconds",
+            documentation="Latency of a storage-prefetch pipeline phase.",
+            labelnames=list(labels.keys()) + ["phase"],
+        )
+
         self.storage_prefetch_unfulfilled_tokens_total = Counter(
             name="sglang:storage_prefetch_unfulfilled_tokens_total",
             documentation="Attempt-level storage-hit tokens that did not become "
@@ -2053,6 +2059,13 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     ) -> None:
         self.storage_prefetch_hit_duration_seconds.labels(
             **self.labels, outcome=outcome
+        ).observe(duration_seconds)
+
+    def observe_storage_prefetch_phase_duration(
+        self, duration_seconds: float, phase: str
+    ) -> None:
+        self.storage_prefetch_phase_duration_seconds.labels(
+            **self.labels, phase=phase
         ).observe(duration_seconds)
 
     def log_storage_prefetch_unfulfilled_tokens(

@@ -95,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateSessionLifecycleReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
@@ -669,6 +670,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.session_lifecycle_futures = {}  # request id -> asyncio event
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -831,6 +833,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (
+                    UpdateSessionLifecycleReqOutput,
+                    self._handle_session_lifecycle_req_output,
+                ),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -3499,6 +3505,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
+
+    def _handle_session_lifecycle_req_output(self, recv_obj):
+        future = self.session_lifecycle_futures.get(recv_obj.rid)
+        if future is None:
+            logger.warning(
+                "Session lifecycle response arrived after waiter cleanup: %s",
+                recv_obj.rid,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.model_update_expected_workers == 1:

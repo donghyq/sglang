@@ -403,6 +403,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self.enable_generation_commit = bool(
+                extra_config.get("enable_generation_commit", False)
+                if extra_config
+                else False
+            )
             self._use_group_semantics = (
                 self.enable_group_semantics
                 and self._supports_group_ids
@@ -766,6 +771,62 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return None
         return [group_ids[i] for i in indices]
 
+    def _manifest_key(self, logical_key: str) -> str:
+        # Each TP/PP rank has distinct KV members. A shared manifest key lets
+        # concurrent ranks overwrite one another's generation pointer.
+        rank_key = f"{self.local_rank}:{self.pp_rank}:{self.attn_cp_rank}"
+        return self._tag_keys(
+            [f"__sglang_generation_manifest__:{rank_key}:{logical_key}"]
+        )[0]
+
+    def _generation_key(self, logical_key: str, generation: str) -> str:
+        return f"{logical_key}__sglang_generation__{generation}"
+
+    def _read_manifest(self, logical_key: str) -> Optional[dict]:
+        raw = self.store.get(self._manifest_key(logical_key))
+        if raw is None:
+            return None
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            manifest = json.loads(raw)
+        except (TypeError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(manifest, dict):
+            return None
+        members = manifest.get("members")
+        if (
+            manifest.get("schema_version") != 1
+            or manifest.get("logical_key") != logical_key
+            or not isinstance(manifest.get("generation"), str)
+            or not isinstance(members, list)
+            or not manifest["generation"]
+            or not members
+            or any(not isinstance(member, str) or not member for member in members)
+            or len(set(members)) != len(members)
+        ):
+            return None
+        return manifest
+
+    def _write_manifest(
+        self, logical_key: str, generation: str, members: List[str]
+    ) -> None:
+        manifest = {
+            "schema_version": 1,
+            "logical_key": logical_key,
+            "generation": generation,
+            "members": members,
+        }
+        ret_code = self.store.put(
+            self._manifest_key(logical_key),
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        if ret_code != 0:
+            raise RuntimeError(
+                f"Failed to write generation manifest for {logical_key}: "
+                f"error code {ret_code}"
+            )
+
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
@@ -1094,7 +1155,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
-    def batch_get_v1(
+    def _batch_get_v1_impl(
         self,
         keys: List[str],
         host_indices: torch.Tensor,
@@ -1123,7 +1184,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         return self._batch_postprocess(get_results, is_set_operate=False)
 
-    def batch_set_v1(
+    def _batch_set_v1_impl(
         self,
         keys: List[str],
         host_indices: torch.Tensor,
@@ -1180,6 +1241,61 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_results[set_indices[i]] = put_results[i]
 
         return self._batch_postprocess(set_results, is_set_operate=True)
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if not self.enable_generation_commit:
+            return self._batch_get_v1_impl(keys, host_indices, extra_info)
+
+        generation_keys = []
+        for key in keys:
+            manifest = self._read_manifest(key)
+            if manifest is None:
+                return [False] * len(keys)
+            generation_keys.append(self._generation_key(key, manifest["generation"]))
+        return self._batch_get_v1_impl(generation_keys, host_indices, extra_info)
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if not self.enable_generation_commit:
+            return self._batch_set_v1_impl(keys, host_indices, extra_info)
+
+        generation_keys = []
+        generations = []
+        new_indices = []
+        for index, key in enumerate(keys):
+            manifest = self._read_manifest(key)
+            if manifest is None:
+                generation = uuid.uuid4().hex
+                generations.append(generation)
+                new_indices.append(index)
+            else:
+                generation = manifest["generation"]
+                generations.append(generation)
+            generation_keys.append(self._generation_key(key, generation))
+
+        results = self._batch_set_v1_impl(generation_keys, host_indices, extra_info)
+        if not all(results):
+            return results
+
+        page_size = self.mem_pool_host.page_size
+        for index in new_indices:
+            logical_key = keys[index]
+            generation_key = generation_keys[index]
+            member_keys, _, _ = self._batch_preprocess(
+                [generation_key],
+                host_indices[index * page_size : (index + 1) * page_size],
+            )
+            self._write_manifest(logical_key, generations[index], member_keys)
+        return results
 
     def set(
         self,
@@ -1304,7 +1420,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
-    def batch_exists(
+    def _batch_exists_impl(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         # Apply config prefix if available.
@@ -1332,6 +1448,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if exist_result[i] != 1:
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
+
+    def batch_exists(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        if not self.enable_generation_commit:
+            return self._batch_exists_impl(keys, extra_info)
+
+        generation_keys = []
+        for key in keys:
+            manifest = self._read_manifest(key)
+            if manifest is None:
+                return 0
+            generation_keys.append(self._generation_key(key, manifest["generation"]))
+        return self._batch_exists_impl(generation_keys, extra_info)
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
