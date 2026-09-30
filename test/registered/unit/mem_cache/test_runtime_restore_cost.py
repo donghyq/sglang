@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -171,6 +172,46 @@ class TestRuntimeRestoreCost(CustomTestCase):
             cache.release_aborted_request(operation.handle)
             self.assertEqual(cache._restore_cost_records, {})
             self.assertEqual(cache._restore_cost_declined, set())
+
+    def test_accepted_hit_timeout_and_cancel_cleanup(self):
+        with tempfile.TemporaryDirectory() as d:
+            filename = Path(d) / "profile.json"
+            p = profile()
+            p["buckets"][0]["restore_ttft_ms"] = [20, 22, 21]
+            filename.write_text(json.dumps(p))
+            cache, operation = _cache_mode_hit_fixture(8)
+            cache.linker = None
+            cache.prefetch_loaded_tokens_by_reqid = {}
+            cache.prefetch_loaded_storage_start_by_reqid = {}
+            cache._restore_cost_records = {}
+            cache._restore_cost_declined = set()
+            cache.restore_cost_gate = RuntimeRestoreCostGate(
+                str(filename), "30B", 2, 49152
+            )
+            cc = cache.cache_controller
+            cc.storage_backend_type = "mooncake"
+            cc.prefetch_tokens_occupied = 8
+            cache._drain_storage_control_queues_impl(1, 0, 0, 0, {}, False)
+            operation.start_time = time.monotonic() - 100
+            operation.completed_tokens = 4
+            operation.pool_transfers_done = False
+            cache.prefetch_stop_policy = "timeout"
+            cache.prefetch_timeout_base = 1.0
+            cache.prefetch_timeout_per_page = 0.1
+            cache.pp_rank = 0
+            cache._all_reduce = lambda *args: None
+            self.assertTrue(cache._can_terminate_prefetch(operation))
+            cc.terminate_prefetch = Mock(return_value=(4, operation.hash_value))
+            cache.release_aborted_request(operation.handle)
+            self.assertEqual(cache.ongoing_prefetch, {})
+            self.assertEqual(cache._restore_cost_records, {})
+            self.assertEqual(cache._restore_cost_declined, set())
+            self.assertEqual(cc.prefetch_tokens_occupied, 0)
+            # Completed prefix goes back once; unread tail remains IO-owned
+            # until the native termination ACK, as covered by lifecycle tests.
+            self.assertEqual(
+                cc.append_host_mem_release.call_args.kwargs["host_indices"].numel(), 4
+            )
 
     def test_shadow_never_rejects_and_observes_actual_restore(self):
         with tempfile.TemporaryDirectory() as d:
