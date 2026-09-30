@@ -600,6 +600,7 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        self._wait_agent_prefetch_fence()
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -1901,7 +1902,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 load_bucket=(self._agent_cost_record(kv_tokens) or {}).get("load_bucket", "idle"),
                 device_indices=device_indices)
             if sid in policy.attempts:
-                policy.record(sid, "H2D_STARTED", h2d_bytes=kv_tokens*policy.bytes_per_token)
+                policy.record(sid, "H2D_ENQUEUED", h2d_queued_bytes=kv_tokens*policy.bytes_per_token)
         self.ongoing_load_back[node_id] = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
@@ -3907,8 +3908,29 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
-            return self.cache_controller.start_loading()
+            cc = self.cache_controller
+            queued = [nid for operation in cc.load_queue for nid in operation.node_ids]
+            consumer = cc.start_loading()
+            policy = getattr(self, "agent_lifecycle", None)
+            if consumer >= 0 and policy is not None:
+                for nid in queued:
+                    load = policy.loads.get(nid)
+                    if load is not None and load["session_id"] in policy.attempts:
+                        policy.record(load["session_id"], "H2D_STARTED", consumer_index=consumer,
+                                      h2d_bytes=load["tokens"]*policy.bytes_per_token)
+            return consumer
         return 0
+
+    def _wait_agent_prefetch_fence(self):
+        policy = getattr(self, "agent_lifecycle", None)
+        event = getattr(policy, "gpu_fence", None)
+        if event is not None:
+            # A prefetched value enters the native radix tree before its DMA
+            # completes. Do not expose it as an L1 hit until the native fence
+            # is complete, including D matches that need no ordinary restore.
+            if not event.query():
+                event.synchronize()
+            policy.gpu_fence = None
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
@@ -4130,8 +4152,13 @@ class UnifiedRadixCache(BasePrefixCache):
         attempt = policy.attempts[session_id]
         match = self._agent_match(session_id)
         needed = len(attempt["tokens"])-len(match.device_indices)
+        cc = getattr(self, "cache_controller", None)
+        counter = getattr(cc, "layer_done_counter", None)
+        producer_ready = counter is None or counter.events[
+            (counter.producer_index+1) % counter.num_counters].finish_event.query()
         local_ready = (complete and needed > 0 and match.host_hit_length >= needed and
-                       self._agent_gpu_capacity() >= needed)
+                       self._agent_gpu_capacity() >= needed and producer_ready and
+                       not getattr(cc, "load_queue", ()))
         vote = torch.tensor([int(local_ready), needed, -needed], dtype=torch.int64, device="cpu")
         self._all_reduce_storage_admission(vote)
         if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
@@ -4147,7 +4174,12 @@ class UnifiedRadixCache(BasePrefixCache):
             load["session_id"] = session_id
             load["attempt_id"] = attempt["attempt_id"]
             load["query_started"] = policy.query_started.pop(handle, None)
-            policy.record(session_id, "H2D_STARTED", h2d_bytes=load["tokens"]*policy.bytes_per_token)
+            policy.record(session_id, "H2D_ENQUEUED", h2d_queued_bytes=load["tokens"]*policy.bytes_per_token)
+            # Advance the existing native loader even without a generation
+            # batch. Matching is fenced until this native producer completes.
+            consumer = self.ready_to_load_host_cache()
+            if consumer >= 0:
+                policy.gpu_fence = cc.layer_done_counter.events[consumer].finish_event
         return True
 
     def finish_agent_prefetch(self, session_id, state):
@@ -4207,7 +4239,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     load["session_id"] = session_id
                     load["attempt_id"] = policy.attempts[session_id]["attempt_id"]
                     policy.record(session_id, "ADMITTED", admission_basis="legacy_unconditional_host")
-                    policy.record(session_id, "H2D_STARTED", h2d_bytes=load["tokens"]*policy.bytes_per_token)
+                    policy.record(session_id, "H2D_ENQUEUED", h2d_queued_bytes=load["tokens"]*policy.bytes_per_token)
             return loaded
         if len(match.device_indices) >= len(tokens):
             if policy is not None:

@@ -100,6 +100,48 @@ class TestAgentLifecycleV1(CustomTestCase):
         cache.load_back.assert_not_called()
         self.assertEqual(self.policy.attempts["parent"]["state"], "CAPACITY_REJECT")
 
+    def test_warm_starts_native_loader_without_a_generation_batch(self):
+        self.ready()
+        self.policy.request("parent", 8192, "host")
+        self.policy.attempts["parent"].update(tokens=array("q",range(8192)))
+        event=Mock()
+        event.query.return_value=True
+        cc=SimpleNamespace(load_queue=[],layer_done_counter=SimpleNamespace(
+            producer_index=-1,num_counters=3,events=[SimpleNamespace(finish_event=event)]*3))
+        self.policy.loads[7]=dict(session_id=None,tokens=8192,device_indices=torch.arange(8192))
+        cache=SimpleNamespace(agent_lifecycle=self.policy,cache_controller=cc,
+            _agent_match=lambda _:SimpleNamespace(device_indices=torch.empty(0),host_hit_length=8192,best_match_node=7),
+            _agent_gpu_capacity=lambda:8192,_all_reduce_storage_admission=lambda _:None,
+            load_back=Mock(return_value=True),ready_to_load_host_cache=Mock(return_value=0))
+        self.assertTrue(UnifiedRadixCache._agent_warm_host(cache,"parent"))
+        cache.ready_to_load_host_cache.assert_called_once_with()
+        self.assertIs(self.policy.gpu_fence,event)
+
+    def test_pending_prefetch_is_fenced_before_a_device_match(self):
+        event=Mock()
+        event.query.return_value=False
+        self.policy.gpu_fence=event
+        complete = []
+        event.synchronize.side_effect=lambda:complete.append(True)
+        result=object()
+        def matched(_):
+            self.assertTrue(complete, "DMA must finish before exposing a device hit")
+            return result
+        cache=SimpleNamespace(agent_lifecycle=self.policy,session=SimpleNamespace(try_match_prefix=matched))
+        cache._wait_agent_prefetch_fence=lambda:UnifiedRadixCache._wait_agent_prefetch_fence(cache)
+        match=getattr(UnifiedRadixCache.match_prefix,"__wrapped__",UnifiedRadixCache.match_prefix)
+        self.assertIs(match(cache,object()),result)
+        event.synchronize.assert_called_once_with()
+        self.assertIsNone(self.policy.gpu_fence)
+
+    def test_native_loader_records_actual_start_not_only_enqueue(self):
+        self.policy.request("parent",8192,"host")
+        self.policy.loads[7]=dict(session_id="parent",tokens=8192)
+        cc=SimpleNamespace(load_queue=[SimpleNamespace(node_ids=[7])],start_loading=Mock(return_value=1))
+        cache=SimpleNamespace(agent_lifecycle=self.policy,cache_controller=cc,linker=None)
+        self.assertEqual(UnifiedRadixCache.ready_to_load_host_cache(cache),1)
+        self.assertEqual(self.policy.attempts["parent"]["state"],"H2D_STARTED")
+
     def test_old_generation_cannot_complete_new_session_attempt(self):
         self.ready()
         self.policy.request("parent", 8192, "host", generation=2)
