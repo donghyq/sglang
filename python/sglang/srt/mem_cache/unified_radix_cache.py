@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
+from sglang.srt.mem_cache.agent_lifecycle import AgentLifecycle
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -524,6 +525,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.tp_world_size,
                 self.cache_controller.mem_pool_host.anchor_entry.host_pool.size_per_token,
             )
+
+        import os
+        self.agent_lifecycle = AgentLifecycle(
+            "P" if server_args.disaggregation_mode == "prefill" else "D",
+            self.cache_controller.mem_pool_host.anchor_entry.host_pool.size_per_token,
+        )
+        self._lifecycle_cost_gate = self.restore_cost_gate
+        lifecycle_cost_file = os.getenv("SGLANG_AGENT_LIFECYCLE_COST_PROFILE")
+        if lifecycle_cost_file:
+            self._lifecycle_cost_gate = RuntimeRestoreCostGate(
+                lifecycle_cost_file, get_model().model_path, self.tp_world_size,
+                self.agent_lifecycle.bytes_per_token)
+        if self.agent_lifecycle.mode == "v1" and (
+            self.pp_size != 1 or self.host_memory_mode != "cache" or
+            set(self.tree_components) != {ComponentType.FULL}
+        ):
+            raise ValueError("Lifecycle V1 supports PP=1 FULL KV HiCache cache mode")
 
         # State initialization
         self.write_through_threshold = (
@@ -1022,6 +1040,13 @@ class UnifiedRadixCache(BasePrefixCache):
             req.kv.req_pool_idx, :owned_kv_len
         ]
 
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is not None and req.finished_reason is not None:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+            if not isinstance(req.finished_reason, FINISH_ABORT):
+                sid = getattr(req, "session_id", None) or getattr(getattr(req, "session", None), "session_id", None)
+                policy.consume(sid, kv_indices[:len(req.origin_input_ids)])
+
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             priority=req.priority or 0,
@@ -1353,9 +1378,15 @@ class UnifiedRadixCache(BasePrefixCache):
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
+                policy = getattr(self, "agent_lifecycle", None)
+                if policy is not None and any(a.get("gpu_indices") for a in policy.attempts.values()):
+                    policy.evicted(indices)
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, FreeDeviceKVFullOnly):
             for indices in action.indices:
+                policy = getattr(self, "agent_lifecycle", None)
+                if policy is not None and any(a.get("gpu_indices") for a in policy.attempts.values()):
+                    policy.evicted(indices)
                 self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
@@ -1854,6 +1885,23 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
 
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is not None:
+            handle = getattr(req, "cache_request_handle", None)
+            sid = policy.session_for_handle(handle)
+            if sid is None and req is not None:
+                sid = getattr(req, "session_id", None) or getattr(getattr(req, "session", None), "session_id", None)
+            attempt = policy.attempts.get(sid, {})
+            if not attempt.get("ever_admitted") or attempt.get("state") in {"REJECTED", "CANCELLED", "TIMEOUT", "CAPACITY_REJECT", "EVICTED_BEFORE_USE", "STORAGE_MISS", "CONSUMED"}:
+                sid = None
+            started = policy.query_started.pop(handle, None) if handle is not None else None
+            policy.loads[node_id] = dict(session_id=sid, tokens=kv_tokens,
+                attempt_id=attempt.get("attempt_id"),
+                h2d_started=time.monotonic(), query_started=started,
+                load_bucket=(self._agent_cost_record(kv_tokens) or {}).get("load_bucket", "idle"),
+                device_indices=device_indices)
+            if sid in policy.attempts:
+                policy.record(sid, "H2D_STARTED", h2d_bytes=kv_tokens*policy.bytes_per_token)
         self.ongoing_load_back[node_id] = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
@@ -2131,6 +2179,9 @@ class UnifiedRadixCache(BasePrefixCache):
             assume_stored=assume_stored,
         )
         operation = submission.operation
+        policy = getattr(self, "agent_lifecycle", None)
+        if operation is not None and policy is not None:
+            policy.query_started[request] = time.monotonic()
         if operation is None:
             assert submission.decision is not None
             self.cache_controller.append_host_mem_release(extra_pools=aux_xfers or None)
@@ -2405,6 +2456,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        policy = getattr(self, "agent_lifecycle", None)
+        sid = policy.session_for_handle(request) if policy is not None else None
+        if sid in getattr(policy, "attempts", {}):
+            stopped = policy.attempts[sid]["state"] in {"TIMEOUT", "CANCELLED"}
+            state = policy.attempts[sid]["state"] if stopped else ("HOST_READY" if completed_tokens > 0 and not insert_result.host_insert_dropped else "STORAGE_MISS")
+            policy.record(sid, state, transferred_bytes=completed_tokens*policy.bytes_per_token,
+                          installed_tokens=loaded_from_storage)
+            if policy.mode == "v1" and not stopped:
+                self._agent_warm_host(sid, complete=completed_tokens == len(prefetch_key) and not insert_result.host_insert_dropped)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
         if loaded_from_storage > 0:
@@ -2850,6 +2910,12 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        policy = getattr(self, "agent_lifecycle", None)
+        sid = policy.session_for_handle(request) if policy is not None else None
+        if policy is not None:
+            policy.query_started.pop(request, None)
+        if sid in getattr(policy, "attempts", {}) and policy.attempts[sid]["state"] not in {"REJECTED", "CANCELLED", "TIMEOUT", "CAPACITY_REJECT"}:
+            policy.record(sid, "STORAGE_MISS" if operation.storage_hit_count == 0 else "CAPACITY_REJECT")
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(request)
@@ -3133,9 +3199,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     and not operation.is_terminated()
                     and hit_tokens >= self.prefetch_threshold
                 )
+                policy = getattr(self, "agent_lifecycle", None)
+                sid = policy.session_for_handle(request) if policy is not None else None
+                lifecycle_permit = True
+                if sid in getattr(policy, "attempts", {}):
+                    policy.record(sid, "LOOKUP_HIT" if hit_tokens > 0 else "LOOKUP_MISS", hit_tokens=hit_tokens)
+                    if policy.mode == "v1":
+                        capacity = cc.mem_pool_host.available_size() >= hit_tokens and self._agent_gpu_capacity() >= hit_tokens
+                        lifecycle_permit, fields = policy.admission(sid, hit_tokens, "mooncake", capacity,
+                            self._agent_cost_record(hit_tokens), complete=hit_tokens == len(info.prefetch_key) if info is not None else False)
+                        policy.record(sid, "ADMISSION_EVALUATED", would_admit=lifecycle_permit, **fields)
+                        locally_ready = locally_ready and lifecycle_permit
                 if locally_ready:
                     host_indices = cc.mem_pool_host.alloc(hit_tokens)
-                    if host_indices is None:
+                    if host_indices is None and not (sid is not None and policy.mode == "v1"):
                         self.evict_host(hit_tokens)
                         host_indices = cc.mem_pool_host.alloc(hit_tokens)
                     locally_ready = host_indices is not None
@@ -3185,6 +3262,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.ongoing_prefetch[request] = info._replace(
                         host_indices=host_indices
                     )
+                    if sid in getattr(policy, "attempts", {}):
+                        policy.record(sid, "ADMITTED", tp_admitted=True)
+                        policy.record(sid, "TRANSFER_STARTED", requested_bytes=hit_tokens*policy.bytes_per_token)
                     cc.prefetch_buffer.put(operation)
                     continue
 
@@ -3196,6 +3276,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.discard_storage_prefetch_accounting(request)
                     continue
 
+                if sid in getattr(policy, "attempts", {}) and policy.mode == "v1":
+                    policy.record(sid, "REJECTED", reason=fields["reason"] if not lifecycle_permit else "peer_or_native_capacity_rejected", tp_admitted=False)
                 self._invalidate_absent_from_hit_query(operation)
                 self._account_prefetch_outcome(operation, revoked=True)
                 if hit_tokens > 0:
@@ -3644,6 +3726,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
+                policy = getattr(self, "agent_lifecycle", None)
+                load = policy.loads.pop(ack_id, None) if policy is not None else None
+                if load is not None:
+                    now = time.monotonic()
+                    policy.observe("host", load["tokens"], (now-load["h2d_started"])*1000, load.get("load_bucket", "idle"))
+                    if load["query_started"] is not None:
+                        policy.observe("mooncake", load["tokens"], (now-load["query_started"])*1000, load.get("load_bucket", "idle"))
+                    sid = load["session_id"]
+                    if sid in policy.attempts and load.get("attempt_id") == policy.attempts[sid].get("attempt_id") and policy.attempts[sid]["state"] not in {"CONSUMED", "CANCELLED", "TIMEOUT", "CAPACITY_REJECT", "EVICTED_BEFORE_USE", "REJECTED", "STORAGE_MISS"}:
+                        policy.attempts[sid]["gpu_indices"] = set(load["device_indices"].cpu().tolist())
+                        policy.record(sid, "GPU_READY")
+                        self._release_agent_host_retention(sid, "GPU_ready")
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -3773,6 +3867,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is not None and policy.mode == "v1":
+            for sid, entry in sorted(list(policy.host_retention.items())):
+                vote = torch.tensor([int(time.time() >= entry["expires_at"])], dtype=torch.int64, device="cpu")
+                self._all_reduce_storage_admission(vote)
+                if int(vote[0]):
+                    self._release_agent_host_retention(sid, "resume_hint_expired")
+            for handle in sorted(list(self.ongoing_prefetch), key=lambda h: h.rid):
+                sid = policy.session_for_handle(handle)
+                if sid not in policy.attempts:
+                    continue
+                operation = self.ongoing_prefetch[handle].operation
+                if not operation.is_terminated() and self._can_terminate_prefetch(operation):
+                    policy.record(sid, "TIMEOUT", reason="native_IO_timeout", cleanup="native_terminate_and_ACK")
+                    self.cache_controller.terminate_prefetch(operation)
+                    if operation.host_indices is None:
+                        self.revoke_pending_prefetch(handle)
+                    else:
+                        self._handle_prefetch_result(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -3880,7 +3993,199 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         self.session_refs.set_session_lifecycle(session_id, state)
 
+    def demote_agent_session(self, session_id, req):
+        policy = self.agent_lifecycle
+        if policy.mode != "v1":
+            return False
+        hint = policy.hints[session_id]
+        tokens = list(req.origin_input_ids) + list(req.output_ids)
+        match = self.match_prefix(MatchPrefixParams(key=RadixKey(tokens, extra_key=req.extra_key, cache_salt=req.cache_salt)))
+        node = self.tree_core.node_by_id(match.best_match_node)
+        cost = self._agent_cost_record(len(req.origin_input_ids))
+        recovery, _ = policy.estimate(len(req.origin_input_ids), "host", cost)
+        pressure = self._component_available_size(ComponentType.FULL) < len(req.origin_input_ids)
+        eligible = pressure and node.parent is not None and node in self.tree_core.evictable_device_leaves
+        if eligible:
+            eligible = policy.can_demote([session_id], node, ComponentType.FULL,
+                                        self.ongoing_write_through, recovery)
+        # Reserve the existing complete Host copy using native references, not
+        # a Store lease. The charged physical slots share the existing budget.
+        host_slots = set()
+        current = node
+        while current.parent is not None:
+            value = current.component_data[ComponentType.FULL].host_value
+            if value is not None:
+                host_slots.update(value.tolist())
+            current = current.parent
+        retained = set().union(*(entry["slots"] for entry in policy.host_retention.values()))
+        host_capacity = self.cache_controller.mem_pool_host.anchor_entry.host_pool.size
+        eligible = eligible and session_id not in policy.host_retention and len(retained | host_slots) <= host_capacity // 2
+        chain = []
+        current = node
+        while current.parent is not None:
+            cd = current.component_data[ComponentType.FULL]
+            if cd.value is not None:
+                if cd.lock_ref > 0:
+                    eligible = False
+                chain.append(current.id)
+            current = current.parent
+        identity = [(list(self.tree_core.node_by_id(nid).key.token_ids), self.tree_core.node_by_id(nid).key.cache_salt) for nid in chain]
+        signature = int.from_bytes(hashlib.blake2b(str(identity).encode(), digest_size=8).digest(), "little") & ((1<<62)-1)
+        vote = torch.tensor([int(eligible), signature, -signature], dtype=torch.int64, device="cpu")
+        self._all_reduce_storage_admission(vote)
+        if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
+            policy.emit(session_id, "DEMOTE_REJECTED", reason="reference_copy_cost_or_peer_constraint", fallback="native_LRU")
+            return False
+        receipt = self.inc_host_lock_ref(node.id).to_dec_params()
+        policy.host_retention[session_id] = dict(node_id=node.id, receipt=receipt, slots=host_slots,
+                                                expires_at=hint.expected_resume_at)
+        policy.emit(session_id, "HOST_RETAINED", physical_bytes=len(host_slots)*policy.bytes_per_token,
+                    expires_at=hint.expected_resume_at, budget_tokens=host_capacity//2)
+        tracker = {ct: 0 for ct in self.tree_components}
+        for node_id in chain:
+            current = self.tree_core.node_by_id(node_id)
+            if current not in self.tree_core.evictable_device_leaves:
+                break
+            self._demote(node_id, tracker)
+        released = tracker[ComponentType.FULL]
+        policy.emit(session_id, "DEMOTED", physical_bytes=released*policy.bytes_per_token,
+                    complete_host_copy=True, recovery_estimate_ms=recovery,
+                    expected_resume_at=hint.expected_resume_at)
+        return released > 0
+
+    def _release_agent_host_retention(self, session_id, reason):
+        policy = getattr(self, "agent_lifecycle", None)
+        entry = policy.host_retention.pop(session_id, None) if policy is not None else None
+        if entry is not None:
+            self.dec_host_lock_ref(entry["node_id"], entry["receipt"])
+            policy.emit(session_id, "HOST_RETENTION_RELEASED", reason=reason,
+                        physical_bytes=len(entry["slots"])*policy.bytes_per_token)
+
+    def _agent_gpu_capacity(self):
+        # Only native, unreferenced idle victims are reclaimable. Shared nodes
+        # are visited once; physical-slot union avoids alias double charging.
+        slots = set()
+        stack = list(self.tree_core.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            cd = node.component_data[ComponentType.FULL]
+            if cd.value is not None and cd.lock_ref == 0 and cd.session_ref == 0:
+                slots.update(cd.value.cpu().tolist())
+        return self._component_available_size(ComponentType.FULL) + len(slots)
+
+    def _agent_cost_record(self, tokens):
+        gate = getattr(self, "_lifecycle_cost_gate", None)
+        cc = self.cache_controller
+        if gate is None:
+            return None
+        busy = getattr(cc, "runtime_active_storage_reads", 0) or not cc.prefetch_buffer.empty()
+        return gate.evaluate(tokens, cc.storage_backend_type, "transfer_busy" if busy else "idle")
+
+    def _agent_match(self, session_id):
+        attempt = self.agent_lifecycle.attempts[session_id]
+        return self.match_prefix(MatchPrefixParams(key=RadixKey(
+            attempt["tokens"], extra_key=attempt["extra_key"], cache_salt=attempt["cache_salt"])))
+
+    def _agent_prefetch_candidate(self, session_id, req):
+        policy = self.agent_lifecycle
+        if not self.enable_storage or self.cache_controller is None:
+            return False
+        tokens = list(req.origin_input_ids)
+        if not policy.request(session_id, len(tokens), "pending_lookup", self.session_refs.ensure_session_generation(session_id)):
+            return False
+        attempt = policy.attempts[session_id]
+        attempt.update(tokens=tokens, extra_key=req.extra_key, cache_salt=req.cache_salt)
+        match = self._agent_match(session_id)
+        already_gpu = len(match.device_indices) >= len(tokens)
+        full_host = len(match.device_indices) + match.host_hit_length >= len(tokens)
+        source = "host" if full_host else "mooncake"
+        attempt["source_tier"] = source
+        capacity = self._agent_gpu_capacity() >= len(tokens)-len(match.device_indices)
+        permitted, fields = policy.admission(session_id, len(tokens), source, capacity, self._agent_cost_record(len(tokens)))
+        # All ranks receive this control request. Use the existing admission
+        # coordinator before issuing local IO; no rank may warm on its own.
+        if already_gpu:
+            permitted, fields = False, {"reason": "already_GPU_resident"}
+        vote = torch.tensor([int(permitted), int(full_host), -int(full_host)], dtype=torch.int64, device="cpu")
+        self._all_reduce_storage_admission(vote)
+        if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
+            policy.record(session_id, "REJECTED", **dict(fields, reason=fields["reason"] if not permitted else "peer_rejected"))
+            return False
+        if full_host:
+            policy.record(session_id, "LOOKUP_HIT", source_tier="host", hit_tokens=len(tokens))
+            attempt["admission_fields"] = fields
+            return self._agent_warm_host(session_id)
+        handle = CacheRequestHandle(attempt["handle"], attempt.get("attempt_id", 0))
+        decision = self.prefetch_from_storage(handle, self.root_node_handle(req.extra_key),
+            tokens, matched_prefix_tokens=[], extra_key=req.extra_key, cache_salt=req.cache_salt)
+        queued = self.has_ongoing_prefetch(handle) if decision is None else bool(decision)
+        if not queued:
+            policy.record(session_id, "REJECTED", reason="native_submission_declined")
+        return queued
+
+    def _agent_warm_host(self, session_id, complete=True):
+        policy = self.agent_lifecycle
+        attempt = policy.attempts[session_id]
+        match = self._agent_match(session_id)
+        needed = len(attempt["tokens"])-len(match.device_indices)
+        local_ready = (complete and needed > 0 and match.host_hit_length >= needed and
+                       self._agent_gpu_capacity() >= needed)
+        vote = torch.tensor([int(local_ready), needed, -needed], dtype=torch.int64, device="cpu")
+        self._all_reduce_storage_admission(vote)
+        if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
+            policy.record(session_id, "CAPACITY_REJECT", reason="host_span_or_GPU_capacity_changed", tp_admitted=False)
+            return False
+        handle = CacheRequestHandle(attempt["handle"], attempt.get("attempt_id", 0))
+        if not self.load_back(match.best_match_node):
+            policy.record(session_id, "CAPACITY_REJECT", reason="native_load_back_declined")
+            return False
+        load = policy.loads.get(match.best_match_node)
+        if load is not None:
+            policy.record(session_id, "ADMITTED", tp_admitted=True, **attempt.get("admission_fields", {}))
+            load["session_id"] = session_id
+            load["attempt_id"] = attempt["attempt_id"]
+            load["query_started"] = policy.query_started.pop(handle, None)
+            policy.record(session_id, "H2D_STARTED", h2d_bytes=load["tokens"]*policy.bytes_per_token)
+        return True
+
+    def finish_agent_prefetch(self, session_id, state):
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is None:
+            return
+        attempt = policy.attempts.get(session_id)
+        if attempt is None:
+            if state == "COMPLETED":
+                self._release_agent_host_retention(session_id, "session_completed")
+            return
+        if state == "ACTIVE":
+            attempt["resume_at"] = time.time()
+            return
+        self._release_agent_host_retention(session_id, "session_completed")
+        handle = CacheRequestHandle(attempt["handle"], attempt.get("attempt_id", 0))
+        policy.query_started.pop(handle, None)
+        pending = self.ongoing_prefetch.get(handle)
+        if pending is not None:
+            pending.operation.mark_terminate()
+            policy.record(session_id, "CANCELLED", reason="session_completed", cleanup="native_async_ACK")
+        else:
+            policy.record(session_id, "CONSUMED" if attempt["useful_bytes"] else "CANCELLED",
+                          reason="session_completed", useful_bytes=attempt["useful_bytes"],
+                          unused_l3_bytes=max(0, attempt["transferred_bytes"]-attempt["useful_bytes"]),
+                          unused_h2d_bytes=max(0, attempt.get("h2d_bytes", 0)-attempt["useful_bytes"]),
+                          last_execution_state=attempt["state"])
+
     def prefetch_session(self, session_id: str, req: Req) -> Optional[bool]:
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is not None and policy.mode == "native":
+            return False
+        if policy is not None and policy.mode == "v1":
+            return self._agent_prefetch_candidate(session_id, req)
+        if policy is not None:
+            policy.request(session_id, len(req.origin_input_ids), "native_v0")
+            policy.attempts[session_id]["tokens"] = list(req.origin_input_ids)
+            policy.attempts[session_id]["extra_key"] = req.extra_key
+            policy.attempts[session_id]["cache_salt"] = req.cache_salt
         if not self.enable_storage or self.cache_controller is None:
             return None
         if req.last_node is None:
@@ -3894,10 +4199,20 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
         if match.host_hit_length > 0:
-            return self.load_back(match.best_match_node)
+            loaded = self.load_back(match.best_match_node)
+            if loaded and policy is not None:
+                load = policy.loads.get(match.best_match_node)
+                if load is not None:
+                    load["session_id"] = session_id
+                    load["attempt_id"] = policy.attempts[session_id]["attempt_id"]
+                    policy.record(session_id, "ADMITTED", admission_basis="legacy_unconditional_host")
+                    policy.record(session_id, "H2D_STARTED", h2d_bytes=load["tokens"]*policy.bytes_per_token)
+            return loaded
         if len(match.device_indices) >= len(tokens):
+            if policy is not None:
+                policy.record(session_id, "REJECTED", reason="already_GPU_resident")
             return False
-        synthetic_handle = CacheRequestHandle(f"_agent_prefetch_{session_id}", 0)
+        synthetic_handle = CacheRequestHandle(f"_agent_prefetch_{session_id}", policy.attempts[session_id]["attempt_id"] if policy is not None else 0)
         decision = self.prefetch_from_storage(
             synthetic_handle,
             self.root_node_handle(req.extra_key),

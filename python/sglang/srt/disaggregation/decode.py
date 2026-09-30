@@ -1710,6 +1710,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _send_kv_metadata(
         self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
     ) -> None:
+        decode_req._agent_metadata_at = time.monotonic()
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
@@ -2470,6 +2471,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
+        policy = getattr(self.tree_cache, "agent_lifecycle", None)
+        prefix = decode_req.prefix_match
+        started = getattr(decode_req, "_agent_metadata_at", None)
+        if policy is not None and started is not None and (prefix is None or prefix.decode_prefix_len == 0):
+            policy.observe("pd_history", len(decode_req.req.origin_input_ids), (time.monotonic()-started)*1000,
+                           (self.tree_cache._agent_cost_record(len(decode_req.req.origin_input_ids)) or {}).get("load_bucket", "idle"))
 
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV

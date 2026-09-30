@@ -382,6 +382,42 @@ class SessionController:
     def get(self, session_id: str) -> Optional[Session]:
         return self.sessions.get(session_id)
 
+    def update_hint(self, recv_req):
+        from sglang.srt.mem_cache.agent_lifecycle import LifecycleHint
+        state = SessionLifecycleState(recv_req.state)
+        if recv_req.session_id not in self.sessions:
+            raise ValueError("unknown session id")
+        policy = getattr(self.tree_cache, "agent_lifecycle", None)
+        if policy is None:
+            if state == SessionLifecycleState.READY_SOON:
+                return self.mark_ready_soon(recv_req.session_id)
+            self._set_lifecycle(recv_req.session_id, state)
+            return None
+        hint = LifecycleHint(state.value, recv_req.expected_resume_at, recv_req.resume_lead_ms,
+                             recv_req.remaining_dependencies, recv_req.confidence, recv_req.reason)
+        policy.update(recv_req.session_id, hint)
+        tracker_state = state
+        if policy.mode == "v0" and state in {SessionLifecycleState.DEPENDENCY_BLOCKED, SessionLifecycleState.WAITING_INPUT}:
+            tracker_state = SessionLifecycleState.TOOL_WAITING
+        self._set_lifecycle(recv_req.session_id, tracker_state)
+        if state in {SessionLifecycleState.ACTIVE, SessionLifecycleState.COMPLETED}:
+            self.tree_cache.finish_agent_prefetch(recv_req.session_id, state.value)
+            return None
+        if policy.mode == "native":
+            return None
+        if policy.mode == "v1" and hint.remaining_dependencies != 0 and state in {SessionLifecycleState.TOOL_WAITING, SessionLifecycleState.DEPENDENCY_BLOCKED}:
+            session = self.sessions.get(recv_req.session_id)
+            if session is not None and session.req_nodes:
+                self.tree_cache.demote_agent_session(recv_req.session_id, next(reversed(session.req_nodes.values())).req)
+        candidate = state == SessionLifecycleState.READY_SOON or (
+            state in {SessionLifecycleState.TOOL_WAITING, SessionLifecycleState.DEPENDENCY_BLOCKED}
+            and hint.remaining_dependencies == 0)
+        session = self.sessions.get(recv_req.session_id)
+        if not candidate or session is None or not session.req_nodes:
+            return None
+        latest_req = next(reversed(session.req_nodes.values())).req
+        return self.tree_cache.prefetch_session(recv_req.session_id, latest_req)
+
     def mark_tool_waiting(self, session_id: str) -> None:
         self._set_lifecycle(session_id, SessionLifecycleState.TOOL_WAITING)
 
@@ -474,6 +510,11 @@ class SessionController:
                 mm.release_features()
             node.req.multimodal_inputs = None
 
+        policy = getattr(self.tree_cache, "agent_lifecycle", None)
+        if policy is not None:
+            self.tree_cache.finish_agent_prefetch(session_id, "COMPLETED")
+            policy.hints.pop(session_id, None)
+            policy.attempts.pop(session_id, None)
         self.tree_cache.release_radix_session(session_id)
         self.tree_cache.release_session(session_id)
         del self.sessions[session_id]

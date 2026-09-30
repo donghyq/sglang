@@ -5867,7 +5867,15 @@ class Scheduler(
         )
         prefetch_started = None
         if success:
-            if recv_req.state == "ACTIVE":
+            if hasattr(controller, "update_hint"):
+                try:
+                    prefetch_started = controller.update_hint(recv_req)
+                except (ValueError, TypeError):
+                    success = False
+                except Exception:
+                    logger.exception("Agent lifecycle hint failed; native request path retained")
+                    prefetch_started = False
+            elif recv_req.state == "ACTIVE":
                 controller.mark_active(recv_req.session_id)
             elif recv_req.state == "TOOL_WAITING":
                 controller.mark_tool_waiting(recv_req.session_id)
@@ -5893,6 +5901,9 @@ class Scheduler(
                 session_id=recv_req.session_id,
                 success=success,
                 prefetch_started=prefetch_started,
+                prefetch_state=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("state") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
+                prefetch_handle=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("handle") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
+                prefetch_reject_reason=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("reason") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
             )
         return None
 

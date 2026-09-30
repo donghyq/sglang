@@ -172,6 +172,13 @@ class FullComponent(TreeComponent):
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
+            policy = getattr(self.cache, "agent_lifecycle", None)
+            if policy is not None and any(a.get("gpu_indices") for a in policy.attempts.values()):
+                policy.evicted(cd.value)
+            if policy is not None:
+                for sid in cd.session_ids or ():
+                    policy.emit(sid, "DEVICE_RELEASED", node_id=node.id, physical_bytes=len(cd.value)*policy.bytes_per_token,
+                                host_copy_present=cd.host_value is not None, native_reference_protection=True)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
@@ -201,6 +208,11 @@ class FullComponent(TreeComponent):
             and SessionLifecycleState.ACTIVE not in lifecycle_states
             and SessionLifecycleState.READY_SOON not in lifecycle_states
         )
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        if policy is not None:
+            if policy.mode in {"native", "v1"}:
+                # V1 uses guarded explicit demote; ordinary victims keep LRU.
+                tool_waiting_only = False
         return (
             not tool_waiting_only,
             ref > 0,
@@ -248,6 +260,13 @@ class FullComponent(TreeComponent):
         self._evict_device_heap = []
         self._evict_device_last_node = None
 
+    def _host_eviction_strategy(self, node):
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        if policy is None or policy.mode == "v0":
+            return self.session_ref_eviction_strategy(node)
+        ref = self.session_ref(node)
+        return (True, ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node))
+
     def drive_host_eviction(
         self,
         num_tokens: int,
@@ -258,7 +277,7 @@ class FullComponent(TreeComponent):
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
         heap = [
-            (self.session_ref_eviction_strategy(n), n)
+            (self._host_eviction_strategy(n), n)
             for n in self.tree_core.evictable_host_leaves
         ]
         heapq.heapify(heap)
@@ -274,7 +293,7 @@ class FullComponent(TreeComponent):
             ):
                 heapq.heappush(
                     heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
+                    (self._host_eviction_strategy(x.parent), x.parent),
                 )
 
     def acquire_component_lock(

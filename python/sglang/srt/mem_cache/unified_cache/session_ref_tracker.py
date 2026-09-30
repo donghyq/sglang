@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 class SessionLifecycleState(str, Enum):
     ACTIVE = "ACTIVE"
     TOOL_WAITING = "TOOL_WAITING"
+    DEPENDENCY_BLOCKED = "DEPENDENCY_BLOCKED"
+    WAITING_INPUT = "WAITING_INPUT"
     READY_SOON = "READY_SOON"
     COMPLETED = "COMPLETED"
 
