@@ -58,6 +58,27 @@ def _recv(rid, input_ids, max_new_tokens=8):
     )
 
 
+class TestSessionReplace(CustomTestCase):
+    def test_replace_all_clears_a_request_tree_once(self):
+        session = Session(capacity_of_str_len=0, session_id="s")
+        root = session.create_req(_recv("root", [1, 2]), None, VOCAB)
+        child = session.create_req(_recv("child", [3, 4]), None, VOCAB)
+        root_node = session.req_nodes["root"]
+        child_node = session.req_nodes["child"]
+        root_node.children.append(child_node)
+        child_node.parent = root_node
+        other = session.create_req(_recv("other", [5, 6]), None, VOCAB)
+
+        replacement = _recv("replacement", [7, 8])
+        replacement.session_params.replace = True
+        req = session.create_req(replacement, None, VOCAB)
+
+        self.assertEqual(list(session.req_nodes), ["replacement"])
+        self.assertEqual(list(req.origin_input_ids), [7, 8])
+        for previous in (root, child, other):
+            self.assertIsNotNone(previous.to_finish)
+
+
 class TestSessionTokenShare(CustomTestCase):
     def setUp(self):
         self.session = Session(capacity_of_str_len=0, session_id="s", streaming=True)

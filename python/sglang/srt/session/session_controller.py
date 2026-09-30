@@ -241,8 +241,10 @@ class Session:
                 last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
-                for _, req_node in self.req_nodes.items():
-                    req_node.clear(self.req_nodes)
+                # Clearing a node also removes its descendants from req_nodes.
+                for rid, req_node in list(self.req_nodes.items()):
+                    if rid in self.req_nodes:
+                        req_node.clear(self.req_nodes)
             else:
                 if session_params.rid not in self.req_nodes:
                     abort = True
