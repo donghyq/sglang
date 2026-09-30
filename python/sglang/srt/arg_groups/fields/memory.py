@@ -171,6 +171,10 @@ class Memory(msgspec.Struct):
             choices=["best_effort", "wait_complete", "timeout"],
         ),
     ] = "timeout"
+    hicache_restore_cost_config: A[
+        Optional[str],
+        "Path to an atomically replaced JSON calibration/profile with mode off, shadow or enforce. Missing/invalid calibration preserves the existing restore policy.",
+    ] = None
     hicache_storage_backend_extra_config: A[
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",

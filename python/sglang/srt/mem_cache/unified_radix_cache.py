@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -10,7 +11,6 @@ from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
-
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -47,6 +47,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.restore_cost import (
+    RuntimeRestoreCostGate,
+    consensus_gate_action,
+)
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -398,6 +402,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self._storage_prefetch_hit_started_at: dict[CacheRequestHandle, float] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
+        self._restore_cost_declined = set()
+        self._restore_cost_records = {}
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
@@ -499,6 +505,24 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.cache_controller.host_write_staged_tokens_fn = lambda: (
                 self.buffer_pipeline.write_staged_tokens_
+            )
+
+        self.restore_cost_gate = None
+        cost_config = get_memory().hicache_restore_cost_config
+        if cost_config:
+            if (
+                self.pp_size != 1
+                or self.host_memory_mode != "cache"
+                or set(self.tree_components) != {ComponentType.FULL}
+            ):
+                raise ValueError(
+                    "Runtime restore cost gate currently supports PP=1 FULL KV in cache mode"
+                )
+            self.restore_cost_gate = RuntimeRestoreCostGate(
+                cost_config,
+                get_model().model_path,
+                self.tp_world_size,
+                self.cache_controller.mem_pool_host.anchor_entry.host_pool.size_per_token,
             )
 
         # State initialization
@@ -984,6 +1008,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "owned_kv_len"])
     def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
+        self._finish_restore_cost(
+            getattr(req, "cache_request_handle", None), "prefill_completed"
+        )
         if self.disable:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
             for comp in self._components_tuple:
@@ -1993,6 +2020,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         req_id = request.rid
+        if request in getattr(self, "_restore_cost_declined", ()):
+            return False
         self.storage_prefetch_retries.cancel(req_id)
         submission = self.cache_controller.get_prefetch_submission(req_id)
         if submission is not None:
@@ -2557,6 +2586,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def _finish_storage_prefetch(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
+        if reason != "cost_gate" and request not in getattr(
+            self, "_restore_cost_declined", ()
+        ):
+            self._finish_restore_cost(request, reason or "fulfilled", fulfilled_tokens)
         started_at = self._storage_prefetch_hit_started_at.pop(request, None)
         remaining = self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         if remaining is None:
@@ -2624,6 +2657,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
+        self._finish_restore_cost(request, "cancelled")
         rid = request.rid
         if self.linker is not None:
             self.linker.release_request(rid)
@@ -2836,6 +2870,91 @@ class UnifiedRadixCache(BasePrefixCache):
             - self._prefetch_occupied_span(prefetch_key, _host_indices),
         )
 
+    def _runtime_restore_cost_action(self, operation, hit_tokens: int, info) -> bool:
+        gate = getattr(self, "restore_cost_gate", None)
+        if gate is None or hit_tokens < self.prefetch_threshold:
+            return True
+        decision_start = time.perf_counter()
+        cc = self.cache_controller
+        # Count real queued/active storage IO, excluding this hit's own query.
+        busy = (
+            getattr(cc, "runtime_active_storage_reads", 0) > 0
+            or not cc.prefetch_buffer.empty()
+        )
+        pool = getattr(self, "req_to_token_pool", None)
+        occupied = (pool.size - len(pool.free_slots)) if pool is not None else 0
+        load_bucket = (
+            "transfer_busy" if busy else ("prefill_active" if occupied else "idle")
+        )
+        record = gate.evaluate(hit_tokens, cc.storage_backend_type, load_bucket)
+        record.update(
+            active_storage_reads=getattr(cc, "runtime_active_storage_reads", 0),
+            queued_storage_reads=cc.prefetch_buffer.qsize(),
+            occupied_prefill_request_slots=occupied,
+        )
+        fingerprint = hashlib.blake2b(digest_size=8)
+        for part in (
+            operation.handle.rid,
+            operation.handle.attempt_id,
+            operation.storage_start,
+            hit_tokens,
+            *(operation.hash_value or ()),
+        ):
+            value = str(part).encode("utf-8")
+            fingerprint.update(len(value).to_bytes(8, "little"))
+            fingerprint.update(value)
+        hit_signature = int.from_bytes(fingerprint.digest(), "little") & ((1 << 62) - 1)
+        vote = torch.tensor(
+            [
+                int(
+                    record["valid"] and record["mode"] == "enforce" and info is not None
+                ),
+                int(record["should_restore"]),
+                record["profile_signature"],
+                -record["profile_signature"],
+                hit_signature,
+                -hit_signature,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._all_reduce_storage_admission(vote)
+        if int(vote[4]) != -int(vote[5]):
+            raise RuntimeError("Storage prefetch hit order differs across ranks")
+        permit, fallback = consensus_gate_action(vote)
+        record.update(
+            request_id=operation.handle.rid,
+            attempt_id=operation.handle.attempt_id,
+            action="restore" if permit else "recompute",
+            tp_consistent=True,
+            fallback_reason=record["fallback_reason"] or fallback,
+            actual_path="pending",
+            alternative_path_cost_is_estimate=True,
+            decision_wall_ms=(time.perf_counter() - decision_start) * 1000,
+        )
+        if info is not None:
+            self._restore_cost_records[operation.handle] = record
+        logger.info("RESTORE_COST_GATE %s", json.dumps(record, sort_keys=True))
+        return permit
+
+    def _finish_restore_cost(self, request, status, fulfilled_tokens=0):
+        records = getattr(self, "_restore_cost_records", {})
+        record = records.pop(request, None)
+        getattr(self, "_restore_cost_declined", set()).discard(request)
+        if record is None:
+            return
+        if status == "prefill_completed":
+            # A positive restore outcome was already finalized at H2D admission.
+            actual = "recompute"
+        elif status == "cancelled":
+            actual = "cancelled"
+        else:
+            actual = "restore" if fulfilled_tokens > 0 else "restore_failed"
+        record.update(
+            actual_path=actual, outcome=status, fulfilled_tokens=fulfilled_tokens
+        )
+        logger.info("RESTORE_COST_OUTCOME %s", json.dumps(record, sort_keys=True))
+
     def _drain_storage_control_queues_impl(
         self,
         n_storage_hit: Optional[int],
@@ -2995,6 +3114,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 info = self.ongoing_prefetch.get(request)
                 if info is not None and hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
+
+                if not self._runtime_restore_cost_action(operation, hit_tokens, info):
+                    self._restore_cost_declined.add(request)
+                    self.storage_prefetch_retries.cancel(request.rid)
+                    operation.mark_terminate()
+                    if info is not None:
+                        self._account_prefetch_outcome(operation, revoked=True)
+                        self._finish_storage_prefetch(
+                            request, fulfilled_tokens=0, reason="cost_gate"
+                        )
+                        self.revoke_pending_prefetch(request)
+                    continue
 
                 host_indices = None
                 locally_ready = (

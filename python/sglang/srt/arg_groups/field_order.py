@@ -362,6 +362,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_mem_layout",
     "hicache_storage_backend",
     "hicache_storage_prefetch_policy",
+    "hicache_restore_cost_config",
     "hicache_storage_backend_extra_config",
     "hicache_storage_prefetch_retry_poll_interval",
     "hicache_storage_prefetch_retry_max_attempts",

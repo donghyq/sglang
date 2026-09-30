@@ -1269,8 +1269,14 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
-        with self.mem_pool_host.layout_lease():
-            return self._page_transfer_with_stable_layout(operation)
+        self.runtime_active_storage_reads = (
+            getattr(self, "runtime_active_storage_reads", 0) + 1
+        )
+        try:
+            with self.mem_pool_host.layout_lease():
+                return self._page_transfer_with_stable_layout(operation)
+        finally:
+            self.runtime_active_storage_reads -= 1
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count

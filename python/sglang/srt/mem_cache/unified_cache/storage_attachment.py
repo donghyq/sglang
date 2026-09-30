@@ -253,6 +253,12 @@ class StorageAttachment:
             )
         else:
             cache.storage_metrics_collector = None
+        # Startup and runtime attach/detach must publish the same collector to
+        # the storage IO threads; otherwise queue/lookup/transfer/sync vanish.
+        if getattr(cache, "cache_controller", None) is not None:
+            cache.cache_controller.storage_metrics_collector = (
+                cache.storage_metrics_collector
+            )
 
     def resolve_prefetch_threshold(self, configured: int) -> int:
         """Use the same complete-window minimum for every buffer-mode anchor."""
