@@ -6,11 +6,15 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodePrefixMatch,
+    HiCacheRestoreGatedKVReceiver,
+    HiCacheRestoreResult,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +22,42 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDecodeHiCacheTreeCore(CustomTestCase):
+    def test_asymmetric_dma_completion_keeps_poll_rank_local(self):
+        # One rank's event can finish before another's. Neither completion
+        # branch may enter a collective that the other rank skips.
+        for done in (True, False):
+            with self.subTest(event_done=done):
+                event = Mock()
+                event.query.return_value = done
+                cache = SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        layer_done_counter=SimpleNamespace(
+                            events=[SimpleNamespace(finish_event=event)]
+                        )
+                    ),
+                    loading_check=Mock(
+                        side_effect=AssertionError("conditional rank collective")
+                    ),
+                )
+                self.assertEqual(
+                    UnifiedRadixCache.is_load_back_event_done(cache, 0), done
+                )
+                cache.loading_check.assert_not_called()
+
+    def test_pd_success_waits_for_local_history_restore(self):
+        receiver = Mock()
+        receiver.poll.return_value = KVPoll.Success
+        req = SimpleNamespace(
+            kv_receiver=receiver,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+        )
+        gated = HiCacheRestoreGatedKVReceiver(req)
+        self.assertEqual(gated.poll(), KVPoll.Transferring)
+        req.hicache_restore_status = HiCacheRestoreResult.READY
+        self.assertEqual(gated.poll(), KVPoll.Success)
+        receiver.poll.return_value = KVPoll.Transferring
+        self.assertEqual(gated.poll(), KVPoll.Transferring)
+
     def test_storage_probe_and_prefetch_use_node_handles(self):
         ongoing_prefetch = {}
 

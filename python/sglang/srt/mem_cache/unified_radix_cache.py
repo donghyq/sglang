@@ -3801,10 +3801,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """Return True after the local load-back event is complete.
 
         Lets the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
-        controller-level ``layer_done_counter`` event is shared across cache
-        implementations, while the tree-side bookkeeping runs in
-        ``loading_check``.
+        (``DecodeHiCacheTransferMixin``) gate on load-back completion.
+        This is a rank-local query: CUDA events can complete at different
+        times across ranks. Tree-side bookkeeping, including its collectives,
+        runs unconditionally in the scheduler's ``check_hicache_events``.
         """
         if consumer_index < 0 or self.cache_controller is None:
             return True
@@ -3815,7 +3815,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if not finish_event.query():
             return False
 
-        self.loading_check()
         return True
 
     # ---- Query / Inspection APIs ----
