@@ -3998,7 +3998,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if policy.mode != "v1":
             return False
         hint = policy.hints[session_id]
-        tokens = list(req.origin_input_ids) + list(req.output_ids)
+        tokens = req.origin_input_ids[:]
+        tokens.extend(req.output_ids)
         match = self.match_prefix(MatchPrefixParams(key=RadixKey(tokens, extra_key=req.extra_key, cache_salt=req.cache_salt)))
         node = self.tree_core.node_by_id(match.best_match_node)
         cost = self._agent_cost_record(len(req.origin_input_ids))
@@ -4091,7 +4092,7 @@ class UnifiedRadixCache(BasePrefixCache):
         policy = self.agent_lifecycle
         if not self.enable_storage or self.cache_controller is None:
             return False
-        tokens = list(req.origin_input_ids)
+        tokens = req.origin_input_ids[:]
         if not policy.request(session_id, len(tokens), "pending_lookup", self.session_refs.ensure_session_generation(session_id)):
             return False
         attempt = policy.attempts[session_id]

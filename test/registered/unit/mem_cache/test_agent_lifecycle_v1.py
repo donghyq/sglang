@@ -1,5 +1,6 @@
 import math
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -7,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.agent_lifecycle import AgentLifecycle, LifecycleHint
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -79,7 +81,7 @@ class TestAgentLifecycleV1(CustomTestCase):
         node = SimpleNamespace(parent=root, id=1, key=[3, 4], component_data={ct: cd})
         self.ready(state="DEPENDENCY_BLOCKED", remaining_dependencies=2)
         self.assertTrue(self.policy.can_demote(["parent"], node, ct, {}, 400))
-        for host, pending, owner in [([1], {}, None), ([1, 2], {1: object()}, None), ([1, 2], {}, "active")]:
+        for host, pending, owner in [([1], {}, None), ([1, 2], {1: object()}, None), ([1,2], {99:SimpleNamespace(node_id=99,publish_node_ids=[1])}, None), ([1, 2], {}, "active")]:
             cd.host_value = host
             cd.session_ids = {"parent"} | ({owner} if owner else set())
             self.assertFalse(self.policy.can_demote(["parent"], node, ct, pending, 400))
@@ -134,6 +136,37 @@ class TestAgentLifecycleV1(CustomTestCase):
         self.assertEqual(req.cache_salt, "same-namespace")
         self.assertEqual(req.extra_key, "layout")
         self.assertEqual(req.origin_input_ids, list(range(8192)))
+
+    def test_candidate_matches_native_token_array_without_conversion(self):
+        self.ready(expected_resume_at=None)
+        tokens = array("q", range(8192))
+        key = RadixKey(tokens, extra_key="layout", cache_salt="namespace")
+        def match(params):
+            self.assertEqual(key.match(params.key), len(tokens))
+            return SimpleNamespace(device_indices=torch.empty(0), host_hit_length=0)
+        cache = SimpleNamespace(agent_lifecycle=self.policy, enable_storage=True, cache_controller=object(),
+            session_refs=SimpleNamespace(ensure_session_generation=lambda _:1), match_prefix=match,
+            _agent_gpu_capacity=lambda:8192, _agent_cost_record=lambda _:self.cost,
+            _all_reduce_storage_admission=lambda _:None, prefetch_from_storage=Mock())
+        cache._agent_match=lambda sid:UnifiedRadixCache._agent_match(cache,sid)
+        req=SimpleNamespace(origin_input_ids=tokens, extra_key="layout", cache_salt="namespace")
+        self.assertFalse(UnifiedRadixCache._agent_prefetch_candidate(cache,"parent",req))
+        cache.prefetch_from_storage.assert_not_called()
+
+    def test_demote_matches_native_history_and_output_arrays(self):
+        self.ready(state="DEPENDENCY_BLOCKED",remaining_dependencies=1)
+        root=SimpleNamespace(parent=None)
+        key=RadixKey(array("q",[1,2,3]),extra_key="layout",cache_salt="namespace")
+        def match(params):
+            self.assertEqual(key.match(params.key),3)
+            return SimpleNamespace(best_match_node=0)
+        cache=SimpleNamespace(agent_lifecycle=self.policy,match_prefix=match,
+            tree_core=SimpleNamespace(node_by_id=lambda _:root,evictable_device_leaves=set()),
+            _agent_cost_record=lambda _:self.cost,_component_available_size=lambda _:1024,
+            cache_controller=SimpleNamespace(mem_pool_host=SimpleNamespace(anchor_entry=SimpleNamespace(host_pool=SimpleNamespace(size=1024)))),
+            _all_reduce_storage_admission=lambda _:None)
+        req=SimpleNamespace(origin_input_ids=array("q",[1,2]),output_ids=array("q",[3]),extra_key="layout",cache_salt="namespace")
+        self.assertFalse(UnifiedRadixCache.demote_agent_session(cache,"parent",req))
 
     def test_consumption_counts_physical_intersection_and_eviction(self):
         self.ready()

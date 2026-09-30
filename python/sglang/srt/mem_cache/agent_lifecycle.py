@@ -80,7 +80,8 @@ class AgentLifecycle:
             attempt["ever_admitted"] = True
         if state == "GPU_READY":
             attempt["gpu_ready_at"] = time.time()
-        self.emit(session_id, state, handle=attempt["handle"], **fields)
+        self.emit(session_id, state, handle=attempt["handle"], attempt_id=attempt["attempt_id"],
+                  session_generation=attempt["generation"], **fields)
 
     def request(self, session_id, tokens, source, generation=0):
         previous = self.attempts.get(session_id)
@@ -171,6 +172,11 @@ class AgentLifecycle:
         if recovery_ms is None or any(h.confidence < 0.8 or h.expected_resume_at is None or
                                       (h.expected_resume_at-time.time())*1000 <= recovery_ms for h in hints):
             return False
+        pending_nodes = set(pending_writes)
+        for entry in pending_writes.values():
+            pending_nodes.update(getattr(entry, "node_ids", ()))
+            pending_nodes.update(getattr(entry, "publish_node_ids", ()))
+            pending_nodes.add(getattr(entry, "node_id", None))
         current = node
         while current.parent is not None:
             cd = current.component_data[component_type]
@@ -179,7 +185,7 @@ class AgentLifecycle:
                 return False
             if any(self.hints.get(sid) is None or self.hints[sid].state not in {"TOOL_WAITING", "DEPENDENCY_BLOCKED"} for sid in owners):
                 return False
-            if current.id in pending_writes or cd.host_value is None or len(cd.host_value) != len(current.key):
+            if current.id in pending_nodes or cd.host_value is None or len(cd.host_value) != len(current.key):
                 return False
             current = current.parent
         return True

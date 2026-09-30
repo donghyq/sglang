@@ -5874,6 +5874,9 @@ class Scheduler(
                     success = False
                 except Exception:
                     logger.exception("Agent lifecycle hint failed; native request path retained")
+                    policy = getattr(controller.tree_cache, "agent_lifecycle", None)
+                    if policy is not None:
+                        policy.record(recv_req.session_id, "REJECTED", reason="execution_failed")
                     prefetch_started = False
             elif recv_req.state == "ACTIVE":
                 controller.mark_active(recv_req.session_id)
@@ -5891,6 +5894,8 @@ class Scheduler(
                 controller.mark_completed(recv_req.session_id)
             else:
                 success = False
+        policy = getattr(controller.tree_cache, "agent_lifecycle", None)
+        attempt = policy.attempts.get(recv_req.session_id, {}) if policy is not None else {}
         if (
             get_parallel().pp_rank == 0
             and get_parallel().tp_rank == 0
@@ -5902,7 +5907,7 @@ class Scheduler(
                 success=success,
                 prefetch_started=prefetch_started,
                 prefetch_state=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("state") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
-                prefetch_handle=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("handle") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
+                prefetch_handle=(f'{attempt["handle"]}@{attempt["attempt_id"]}' if attempt else None),
                 prefetch_reject_reason=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("reason") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
             )
         return None
