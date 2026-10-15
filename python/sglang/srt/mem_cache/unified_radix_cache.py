@@ -4048,44 +4048,60 @@ class UnifiedRadixCache(BasePrefixCache):
         node = self.tree_core.node_by_id(match.best_match_node)
         cost = self._agent_cost_record(len(req.origin_input_ids))
         recovery, _ = policy.estimate(len(req.origin_input_ids), "host", cost)
-        pressure = self._component_available_size(ComponentType.FULL) < len(req.origin_input_ids)
-        eligible = pressure and node.parent is not None and node in self.tree_core.evictable_device_leaves
-        if eligible:
-            eligible = policy.can_demote([session_id], node, ComponentType.FULL,
-                                        self.ongoing_write_through, recovery)
+        free_tokens = self._component_available_size(ComponentType.FULL)
+        pressure = free_tokens < len(req.origin_input_ids)
+        details = {}
+        eligible = policy.can_retain_host([session_id], node, ComponentType.FULL,
+                                         getattr(self, "ongoing_write_through", {}), recovery, details)
+        if eligible and len(match.device_indices) + match.host_hit_length < len(req.origin_input_ids):
+            eligible = False
+            details["reason"] = "incomplete_history_match"
         # Reserve the existing complete Host copy using native references, not
         # a Store lease. The charged physical slots share the existing budget.
         host_slots = set()
+        host_identity = []
         current = node
         while current.parent is not None:
             value = current.component_data[ComponentType.FULL].host_value
             if value is not None:
                 host_slots.update(value.tolist())
+            host_identity.append((list(current.key.token_ids), current.key.extra_key, current.key.cache_salt))
             current = current.parent
         retained = set().union(*(entry["slots"] for entry in policy.host_retention.values()))
         host_capacity = self.cache_controller.mem_pool_host.anchor_entry.host_pool.size
-        eligible = eligible and session_id not in policy.host_retention and len(retained | host_slots) <= host_capacity // 2
-        chain = []
-        current = node
-        while current.parent is not None:
-            cd = current.component_data[ComponentType.FULL]
-            if cd.value is not None:
-                if cd.lock_ref > 0:
-                    eligible = False
-                chain.append(current.id)
-            current = current.parent
+        if eligible and session_id in policy.host_retention:
+            eligible = False
+            details["reason"] = "already_retained"
+        if eligible and len(retained | host_slots) > host_capacity // 2:
+            eligible = False
+            details["reason"] = "host_retention_budget"
+        chain = policy.demotable_chain(node, ComponentType.FULL) if eligible else []
         identity = [(list(self.tree_core.node_by_id(nid).key.token_ids), self.tree_core.node_by_id(nid).key.cache_salt) for nid in chain]
-        signature = int.from_bytes(hashlib.blake2b(str(identity).encode(), digest_size=8).digest(), "little") & ((1<<62)-1)
-        vote = torch.tensor([int(eligible), signature, -signature], dtype=torch.int64, device="cpu")
+        signature = int.from_bytes(hashlib.blake2b(str((host_identity, identity)).encode(), digest_size=8).digest(), "little") & ((1<<62)-1)
+        # Use the existing coordinator once for retention and immediate release.
+        # Retaining an existing Host copy must not depend on current GPU pressure.
+        release = pressure and bool(chain) and node in self.tree_core.evictable_device_leaves
+        vote = torch.tensor([int(eligible), signature, -signature, int(release)], dtype=torch.int64, device="cpu")
         self._all_reduce_storage_admission(vote)
+        policy.diagnose(session_id, "host_retention", local_eligible=eligible,
+                        local_reason=details.get("reason", "complete_host_copy"),
+                        free_tokens=free_tokens, pressure=pressure,
+                        host_copy_tokens=len(host_slots), retained_union_tokens=len(retained | host_slots),
+                        host_retention_budget_tokens=host_capacity//2,
+                        release_chain=chain, tp_vote=vote.tolist())
         if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
-            policy.emit(session_id, "DEMOTE_REJECTED", reason="reference_copy_cost_or_peer_constraint", fallback="native_LRU")
+            reason = details.get("reason", "peer_or_prefix_mismatch")
+            policy.emit(session_id, "DEMOTE_REJECTED", reason=reason, fallback="native_LRU")
             return False
         receipt = self.inc_host_lock_ref(node.id).to_dec_params()
         policy.host_retention[session_id] = dict(node_id=node.id, receipt=receipt, slots=host_slots,
                                                 expires_at=hint.expected_resume_at)
         policy.emit(session_id, "HOST_RETAINED", physical_bytes=len(host_slots)*policy.bytes_per_token,
                     expires_at=hint.expected_resume_at, budget_tokens=host_capacity//2)
+        if not int(vote[3]):
+            policy.emit(session_id, "DEMOTE_DEFERRED", reason="no_pressure_or_no_exclusive_native_leaf",
+                        free_tokens=free_tokens)
+            return False
         tracker = {ct: 0 for ct in self.tree_components}
         for node_id in chain:
             current = self.tree_core.node_by_id(node_id)
@@ -4107,16 +4123,29 @@ class UnifiedRadixCache(BasePrefixCache):
                         physical_bytes=len(entry["slots"])*policy.bytes_per_token)
 
     def _agent_gpu_capacity(self):
-        # Only native, unreferenced idle victims are reclaimable. Shared nodes
-        # are visited once; physical-slot union avoids alias double charging.
+        # Session association is a native eviction priority, not an allocator
+        # reference. Follow the native leaf frontier, including soft session
+        # refs, but never count locked KV or ancestors of a locked descendant.
+        # The allocator still chooses victims and rechecks actual capacity.
         slots = set()
-        stack = list(self.tree_core.root_node.children.values())
+        reclaimed = set()
+        stack = list(self.tree_core.evictable_device_leaves)
         while stack:
             node = stack.pop()
-            stack.extend(node.children.values())
+            if node.parent is None or node.id in reclaimed:
+                continue
+            if any(cd.lock_ref > 0 for cd in node.component_data):
+                continue
             cd = node.component_data[ComponentType.FULL]
-            if cd.value is not None and cd.lock_ref == 0 and cd.session_ref == 0:
+            if cd.value is not None:
                 slots.update(cd.value.cpu().tolist())
+            reclaimed.add(node.id)
+            parent = node.parent
+            if parent.parent is not None and all(
+                child.component_data[ComponentType.FULL].value is None or child.id in reclaimed
+                for child in parent.children.values()
+            ):
+                stack.append(parent)
         return self._component_available_size(ComponentType.FULL) + len(slots)
 
     def _agent_cost_record(self, tokens):
@@ -4146,7 +4175,9 @@ class UnifiedRadixCache(BasePrefixCache):
         full_host = len(match.device_indices) + match.host_hit_length >= len(tokens)
         source = "host" if full_host else "mooncake"
         attempt["source_tier"] = source
-        capacity = self._agent_gpu_capacity() >= len(tokens)-len(match.device_indices)
+        capacity_tokens = self._agent_gpu_capacity()
+        needed = len(tokens)-len(match.device_indices)
+        capacity = capacity_tokens >= needed
         permitted, fields = policy.admission(session_id, len(tokens), source, capacity, self._agent_cost_record(len(tokens)))
         # All ranks receive this control request. Use the existing admission
         # coordinator before issuing local IO; no rank may warm on its own.
@@ -4154,6 +4185,10 @@ class UnifiedRadixCache(BasePrefixCache):
             permitted, fields = False, {"reason": "already_GPU_resident"}
         vote = torch.tensor([int(permitted), int(full_host), -int(full_host)], dtype=torch.int64, device="cpu")
         self._all_reduce_storage_admission(vote)
+        policy.diagnose(session_id, "prefetch_admission", source_tier=source,
+                        device_hit_tokens=len(match.device_indices), host_hit_tokens=match.host_hit_length,
+                        needed_tokens=needed, native_reclaimable_capacity_tokens=capacity_tokens,
+                        local_permitted=permitted, decision=fields, tp_vote=vote.tolist())
         if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
             policy.record(session_id, "REJECTED", **dict(fields, reason=fields["reason"] if not permitted else "peer_rejected"))
             return False

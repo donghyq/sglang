@@ -7,8 +7,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.mem_cache.agent_lifecycle import AgentLifecycle, LifecycleHint
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,6 +86,101 @@ class TestAgentLifecycleV1(CustomTestCase):
             cd.host_value = host
             cd.session_ids = {"parent"} | ({owner} if owner else set())
             self.assertFalse(self.policy.can_demote(["parent"], node, ct, pending, 400))
+
+    def test_shared_ancestor_keeps_GPU_but_does_not_block_private_suffix(self):
+        ct = "FULL"
+        self.ready(state="DEPENDENCY_BLOCKED", remaining_dependencies=2)
+        root = SimpleNamespace(parent=None)
+        shared = SimpleNamespace(parent=root, id=1, key=list(range(10)), component_data={ct:
+            SimpleNamespace(value=list(range(10)), host_value=list(range(10)), lock_ref=0,
+                            session_ref=2, session_ids={"parent", "active"})})
+        private = SimpleNamespace(parent=shared, id=2, key=list(range(10, 8192)), component_data={ct:
+            SimpleNamespace(value=list(range(10, 8192)), host_value=list(range(10, 8192)),
+                            lock_ref=0, session_ref=1, session_ids={"parent"})})
+        self.assertTrue(self.policy.can_demote(["parent"], private, ct, {}, 400))
+        self.assertEqual(self.policy.demotable_chain(private, ct), [2])
+        shared.component_data[ct].host_value = None
+        self.assertFalse(self.policy.can_demote(["parent"], private, ct, {}, 400))
+
+    def test_native_capacity_counts_soft_refs_and_preserves_locked_branches(self):
+        ct = ComponentType.FULL
+        def node(parent, slots, locked=0, refs=0):
+            value = UnifiedTreeNode((ct,))
+            value.parent = parent
+            value.component_data[ct].value = torch.tensor(slots)
+            value.component_data[ct].lock_ref = locked
+            value.component_data[ct].session_ref = refs
+            if parent is not None:
+                parent.children[value.id] = value
+            return value
+        root = node(None, [])
+        shared = node(root, [1, 2], refs=2)
+        waiting = node(shared, [3, 4, 5], refs=1)
+        active = node(shared, [6, 7], locked=1, refs=1)
+        cache = SimpleNamespace(tree_core=SimpleNamespace(root_node=root,
+            evictable_device_leaves={waiting}), _component_available_size=lambda _: 2)
+        self.assertEqual(UnifiedRadixCache._agent_gpu_capacity(cache), 5)
+        active.component_data[ct].lock_ref = 0
+        cache.tree_core.evictable_device_leaves.add(active)
+        self.assertEqual(UnifiedRadixCache._agent_gpu_capacity(cache), 9)
+        # A stale candidate set cannot override a current native lock.
+        waiting.component_data[ct].lock_ref = 1
+        self.assertEqual(UnifiedRadixCache._agent_gpu_capacity(cache), 4)
+
+    def test_complete_host_copy_is_retained_before_GPU_pressure(self):
+        ct = ComponentType.FULL
+        self.ready(state="DEPENDENCY_BLOCKED", remaining_dependencies=3)
+        root = SimpleNamespace(parent=None)
+        class Node:
+            pass
+        node = Node()
+        node.id, node.parent = 1, root
+        node.key = RadixKey(array("q", [1, 2]), extra_key="layout", cache_salt=None)
+        node.component_data = {ct: SimpleNamespace(value=torch.tensor([10, 11]),
+            host_value=torch.tensor([20, 21]), lock_ref=0, session_ref=1, session_ids={"parent"})}
+        receipt = object()
+        cache = SimpleNamespace(agent_lifecycle=self.policy,
+            match_prefix=lambda _:SimpleNamespace(best_match_node=1, device_indices=torch.tensor([10,11]), host_hit_length=0),
+            tree_core=SimpleNamespace(node_by_id=lambda _:node, evictable_device_leaves={node}),
+            _agent_cost_record=lambda _:self.cost, _component_available_size=lambda _:1024,
+            ongoing_write_through={}, cache_controller=SimpleNamespace(mem_pool_host=SimpleNamespace(
+                anchor_entry=SimpleNamespace(host_pool=SimpleNamespace(size=1024)))),
+            _all_reduce_storage_admission=lambda _:None,
+            inc_host_lock_ref=Mock(return_value=SimpleNamespace(to_dec_params=lambda:receipt)), _demote=Mock())
+        req=SimpleNamespace(origin_input_ids=array("q",[1,2]), output_ids=array("q"), extra_key="layout", cache_salt=None)
+        self.assertFalse(UnifiedRadixCache.demote_agent_session(cache,"parent",req))
+        cache.inc_host_lock_ref.assert_called_once_with(1)
+        self.assertIs(self.policy.host_retention["parent"]["receipt"], receipt)
+        cache._demote.assert_not_called()
+        self.policy.host_retention.clear()
+        cache.inc_host_lock_ref.reset_mock()
+        def peer_reject(vote):
+            vote[0] = 0
+        cache._all_reduce_storage_admission = peer_reject
+        self.assertFalse(UnifiedRadixCache.demote_agent_session(cache,"parent",req))
+        cache.inc_host_lock_ref.assert_not_called()
+        cache._all_reduce_storage_admission = lambda _:None
+        cache.cache_controller.mem_pool_host.anchor_entry.host_pool.size = 2
+        self.assertFalse(UnifiedRadixCache.demote_agent_session(cache,"parent",req))
+        cache.inc_host_lock_ref.assert_not_called()
+
+    def test_retention_records_specific_incomplete_copy_reason(self):
+        ct = "FULL"
+        self.ready(state="DEPENDENCY_BLOCKED", remaining_dependencies=1)
+        root = SimpleNamespace(parent=None)
+        cd = SimpleNamespace(host_value=None)
+        node = SimpleNamespace(parent=root, id=1, key=[3,4], component_data={ct:cd})
+        details = {}
+        self.assertFalse(self.policy.can_retain_host(["parent"],node,ct,{},400,details))
+        self.assertEqual(details, {"reason":"incomplete_host_copy", "node_id":1})
+
+    def test_diagnostics_are_filtered_by_exact_session(self):
+        self.policy.emit = Mock()
+        self.policy.trace_sessions = {"parent"}
+        self.policy.diagnose("other", "admission", needed_tokens=8)
+        self.policy.emit.assert_not_called()
+        self.policy.diagnose("parent", "admission", needed_tokens=8)
+        self.policy.emit.assert_called_once_with("parent", "POLICY_CHECK", stage="admission", needed_tokens=8)
 
     def test_peer_capacity_rejection_issues_no_H2D(self):
         self.ready()

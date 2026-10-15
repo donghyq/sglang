@@ -56,6 +56,7 @@ class AgentLifecycle:
         self.host_retention = {}
         self.max_inflight = 1
         self.completed_requests = {}
+        self.trace_sessions = set(filter(None, os.getenv("SGLANG_AGENT_LIFECYCLE_TRACE_SESSIONS", "").split(",")))
 
     def remember_request(self, session_id, req, generation):
         if self.mode != "v1" or session_id is None or generation is None:
@@ -92,6 +93,10 @@ class AgentLifecycle:
             self.completed_requests.pop(session_id, None)
         self.emit(session_id, "HINT", hint=asdict(hint))
         return hint
+
+    def diagnose(self, session_id, stage, **fields):
+        if session_id in self.trace_sessions:
+            self.emit(session_id, "POLICY_CHECK", stage=stage, **fields)
 
     def record(self, session_id, state, **fields):
         attempt = self.attempts.get(session_id)
@@ -187,13 +192,21 @@ class AgentLifecycle:
             return False, dict(fields, reason="no_remaining_wait_benefit")
         return True, dict(fields, reason="overlap_reduces_resume_wait")
 
-    def can_demote(self, session_ids, node, component_type, pending_writes, recovery_ms=None):
+    def can_retain_host(self, session_ids, node, component_type, pending_writes,
+                        recovery_ms=None, details=None):
+        def reject(reason, **fields):
+            if details is not None:
+                details.update(reason=reason, **fields)
+            return False
+
         hints = [self.hints.get(sid) for sid in session_ids]
         if not hints or any(h is None or h.state not in {"TOOL_WAITING", "DEPENDENCY_BLOCKED"} for h in hints):
-            return False
+            return reject("not_waiting_for_dependencies")
         if recovery_ms is None or any(h.confidence < 0.8 or h.expected_resume_at is None or
                                       (h.expected_resume_at-time.time())*1000 <= recovery_ms for h in hints):
-            return False
+            return reject("missing_or_unfavorable_recovery_estimate")
+        if node.parent is None:
+            return reject("no_cached_prefix")
         pending_nodes = set(pending_writes)
         for entry in pending_writes.values():
             pending_nodes.update(getattr(entry, "node_ids", ()))
@@ -202,15 +215,39 @@ class AgentLifecycle:
         current = node
         while current.parent is not None:
             cd = current.component_data[component_type]
-            owners = getattr(cd, "session_ids", None) or ()
-            if getattr(cd, "session_ref", len(owners)) > 1:
-                return False
-            if any(self.hints.get(sid) is None or self.hints[sid].state not in {"TOOL_WAITING", "DEPENDENCY_BLOCKED"} for sid in owners):
-                return False
-            if current.id in pending_nodes or cd.host_value is None or len(cd.host_value) != len(current.key):
-                return False
+            if current.id in pending_nodes:
+                return reject("write_still_pending", node_id=current.id)
+            if cd.host_value is None or len(cd.host_value) != len(current.key):
+                return reject("incomplete_host_copy", node_id=current.id)
             current = current.parent
         return True
+
+    def demotable_chain(self, node, component_type):
+        # A shared ancestor does not prevent releasing an exclusive suffix.
+        # Stop before shared/active/locked KV; native leaf checks still apply.
+        chain = []
+        while node.parent is not None:
+            cd = node.component_data[component_type]
+            owners = getattr(cd, "session_ids", None) or ()
+            if (getattr(cd, "lock_ref", 0) > 0 or
+                getattr(cd, "session_ref", len(owners)) > 1 or
+                any(self.hints.get(sid) is None or self.hints[sid].state not in
+                    {"TOOL_WAITING", "DEPENDENCY_BLOCKED"} for sid in owners)):
+                break
+            if getattr(cd, "value", None) is not None:
+                chain.append(node.id)
+            node = node.parent
+        return chain
+
+    def can_demote(self, session_ids, node, component_type, pending_writes, recovery_ms=None):
+        if not self.can_retain_host(session_ids, node, component_type, pending_writes, recovery_ms):
+            return False
+        cd = node.component_data[component_type]
+        owners = getattr(cd, "session_ids", None) or ()
+        return (getattr(cd, "lock_ref", 0) == 0 and
+                getattr(cd, "session_ref", len(owners)) <= 1 and
+                all(self.hints.get(sid) is not None and self.hints[sid].state in
+                    {"TOOL_WAITING", "DEPENDENCY_BLOCKED"} for sid in owners))
 
     def consume(self, session_id, device_indices):
         attempt = self.attempts.get(session_id)
