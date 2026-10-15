@@ -108,6 +108,9 @@ class UnifiedSessionRefTracker:
             generation = self.open_radix_session(session_id)
         return generation
 
+    def get_session_generation(self, session_id: str) -> Optional[int]:
+        return self._session_generations.get(session_id)
+
     def set_session_lifecycle(
         self, session_id: str, state: SessionLifecycleState
     ) -> None:

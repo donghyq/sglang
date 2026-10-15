@@ -210,6 +210,63 @@ class TestAgentLifecycleV1(CustomTestCase):
         req=SimpleNamespace(origin_input_ids=array("q",[1,2]),output_ids=array("q",[3]),extra_key="layout",cache_salt="namespace")
         self.assertFalse(UnifiedRadixCache.demote_agent_session(cache,"parent",req))
 
+    def test_completed_radix_tag_keeps_native_key_type_without_request_handles(self):
+        req = SimpleNamespace(origin_input_ids=array("q", [1, 2]),
+                              output_ids=array("q", [3]), extra_key="layout",
+                              cache_salt="tenant", session_generation=2)
+        self.policy.remember_request("parent", req, 2)
+        req.origin_input_ids.append(99)
+        saved = self.policy.completed_request("parent", 2)
+        self.assertEqual(RadixKey(array("q", [1, 2]), extra_key="layout", cache_salt="tenant").match(
+            RadixKey(saved.origin_input_ids, extra_key=saved.extra_key, cache_salt=saved.cache_salt)), 2)
+        self.assertEqual(saved.output_ids, array("q", [3]))
+        self.assertFalse(hasattr(saved, "last_node"))
+        saved.origin_input_ids.append(88)
+        self.assertEqual(self.policy.completed_request("parent", 2).origin_input_ids, array("q", [1, 2]))
+
+    def test_completed_radix_tag_rejects_old_generation_and_native_mode(self):
+        req = SimpleNamespace(origin_input_ids=array("q", [1]), output_ids=array("q"),
+                              extra_key=None, cache_salt=None, session_generation=1)
+        self.policy.remember_request("parent", req, 2)
+        self.assertIsNone(self.policy.completed_request("parent", 2))
+        self.policy.remember_request("parent", req, 1)
+        self.assertIsNone(self.policy.completed_request("parent", 2))
+        self.policy.update("parent", LifecycleHint("COMPLETED"))
+        self.assertIsNone(self.policy.completed_request("parent", 1))
+        self.policy.mode = "native"
+        self.policy.remember_request("parent", req, 1)
+        self.assertFalse(self.policy.completed_requests)
+
+    def test_hint_uses_completed_explicit_history_without_native_append_nodes(self):
+        from sglang.srt.session.session_controller import Session, SessionController
+        req = SimpleNamespace(origin_input_ids=array("q", [1, 2]), output_ids=array("q", [3]),
+                              extra_key="layout", cache_salt="tenant", session_generation=2)
+        self.policy.remember_request("parent", req, 2)
+        cache = SimpleNamespace(agent_lifecycle=self.policy, set_session_lifecycle=Mock(),
+            get_session_lifecycle_request=lambda sid: self.policy.completed_request(sid, 2),
+            demote_agent_session=Mock(), prefetch_session=Mock(return_value=True))
+        controller = SessionController(cache)
+        controller.sessions["parent"] = Session(capacity_of_str_len=100)
+        hint = SimpleNamespace(session_id="parent", state="READY_SOON", expected_resume_at=1003,
+                               resume_lead_ms=None, remaining_dependencies=0, confidence=1, reason="test")
+        self.assertTrue(controller.update_hint(hint))
+        sid, saved = cache.prefetch_session.call_args.args
+        self.assertEqual(sid, "parent")
+        self.assertEqual(saved.origin_input_ids, array("q", [1, 2]))
+        self.assertFalse(controller.sessions["parent"].req_nodes)
+        hint.state, hint.remaining_dependencies = "DEPENDENCY_BLOCKED", 2
+        controller.update_hint(hint)
+        cache.demote_agent_session.assert_called_once()
+        self.assertEqual(cache.prefetch_session.call_count, 1)
+
+    def test_radix_close_discards_completed_hint_context(self):
+        self.policy.completed_requests["parent"] = object()
+        refs = SimpleNamespace(release_radix_session=Mock(return_value=0))
+        cache = SimpleNamespace(agent_lifecycle=self.policy, session_refs=refs)
+        self.assertEqual(UnifiedRadixCache.release_radix_session(cache, "parent"), 0)
+        self.assertNotIn("parent", self.policy.completed_requests)
+        refs.release_radix_session.assert_called_once_with("parent")
+
     def test_consumption_counts_physical_intersection_and_eviction(self):
         self.ready()
         self.policy.request("parent", 3, "host")

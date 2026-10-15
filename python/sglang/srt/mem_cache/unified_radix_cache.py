@@ -386,6 +386,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is not None:
+            policy.completed_requests.clear()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -1158,6 +1161,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.finished_reason, FINISH_ABORT
             ):
                 self.session_refs.register_session_ref(req)
+                policy = getattr(self, "agent_lifecycle", None)
+                if policy is not None and policy.mode == "v1":
+                    session_id = self.session_refs.session_id_for_req(req)
+                    policy.remember_request(
+                        session_id, req,
+                        self.session_refs.get_session_generation(session_id),
+                    )
 
     @rank_consensus(same_params=["req.rid", "chunked"])
     def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
@@ -2050,6 +2060,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         storage_hit_count = storage_hit_count_tensor.item()
         storage_hit_count -= storage_hit_count % self.page_size
+        # Decode publishes this length before submitting the truncated prefetch.
+        # A short hit cannot be promised if that submission would be skipped.
+        if storage_hit_count < self.prefetch_threshold:
+            return 0
         return storage_hit_count
 
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
@@ -4008,7 +4022,15 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.session_refs.ensure_session_generation(session_id)
 
     def release_radix_session(self, session_id: str) -> int:
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is not None:
+            policy.completed_requests.pop(session_id, None)
         return self.session_refs.release_radix_session(session_id)
+
+    def get_session_lifecycle_request(self, session_id: str):
+        return self.agent_lifecycle.completed_request(
+            session_id, self.session_refs.get_session_generation(session_id)
+        )
 
     def set_session_lifecycle(
         self, session_id: str, state: SessionLifecycleState

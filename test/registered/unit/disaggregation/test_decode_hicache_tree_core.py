@@ -22,6 +22,58 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDecodeHiCacheTreeCore(CustomTestCase):
+    def test_storage_probe_only_promises_prefetchable_prefix(self):
+        # A long query can have only a short remote hit. Decode publishes this
+        # result to prefill, so it must meet the actual prefetch threshold.
+        for storage_hit, page_size, expected in (
+            (0, 1, 0),
+            (10, 1, 0),
+            (255, 1, 0),
+            (256, 1, 256),
+            (255, 16, 0),
+            (300, 16, 288),
+        ):
+            with self.subTest(storage_hit=storage_hit, page_size=page_size):
+                cache = SimpleNamespace(
+                    enable_storage=True,
+                    cache_controller=SimpleNamespace(
+                        prefetch_rate_limited=Mock(return_value=False),
+                        _storage_hit_query=Mock(return_value=(None, storage_hit)),
+                    ),
+                    tree_core=SimpleNamespace(is_eagle=False),
+                    page_size=page_size,
+                    prefetch_threshold=256,
+                    _all_reduce_attn_groups=Mock(),
+                )
+                hit = UnifiedRadixCache.query_storage_hit_length(
+                    cache, 0, list(range(1024))
+                )
+                self.assertEqual(hit, expected)
+                cache._all_reduce_attn_groups.assert_called_once()
+
+    def test_storage_probe_applies_threshold_after_tp_min(self):
+        def reduce_to_short_peer_hit(value, _op):
+            value.fill_(10)
+
+        cache = SimpleNamespace(
+            enable_storage=True,
+            cache_controller=SimpleNamespace(
+                prefetch_rate_limited=Mock(return_value=False),
+                _storage_hit_query=Mock(return_value=(None, 512)),
+            ),
+            tree_core=SimpleNamespace(is_eagle=False),
+            page_size=1,
+            prefetch_threshold=256,
+            _all_reduce_attn_groups=Mock(side_effect=reduce_to_short_peer_hit),
+        )
+        self.assertEqual(
+            UnifiedRadixCache.query_storage_hit_length(
+                cache, 0, list(range(1024))
+            ),
+            0,
+        )
+        cache._all_reduce_attn_groups.assert_called_once()
+
     def test_asymmetric_dma_completion_keeps_poll_rank_local(self):
         # One rank's event can finish before another's. Neither completion
         # branch may enter a collective that the other rank skips.

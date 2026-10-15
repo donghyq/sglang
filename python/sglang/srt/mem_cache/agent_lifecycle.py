@@ -8,6 +8,7 @@ import os
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 WAIT_STATES = {"TOOL_WAITING", "DEPENDENCY_BLOCKED", "WAITING_INPUT"}
@@ -54,6 +55,25 @@ class AgentLifecycle:
         self.loads = {}
         self.host_retention = {}
         self.max_inflight = 1
+        self.completed_requests = {}
+
+    def remember_request(self, session_id, req, generation):
+        if self.mode != "v1" or session_id is None or generation is None:
+            return
+        if req.session_generation != generation:
+            return
+        # Keep only logical identity, never request objects or physical KV handles.
+        self.completed_requests[session_id] = (
+            generation, req.origin_input_ids[:], req.output_ids[:],
+            req.extra_key, req.cache_salt,
+        )
+
+    def completed_request(self, session_id, generation):
+        saved = self.completed_requests.get(session_id)
+        if self.mode != "v1" or saved is None or saved[0] != generation:
+            return None
+        return SimpleNamespace(origin_input_ids=saved[1][:], output_ids=saved[2][:],
+                               extra_key=saved[3], cache_salt=saved[4])
 
     @staticmethod
     def bucket(tokens):
@@ -68,6 +88,8 @@ class AgentLifecycle:
     def update(self, session_id, hint):
         hint = hint.validated(time.time())
         self.hints[session_id] = hint
+        if hint.state == "COMPLETED":
+            self.completed_requests.pop(session_id, None)
         self.emit(session_id, "HINT", hint=asdict(hint))
         return hint
 

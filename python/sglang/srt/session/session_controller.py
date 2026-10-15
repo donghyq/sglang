@@ -405,17 +405,24 @@ class SessionController:
             return None
         if policy.mode == "native":
             return None
+        session = self.sessions.get(recv_req.session_id)
+        latest_req = (
+            next(reversed(session.req_nodes.values())).req
+            if session is not None and session.req_nodes else None
+        )
+        if latest_req is None and policy.mode == "v1":
+            # Explicit-history Dynamo requests use radix session tags rather
+            # than the native history-append API. Hints may use their completed
+            # logical prefix; normal generation and KV matching stay native.
+            latest_req = self.tree_cache.get_session_lifecycle_request(recv_req.session_id)
         if policy.mode == "v1" and hint.remaining_dependencies != 0 and state in {SessionLifecycleState.TOOL_WAITING, SessionLifecycleState.DEPENDENCY_BLOCKED}:
-            session = self.sessions.get(recv_req.session_id)
-            if session is not None and session.req_nodes:
-                self.tree_cache.demote_agent_session(recv_req.session_id, next(reversed(session.req_nodes.values())).req)
+            if latest_req is not None:
+                self.tree_cache.demote_agent_session(recv_req.session_id, latest_req)
         candidate = state == SessionLifecycleState.READY_SOON or (
             state in {SessionLifecycleState.TOOL_WAITING, SessionLifecycleState.DEPENDENCY_BLOCKED}
             and hint.remaining_dependencies == 0)
-        session = self.sessions.get(recv_req.session_id)
-        if not candidate or session is None or not session.req_nodes:
+        if not candidate or latest_req is None:
             return None
-        latest_req = next(reversed(session.req_nodes.values())).req
         return self.tree_cache.prefetch_session(recv_req.session_id, latest_req)
 
     def mark_tool_waiting(self, session_id: str) -> None:
