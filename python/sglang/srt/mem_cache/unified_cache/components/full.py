@@ -296,6 +296,8 @@ class FullComponent(TreeComponent):
         self, node: UnifiedTreeNode, grouped_hints: dict | None = None
     ) -> tuple[int, int, int]:
         policy = getattr(self.cache, "agent_lifecycle", None)
+        if policy is None or policy.dag_mode == "off":
+            return 0, 0, 0
         distance, consumer_count = self._dag_raw_hints_for_node(node, grouped_hints)
         if distance is None:
             foreground_protected = node in getattr(
@@ -351,9 +353,6 @@ class FullComponent(TreeComponent):
         return True
 
     def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
-        dag_rank, dag_distance, _consumer_count = self._dag_hints_for_node(
-            node, getattr(self, "_dag_grouped_hints", None)
-        )
         policy = getattr(self.cache, "agent_lifecycle", None)
         ref = self.session_ref(node)
         session_ids = node.component_data[self.component_type].session_ids or ()
@@ -379,6 +378,9 @@ class FullComponent(TreeComponent):
                 ref,
                 self.tree_core.eviction_strategy.get_priority(node),
             )
+        dag_rank, dag_distance, _consumer_count = self._dag_hints_for_node(
+            node, getattr(self, "_dag_grouped_hints", None)
+        )
         stable_key = self._dag_stable_key(node)
         return (
             dag_rank,
