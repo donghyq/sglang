@@ -98,6 +98,7 @@ class TestDAGKVPolicy(CustomTestCase):
         )
         component.component_type = self.ct
         component._session_leaves = {}
+        component.session_ref_eviction_strategy = component._session_ref_eviction_strategy
         return component
 
     def test_off_keeps_bed4_eviction_key_and_rejects_state_events(self):
@@ -373,10 +374,10 @@ class TestDAGKVPolicy(CustomTestCase):
                      logical_time=1000.0, consumer_id="consumer", session_id="control")
             )[0]
         )
-        self.assertEqual(self.policy.dag_hints_for_session("session"), ())
+        self.assertFalse(self.policy.dag_hints_for_session("session"))
         self.assertTrue(self._consumer(seq=4, ttl_ms=1))
         self.policy.set_dag_logical_time(dict(logical_time=1002.0))
-        self.assertEqual(self.policy.dag_hints_for_session("session"), ())
+        self.assertFalse(self.policy.dag_hints_for_session("session"))
         self.assertTrue(self._consumer(seq=5))
         self.assertTrue(
             self.policy.handle_dag_event(
@@ -446,6 +447,9 @@ class TestDAGKVPolicy(CustomTestCase):
         )
         cache._agent_match = lambda _sid: SimpleNamespace(
             device_indices=torch.empty(0), host_hit_length=8, best_match_node=node.id
+        )
+        cache._agent_dag_victim_plan = lambda needed, sid: (
+            UnifiedRadixCache._agent_dag_victim_plan(cache, needed, sid)
         )
         req = SimpleNamespace(
             origin_input_ids=list(range(12)), extra_key="layout", cache_salt=None
@@ -535,6 +539,20 @@ class TestDAGKVPolicy(CustomTestCase):
         unprotected_near = next(n for n in near_nodes if n not in component._dag_protected_nodes)
         self.assertEqual(component._session_ref_eviction_strategy(unprotected_near)[0], 1)
         self.assertEqual(component._session_ref_eviction_strategy(ordinary)[0], 1)
+
+        # Isomorphic TP trees can have different local node creation order.
+        # The bounded protection budget must select the same logical prefix.
+        other_root = UnifiedTreeNode((self.ct,))
+        other_near = [self._node(other_root, 1, key_start=i) for i in reversed(range(4))]
+        other_ordinary = self._node(other_root, 1, key_start=4)
+        other_ordinary.last_access_time = 999.0
+        other = self._component(other_near + [other_ordinary], other_root)
+        other._session_leaves["session"] = set(other_near)
+        other._evict_device_start(5)
+        self.assertEqual(
+            {component._dag_stable_key(node) for node in component._dag_protected_nodes},
+            {other._dag_stable_key(node) for node in other._dag_protected_nodes},
+        )
 
     def test_decode_role_and_snapshot_use_same_protocol_without_dag_policy(self):
         self.policy.role = "D"

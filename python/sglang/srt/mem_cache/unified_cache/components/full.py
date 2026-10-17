@@ -445,7 +445,9 @@ class FullComponent(TreeComponent):
             self._dag_foreground_token_budget = int(
                 self._dag_candidate_tokens * policy.dag_foreground_token_fraction
             )
-            for node in leaves:
+            # The finite budget must be assigned identically on TP ranks;
+            # evictable leaves are a set with process-local iteration order.
+            for node in sorted(leaves, key=self._dag_stable_key):
                 self._dag_try_protect_node(node, self._dag_grouped_hints)
             ordinary = [
                 node
@@ -454,7 +456,9 @@ class FullComponent(TreeComponent):
             ]
             # Protect the most recently used ordinary foreground leaves up to a
             # finite token budget, so a stream of DAG hints cannot starve them.
-            ordinary.sort(key=lambda node: node.last_access_time, reverse=True)
+            ordinary.sort(
+                key=lambda node: (-node.last_access_time, self._dag_stable_key(node))
+            )
             for node in ordinary:
                 self._dag_try_protect_foreground_node(node, self._dag_grouped_hints)
         self._evict_device_request_cnt = request_cnt
