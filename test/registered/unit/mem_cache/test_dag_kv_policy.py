@@ -99,6 +99,14 @@ class TestDAGKVPolicy(CustomTestCase):
         component.component_type = self.ct
         component._session_leaves = {}
         component.session_ref_eviction_strategy = component._session_ref_eviction_strategy
+        nodes = [root] if root is not None else list(leaves)
+        total = 0
+        while nodes:
+            current = nodes.pop()
+            value = current.component_data[self.ct].value
+            total += len(value) if value is not None else 0
+            nodes.extend(current.children.values())
+        component.tree_core.component_evictable_size_ = {self.ct: total}
         return component
 
     def test_off_keeps_bed4_eviction_key_and_rejects_state_events(self):
@@ -236,6 +244,10 @@ class TestDAGKVPolicy(CustomTestCase):
         component.tree_core.evictable_device_leaves = {node12k}
         component._session_leaves["session"] = {node12k}
         self.assertEqual(component._dag_hints_for_node(node12k)[2], 0)
+        self.assertEqual(component._dag_stable_key(private), component._dag_stable_key(node12k))
+        before = component._dag_stable_key(private)
+        private.hash_value = ["storage-hash-materialized-later"]
+        self.assertEqual(component._dag_stable_key(private), before)
 
     def test_lock_and_inflight_io_are_hard_constraints(self):
         self.assertTrue(self._configure("eviction")[0])
@@ -270,7 +282,13 @@ class TestDAGKVPolicy(CustomTestCase):
         )
 
         self.assertTrue(self._configure("eviction")[0])
-        self.assertTrue(self._consumer(prefix_tokens=40))
+        self.assertTrue(self._consumer(prefix_tokens=8))
+        # This ancestor has a separate, genuinely covering future consumer.
+        component._session_leaves["shared-session"] = {shared}
+        self.assertTrue(self._consumer(
+            "shared-consumer", "shared-session", 2,
+            prefix_tokens=8, next_use_distance=2,
+        )[0])
         self.policy.emit = Mock()
         component._evict_device_start(2)
         self.assertEqual(
@@ -285,6 +303,12 @@ class TestDAGKVPolicy(CustomTestCase):
             plan_call.kwargs["native_candidate_order"],
             plan_call.kwargs["dag_candidate_order"],
         )
+        device_frees = {self.ct: []}
+        host_frees = {self.ct: []}
+        component.cache._pending_native_victim_frees = []
+        component.evict_component(ordinary, device_frees, host_frees)
+        # Full defers this clear to the native cascade, after sibling hooks.
+        ordinary.component_data[self.ct].value = None
         # After the child enters the native free path, its parent can join the
         # frontier. The parent receives the same shared-consumer coverage and
         # protection-budget accounting, rather than losing all hints.
@@ -293,10 +317,6 @@ class TestDAGKVPolicy(CustomTestCase):
         self.assertEqual(component._dag_raw_hints_for_node(shared)[0], 2)
         self.assertEqual(component._dag_candidate_tokens, 40)
         self.assertEqual(component._dag_protected_token_budget, 10)
-        device_frees = {self.ct: []}
-        host_frees = {self.ct: []}
-        component.cache._pending_native_victim_frees = []
-        component.evict_component(ordinary, device_frees, host_frees)
         event_names = [call.args[1] for call in self.policy.emit.call_args_list]
         self.assertIn("NATIVE_VICTIM_SELECTED", event_names)
         self.assertNotIn("NATIVE_VICTIM_FREED", event_names)

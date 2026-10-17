@@ -226,25 +226,28 @@ class FullComponent(TreeComponent):
         key = node.key
         if key is None:
             return 0
-        last_hash = node.get_last_hash_value()
-        if last_hash is not None:
-            # Storage-enabled production trees already carry namespace-aware
-            # page hashes. Use the terminal page identity instead of copying
-            # every token along the root path.
-            parts = [(last_hash, key.extra_key, key.cache_salt)]
-        else:
-            # Dependency-light unit trees may not compute page hashes; walk the
-            # logical path only on that fallback path.
-            parts = []
-            current = node
-            while current is not None and current.key is not None:
-                current_key = current.key
-                parts.append(
-                    (tuple(current_key.token_ids), current_key.extra_key, current_key.cache_salt)
-                )
-                current = current.parent
-        digest = hashlib.blake2b(repr(parts).encode("utf-8"), digest_size=8).digest()
-        return int.from_bytes(digest, "little", signed=False)
+        stamp = (id(key), len(key), id(node.parent), key.extra_key,
+                 key.cache_salt, key.is_bigram)
+        cached = getattr(node, "_agent_dag_identity", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        # Lazy storage hashes can be materialized on different iterations on
+        # TP ranks. Identity must also ignore radix edge split boundaries.
+        # These are existing CPU token arrays, never GPU page-index copies.
+        path = []
+        current = node
+        while current is not None and current.key is not None:
+            path.append(current.key)
+            current = current.parent
+        tokens = []
+        for part in reversed(path):
+            raw = part.raw_token_ids()
+            tokens.extend(raw[1:] if part.is_bigram and tokens else raw)
+        identity = (tuple(tokens), key.extra_key, key.cache_salt, key.is_bigram)
+        digest = hashlib.blake2b(repr(identity).encode("utf-8"), digest_size=8).digest()
+        value = int.from_bytes(digest, "little", signed=False)
+        node._agent_dag_identity = (stamp, value)
+        return value
 
     @staticmethod
     def _dag_node_range(node: UnifiedTreeNode) -> tuple[int, int]:
