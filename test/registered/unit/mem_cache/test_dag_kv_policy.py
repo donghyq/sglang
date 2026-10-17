@@ -1,3 +1,4 @@
+import json
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -137,7 +138,7 @@ class TestDAGKVPolicy(CustomTestCase):
         mismatch_cache = SimpleNamespace(
             agent_lifecycle=self.policy,
             _all_reduce_storage_admission=lambda vote: vote.__setitem__(
-                3, (int(vote[3]) + 1) % (1 << 62)
+                1, (int(vote[1]) + 1) % (1 << 62)
             ),
         )
         accepted, reason = UnifiedRadixCache.dag_configure_event(
@@ -575,6 +576,12 @@ class TestDAGKVPolicy(CustomTestCase):
         self.assertEqual(snapshot["host_total_tokens"], 80)
         self.assertEqual(snapshot["host_used_tokens"], 50)
         self.assertEqual(snapshot["host_free_tokens"], 30)
+        with patch("sglang.srt.mem_cache.agent_lifecycle.logger.info") as logged:
+            self.policy.emit(None, "NATIVE_SNAPSHOT", **snapshot)
+        emitted = json.loads(logged.call_args.args[1])
+        self.assertEqual(emitted["role"], "D")
+        self.assertEqual(emitted["mode"], "v1")
+        self.assertEqual(emitted["gpu_used_tokens"], 60)
 
 
 if __name__ == "__main__":

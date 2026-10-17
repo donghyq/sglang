@@ -152,7 +152,8 @@ class AgentLifecycle:
     def emit(self, session_id, state, **fields):
         from sglang.srt.runtime_context import get_parallel
         row = dict(session_id=session_id, state=state, role=self.role,
-                   rank=get_parallel().tp_rank, wall_time=time.time(), mode=self.mode, **fields)
+                   rank=get_parallel().tp_rank, wall_time=time.time(), mode=self.mode)
+        row.update(fields)
         logger.info("AGENT_LIFECYCLE %s", json.dumps(row, sort_keys=True, default=str))
 
     def update(self, session_id, hint):
@@ -225,7 +226,7 @@ class AgentLifecycle:
         self.native_eviction_events = 0
         self.native_victim_events = 0
         self.dag_stats["events_accepted"] += 1
-        self.emit(event.get("session_id"), "DAG_CONFIGURED", mode=mode,
+        self.emit(event.get("session_id"), "DAG_CONFIGURED", dag_mode=mode,
                   stable_history_prepare=self.dag_stable_history_prepare,
                   metadata_entries=self.dag_metadata_size())
         return True, None
