@@ -618,23 +618,24 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.match_prefix(params)
         policy = getattr(self, "agent_lifecycle", None)
         session_id = getattr(params.req, "session_id", None) if params.req is not None else None
-        if (policy is not None and session_id is not None and result.prefix_len > 0
+        device_hit_length = len(result.device_indices)
+        if (policy is not None and session_id is not None and device_hit_length > 0
                 and policy.consume_native_log_budget()):
             stable_key = None
             node_by_id = getattr(self.tree_core, "node_by_id", None)
             component = self.components.get(ComponentType.FULL)
             if node_by_id is not None and component is not None:
-                node = node_by_id(result.best_match_node)
+                node = node_by_id(result.last_device_node)
                 stable_key = component._dag_stable_key(node)
             policy.emit(
                 session_id,
                 "NATIVE_PREFIX_CONSUMED",
-                matched_tokens=result.prefix_len,
+                matched_tokens=device_hit_length,
                 stable_key=stable_key,
                 dag_mode=policy.dag_mode,
             )
             if policy.dag_mode != "off":
-                policy.dag_prefix_consumed(session_id, result.prefix_len)
+                policy.dag_prefix_consumed(session_id, device_hit_length)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)

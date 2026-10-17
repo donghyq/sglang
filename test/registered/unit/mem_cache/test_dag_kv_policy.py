@@ -1,4 +1,5 @@
 import json
+import inspect
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.mem_cache.agent_lifecycle import AgentLifecycle, LifecycleHint
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
@@ -119,6 +121,43 @@ class TestDAGKVPolicy(CustomTestCase):
         accepted, reason = self._consumer()
         self.assertFalse(accepted)
         self.assertEqual(reason, "dag_mode_off")
+
+    def test_native_match_observation_uses_actual_device_hit_not_host_hit(self):
+        root = UnifiedTreeNode((self.ct,))
+        root.key = RadixKey(array("q"), extra_key="layout")
+        gpu_node = self._node(root, 2)
+        host_node = self._node(gpu_node, 4, key_start=2)
+        component = self._component([host_node], root)
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.agent_lifecycle = self.policy
+        cache._wait_agent_prefetch_fence = lambda: None
+        cache.session = SimpleNamespace(try_match_prefix=lambda _params: None)
+        cache.disable = False
+        cache.components = {self.ct: component}
+        cache._components_tuple = ()
+        cache.linker = None
+        cache._apply_cache_actions = lambda _actions: None
+        nodes = {node.id: node for node in (root, gpu_node, host_node)}
+        result = MatchResult(
+            device_indices=torch.tensor([0, 1]), last_device_node=gpu_node.id,
+            last_host_node=host_node.id, best_match_node=host_node.id,
+            host_hit_length=4, full_kv_hit_length=6,
+        )
+        cache.tree_core = SimpleNamespace(match_prefix=lambda _params: result,
+                                         node_by_id=nodes.__getitem__)
+        params = MatchPrefixParams(key=RadixKey(array("q", range(6))),
+                                   req=SimpleNamespace(session_id="session"))
+        with patch.object(self.policy, "emit") as emit:
+            matched = inspect.unwrap(UnifiedRadixCache.match_prefix)(cache, params)
+        self.assertIs(matched, result)
+        self.assertEqual(emit.call_args.kwargs["matched_tokens"], 2)
+        self.assertEqual(emit.call_args.kwargs["stable_key"], component._dag_stable_key(gpu_node))
+        # A full Host-only match has no installed GPU prefix to report.
+        result = result._replace(device_indices=torch.tensor([], dtype=torch.int64),
+                                 last_device_node=root.id, full_kv_hit_length=6)
+        with patch.object(self.policy, "emit") as emit:
+            inspect.unwrap(UnifiedRadixCache.match_prefix)(cache, params)
+        emit.assert_not_called()
 
     def test_configure_only_at_idle_boundary_and_explicit_stable_history_flag(self):
         cache = SimpleNamespace(
