@@ -2317,6 +2317,7 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
 class UpdateSessionLifecycleReqInput(BaseReq, kw_only=True):
     session_id: str
     state: str
+    dag_event: Optional[dict] = None
     expected_resume_at: Optional[float] = None
     resume_lead_ms: Optional[float] = None
     remaining_dependencies: Optional[int] = None
@@ -2331,6 +2332,10 @@ class UpdateSessionLifecycleReqOutput(BaseReq, kw_only=True):
     prefetch_state: Optional[str] = None
     prefetch_handle: Optional[str] = None
     prefetch_reject_reason: Optional[str] = None
+    dag_mode: Optional[str] = None
+    dag_event_seq: Optional[int] = None
+    dag_reject_reason: Optional[str] = None
+    native_snapshot: Optional[dict] = None
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):

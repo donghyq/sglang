@@ -1291,7 +1291,9 @@ class Scheduler(
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
-        self.session_controller = SessionController(self.tree_cache)
+        self.session_controller = SessionController(
+            self.tree_cache, scheduler_idle=self.is_fully_idle
+        )
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -5866,8 +5868,25 @@ class Scheduler(
             controller.tree_cache, "set_session_lifecycle"
         )
         prefetch_started = None
+        dag_mode = None
+        dag_event_seq = None
+        dag_reject_reason = None
+        native_snapshot = None
         if success:
-            if hasattr(controller, "update_hint"):
+            dag_event = getattr(recv_req, "dag_event", None)
+            if dag_event is not None:
+                try:
+                    success, dag_reject_reason, dag_mode, dag_event_seq, prefetch_started, native_snapshot = (
+                        controller.handle_dag_event(recv_req)
+                    )
+                except (ValueError, TypeError):
+                    success = False
+                    dag_reject_reason = "invalid_dag_event"
+                except Exception:
+                    logger.exception("Agent DAG event failed; native request path retained")
+                    success = False
+                    dag_reject_reason = "execution_failed"
+            elif hasattr(controller, "update_hint"):
                 try:
                     prefetch_started = controller.update_hint(recv_req)
                 except (ValueError, TypeError):
@@ -5909,6 +5928,10 @@ class Scheduler(
                 prefetch_state=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("state") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
                 prefetch_handle=(f'{attempt["handle"]}@{attempt["attempt_id"]}' if attempt else None),
                 prefetch_reject_reason=(getattr(controller.tree_cache, "agent_lifecycle", None).attempts.get(recv_req.session_id, {}).get("reason") if getattr(controller.tree_cache, "agent_lifecycle", None) is not None else None),
+                dag_mode=dag_mode,
+                dag_event_seq=dag_event_seq,
+                dag_reject_reason=dag_reject_reason,
+                native_snapshot=native_snapshot,
             )
         return None
 

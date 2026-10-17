@@ -7,12 +7,25 @@ import math
 import os
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 WAIT_STATES = {"TOOL_WAITING", "DEPENDENCY_BLOCKED", "WAITING_INPUT"}
 TERMINAL = {"CONSUMED", "CANCELLED", "TIMEOUT", "CAPACITY_REJECT", "EVICTED_BEFORE_USE", "STORAGE_MISS", "REJECTED"}
+DAG_MODES = {"off", "eviction", "eviction_prefetch"}
+DAG_EVENT_KINDS = {
+    "configure", "consumer_upsert", "step_start", "step_complete",
+    "dependency_complete", "branch_cancel", "workflow_finish", "workflow_reset",
+    "tick", "snapshot",
+}
+DAG_CONSUMER_STATUSES = {"pending", "ready", "active", "cancelled", "completed"}
+DAG_MAX_TTL_MS = 60_000
+DAG_NEAR_USE_DISTANCE = 8
+DAG_PROTECTED_TOKEN_FRACTION = 0.25
+DAG_FOREGROUND_TOKEN_FRACTION = 0.25
+DAG_EARLY_WINDOW_FACTOR = 0.25
+DAG_MODE_CODES = {"off": 0, "eviction": 1, "eviction_prefetch": 2}
 
 
 @dataclass(frozen=True)
@@ -39,6 +52,34 @@ class LifecycleHint:
         return self
 
 
+@dataclass
+class DAGConsumerHint:
+    workflow_id: str
+    workflow_epoch: int
+    consumer_id: str
+    session_id: str
+    step_id: str
+    event_seq: int
+    prefix_tokens: int
+    next_use_distance: int | None
+    status: str
+    confidence: float
+    expected_resume_at: float | None
+    valid_until: float
+    stable_history_prepare: bool = False
+    allow_stable_history: bool = False
+    required_dependencies: int | None = None
+    completed_dependencies: int = 0
+    dependency_mode: str = "ALL"
+
+
+@dataclass
+class DAGWorkflowState:
+    epoch: int
+    last_seq: int
+    consumers: dict[str, DAGConsumerHint] = field(default_factory=dict)
+
+
 class AgentLifecycle:
     def __init__(self, role: str, bytes_per_token: int):
         self.mode = os.getenv("SGLANG_AGENT_LIFECYCLE_MODE", "native")
@@ -56,6 +97,34 @@ class AgentLifecycle:
         self.host_retention = {}
         self.max_inflight = 1
         self.completed_requests = {}
+        self.dag_mode = "off"
+        self.dag_stable_history_prepare = False
+        self.dag_workflows: dict[str, DAGWorkflowState] = {}
+        self.dag_max_workflows = 128
+        self.dag_max_consumers = 1024
+        self.dag_max_events = 10000
+        self.dag_max_ttl_ms = DAG_MAX_TTL_MS
+        self.dag_near_use_distance = DAG_NEAR_USE_DISTANCE
+        self.dag_protected_token_fraction = DAG_PROTECTED_TOKEN_FRACTION
+        self.dag_foreground_token_fraction = DAG_FOREGROUND_TOKEN_FRACTION
+        self.dag_early_window_factor = DAG_EARLY_WINDOW_FACTOR
+        # Common logical clock advanced only by broadcast management events.
+        # Expiry is never decided from independently sampled local clocks.
+        self.dag_logical_now = 0.0
+        self.dag_event_count = 0
+        self.native_consumption_log_budget = 4096
+        self.native_consumption_events = 0
+        self.native_eviction_log_budget = 4096
+        self.native_eviction_events = 0
+        self.native_victim_log_budget = 8192
+        self.native_victim_events = 0
+        self.dag_stats = {
+            "events_accepted": 0,
+            "events_rejected": 0,
+            "eviction_candidate_checks": 0,
+            "eviction_cpu_us": 0,
+            "metadata_entries": 0,
+        }
         self.trace_sessions = set(filter(None, os.getenv("SGLANG_AGENT_LIFECYCLE_TRACE_SESSIONS", "").split(",")))
 
     def remember_request(self, session_id, req, generation):
@@ -93,6 +162,343 @@ class AgentLifecycle:
             self.completed_requests.pop(session_id, None)
         self.emit(session_id, "HINT", hint=asdict(hint))
         return hint
+
+    def dag_metadata_size(self):
+        return len(self.dag_workflows) + sum(
+            len(state.consumers) for state in self.dag_workflows.values()
+        )
+
+    def _dag_reject(self, event, reason):
+        self.dag_stats["events_rejected"] += 1
+        self.emit(event.get("session_id"), "DAG_EVENT_REJECTED", kind=event.get("kind"), reason=reason)
+        return False, reason
+
+    def set_dag_logical_time(self, event):
+        value = event.get("logical_time")
+        if value is None:
+            return "missing_logical_time"
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return "invalid_logical_time"
+        self.dag_logical_now = float(value)
+        return None
+
+    def consume_native_log_budget(self):
+        if self.native_consumption_events >= self.native_consumption_log_budget:
+            return False
+        self.native_consumption_events += 1
+        return True
+
+    def consume_native_eviction_log_budget(self):
+        if self.native_eviction_events >= self.native_eviction_log_budget:
+            return False
+        self.native_eviction_events += 1
+        return True
+
+    def consume_native_victim_log_budget(self):
+        if self.native_victim_events >= self.native_victim_log_budget:
+            return False
+        self.native_victim_events += 1
+        return True
+
+    def configure_dag(self, event, idle=True):
+        mode = event.get("mode")
+        if mode not in DAG_MODES:
+            return self._dag_reject(event, "invalid_mode")
+        if self.role == "D":
+            # Decode accepts the broadcast for protocol compatibility but keeps
+            # its native path; P-side FULL KV is the only policy surface.
+            self.emit(event.get("session_id"), "DAG_CONFIGURE_IGNORED", reason="decode_role", requested_mode=mode)
+            return True, "decode_role_dag_disabled"
+        if self.mode != "v1":
+            return self._dag_reject(event, "lifecycle_mode_not_v1")
+        if not idle:
+            return self._dag_reject(event, "not_idle_window")
+        if self.dag_event_count >= self.dag_max_events:
+            return self._dag_reject(event, "event_budget")
+        self.dag_mode = mode
+        self.dag_stable_history_prepare = bool(event.get("stable_history_prepare", False))
+        if mode == "off":
+            self.dag_stable_history_prepare = False
+        self.dag_workflows.clear()
+        self.dag_event_count += 1
+        self.native_consumption_events = 0
+        self.native_eviction_events = 0
+        self.native_victim_events = 0
+        self.dag_stats["events_accepted"] += 1
+        self.emit(event.get("session_id"), "DAG_CONFIGURED", mode=mode,
+                  stable_history_prepare=self.dag_stable_history_prepare,
+                  metadata_entries=self.dag_metadata_size())
+        return True, None
+
+    def dag_configure_is_valid(self, event):
+        mode = event.get("mode")
+        if mode not in DAG_MODES:
+            return "invalid_mode"
+        if self.role != "D" and self.mode != "v1":
+            return "lifecycle_mode_not_v1"
+        if self.role != "D" and self.dag_event_count >= self.dag_max_events:
+            return "event_budget"
+        stable = event.get("stable_history_prepare", False)
+        if not isinstance(stable, bool):
+            return "invalid_stable_history_prepare"
+        return None
+
+    def _dag_validate_event(self, event):
+        workflow_id = event.get("workflow_id")
+        if not isinstance(workflow_id, str) or not workflow_id:
+            return "missing_workflow_id"
+        epoch = event.get("epoch")
+        seq = event.get("seq")
+        if not isinstance(epoch, int) or epoch < 0:
+            return "invalid_epoch"
+        if not isinstance(seq, int) or seq < 0:
+            return "invalid_seq"
+        kind = event.get("kind")
+        if kind == "consumer_upsert":
+            required = ("consumer_id", "session_id", "step_id", "prefix_tokens", "status")
+            if any(event.get(name) is None for name in required):
+                return "missing_consumer_fields"
+            consumer_id = event["consumer_id"]
+            if not isinstance(consumer_id, str) or not consumer_id:
+                return "invalid_consumer_id"
+            prefix_tokens = event["prefix_tokens"]
+            if not isinstance(prefix_tokens, int) or prefix_tokens <= 0:
+                return "invalid_prefix_tokens"
+            if event["status"] not in DAG_CONSUMER_STATUSES:
+                return "invalid_consumer_status"
+            confidence = event.get("confidence", 0.0)
+            if not math.isfinite(float(confidence)) or not 0 <= float(confidence) <= 1:
+                return "invalid_confidence"
+            distance = event.get("next_use_distance")
+            if distance is not None and (not isinstance(distance, int) or distance < 0):
+                return "invalid_next_use_distance"
+            expected = event.get("expected_resume_at")
+            if expected is not None and not math.isfinite(float(expected)):
+                return "invalid_expected_resume_at"
+            ttl_ms = event.get("ttl_ms", 60_000)
+            if not isinstance(ttl_ms, (int, float)) or not math.isfinite(float(ttl_ms)) or ttl_ms <= 0:
+                return "invalid_ttl"
+            required_dependencies = event.get("required_dependencies")
+            completed = event.get("completed_dependencies", 0)
+            remaining = event.get("remaining_dependencies")
+            dependency_mode = event.get("dependency_mode", "ALL")
+            if dependency_mode not in {"ALL"}:
+                return "unsupported_dependency_mode"
+            if required_dependencies is not None and (
+                not isinstance(required_dependencies, int) or required_dependencies < 0
+            ):
+                return "invalid_required_dependencies"
+            if not isinstance(completed, int) or completed < 0:
+                return "invalid_completed_dependencies"
+            if remaining is not None and (not isinstance(remaining, int) or remaining < 0):
+                return "invalid_remaining_dependencies"
+            if required_dependencies is None and remaining is not None:
+                required_dependencies = completed + remaining
+            if required_dependencies is not None and completed > required_dependencies:
+                return "completed_exceeds_required"
+            if (remaining is not None and required_dependencies is not None
+                    and required_dependencies - completed != remaining):
+                return "inconsistent_dependency_counts"
+        elif kind in {"step_complete", "dependency_complete", "branch_cancel"}:
+            consumer_id = event.get("consumer_id")
+            if not isinstance(consumer_id, str) or not consumer_id:
+                return "missing_consumer_id"
+        return None
+
+    def handle_dag_event(self, event, idle=True):
+        if not isinstance(event, dict):
+            return self._dag_reject({}, "invalid_event")
+        kind = event.get("kind")
+        if kind not in DAG_EVENT_KINDS:
+            return self._dag_reject(event, "invalid_kind")
+        reason = self.set_dag_logical_time(event)
+        if reason is not None:
+            return self._dag_reject(event, reason)
+        if kind == "configure":
+            return self.configure_dag(event, idle=idle)
+        if kind in {"tick", "snapshot"}:
+            # Read-only management events do not consume the state-event budget.
+            return True, None
+        if self.role == "D":
+            # Validation still catches protocol drift, but no D-side policy state is kept.
+            reason = self._dag_validate_event(event)
+            if reason is not None:
+                return self._dag_reject(event, reason)
+            self.dag_stats["events_accepted"] += 1
+            self.emit(event.get("session_id"), "DAG_EVENT_IGNORED", kind=kind, reason="decode_role")
+            return True, "decode_role_dag_disabled"
+        if self.dag_mode == "off":
+            return self._dag_reject(event, "dag_mode_off")
+        if self.dag_event_count >= self.dag_max_events:
+            return self._dag_reject(event, "event_budget")
+        reason = self._dag_validate_event(event)
+        if reason is not None:
+            return self._dag_reject(event, reason)
+
+        workflow_id = event["workflow_id"]
+        epoch = event["epoch"]
+        seq = event["seq"]
+        state = self.dag_workflows.get(workflow_id)
+        created = False
+        reset_epoch = False
+        if state is None:
+            if kind != "consumer_upsert":
+                return self._dag_reject(event, "unknown_workflow")
+            if len(self.dag_workflows) >= self.dag_max_workflows:
+                return self._dag_reject(event, "workflow_budget")
+            state = DAGWorkflowState(epoch=epoch, last_seq=-1)
+            created = True
+        else:
+            if state.epoch > epoch:
+                return self._dag_reject(event, "stale_epoch")
+            if state.epoch < epoch:
+                reset_epoch = True
+            elif seq <= state.last_seq:
+                return self._dag_reject(event, "stale_seq")
+
+        # Validate consumer-specific state before mutating epoch or creating a
+        # workflow, so a rejected event cannot pollute or consume a new seq.
+        if reset_epoch and kind in {"step_complete", "dependency_complete"}:
+            return self._dag_reject(event, "unknown_consumer")
+        if kind in {"step_complete", "dependency_complete"}:
+            hint = state.consumers.get(event["consumer_id"])
+            if hint is None:
+                return self._dag_reject(event, "unknown_consumer")
+            if kind == "dependency_complete":
+                if hint.required_dependencies is None:
+                    return self._dag_reject(event, "dependency_count_not_declared")
+                if hint.completed_dependencies >= hint.required_dependencies:
+                    return self._dag_reject(event, "dependency_count_exceeded")
+        if kind == "consumer_upsert":
+            prospective_consumers = 0 if reset_epoch else len(state.consumers)
+            if (not reset_epoch
+                    and self.dag_metadata_size() >= self.dag_max_consumers
+                    and event["consumer_id"] not in state.consumers):
+                return self._dag_reject(event, "consumer_budget")
+            if prospective_consumers >= self.dag_max_consumers:
+                return self._dag_reject(event, "consumer_budget")
+
+        if created:
+            self.dag_workflows[workflow_id] = state
+        if reset_epoch:
+            state.epoch = epoch
+            state.last_seq = -1
+            state.consumers.clear()
+
+        if kind == "consumer_upsert":
+            consumer_id = event["consumer_id"]
+            prefix_tokens = event["prefix_tokens"]
+            distance = event.get("next_use_distance")
+            expected = event.get("expected_resume_at")
+            ttl_ms = event.get("ttl_ms", 60_000)
+            required = event.get("required_dependencies")
+            completed = event.get("completed_dependencies", 0)
+            remaining = event.get("remaining_dependencies")
+            dependency_mode = event.get("dependency_mode", "ALL")
+            if required is None and remaining is not None:
+                required = completed + remaining
+            state.consumers[consumer_id] = DAGConsumerHint(
+                workflow_id=event["workflow_id"], workflow_epoch=state.epoch,
+                consumer_id=consumer_id, session_id=event["session_id"],
+                step_id=event["step_id"], event_seq=event["seq"],
+                prefix_tokens=prefix_tokens, next_use_distance=distance,
+                status=event["status"], confidence=float(event.get("confidence", 0.0)),
+                expected_resume_at=float(expected) if expected is not None else None,
+                valid_until=self.dag_logical_now + min(float(ttl_ms), self.dag_max_ttl_ms) / 1000.0,
+                stable_history_prepare=bool(event.get("stable_history_prepare", False)),
+                allow_stable_history=self.dag_stable_history_prepare,
+                required_dependencies=required,
+                completed_dependencies=completed,
+                dependency_mode=dependency_mode,
+            )
+        elif kind in {"step_complete", "dependency_complete"}:
+            hint = state.consumers[event["consumer_id"]]
+            if kind == "step_complete":
+                hint.status = "completed"
+            else:
+                if hint.required_dependencies is None:
+                    # One completed dependency is insufficient when the ALL
+                    # frontier size was not declared.
+                    return self._dag_reject(event, "dependency_count_not_declared")
+                if hint.completed_dependencies >= hint.required_dependencies:
+                    return self._dag_reject(event, "dependency_count_exceeded")
+                hint.completed_dependencies += 1
+                if hint.completed_dependencies >= hint.required_dependencies:
+                    hint.status = "ready"
+        elif kind == "branch_cancel":
+            consumer_id = event.get("consumer_id")
+            if consumer_id in state.consumers:
+                state.consumers[consumer_id].status = "cancelled"
+        elif kind == "workflow_finish":
+            for hint in state.consumers.values():
+                hint.status = "completed"
+            state.consumers.clear()
+        elif kind == "workflow_reset":
+            state.consumers.clear()
+        # step_start only advances the event sequence. Parallel frontiers are
+        # represented by independent consumer records, never one global step.
+        state.last_seq = event["seq"]
+        self.dag_event_count += 1
+        self.dag_stats["events_accepted"] += 1
+        self.dag_stats["metadata_entries"] = self.dag_metadata_size()
+        self.emit(event.get("session_id"), "DAG_EVENT", kind=kind,
+                  workflow_id=event.get("workflow_id"), epoch=state.epoch, seq=event["seq"],
+                  mode=self.dag_mode, metadata_entries=self.dag_metadata_size())
+        return True, None
+
+    def dag_cleanup_expired(self, now=None):
+        now = self.dag_logical_now if now is None else now
+        removed = 0
+        for state in self.dag_workflows.values():
+            expired = [cid for cid, h in state.consumers.items() if h.valid_until <= now or h.status in {"cancelled", "completed"}]
+            for cid in expired:
+                state.consumers.pop(cid, None)
+                removed += 1
+        return removed
+
+    def dag_hints_for_session(self, session_id, now=None):
+        if self.dag_mode == "off":
+            return ()
+        now = self.dag_logical_now if now is None else now
+        self.dag_cleanup_expired(now)
+        hints = []
+        for state in self.dag_workflows.values():
+            for hint in state.consumers.values():
+                if (hint.session_id == session_id and hint.status in {"pending", "ready"}
+                        and hint.valid_until > now and hint.confidence > 0):
+                    hints.append(hint)
+        return hints
+
+    def dag_hints_by_session(self, now=None):
+        if self.dag_mode == "off":
+            return {}
+        now = self.dag_logical_now if now is None else now
+        self.dag_cleanup_expired(now)
+        grouped = {}
+        for state in self.dag_workflows.values():
+            for hint in state.consumers.values():
+                if (hint.status in {"pending", "ready"} and hint.valid_until > now
+                        and hint.confidence > 0):
+                    grouped.setdefault(hint.session_id, []).append(hint)
+        return grouped
+
+    def dag_prefetch_candidates(self):
+        if self.dag_mode != "eviction_prefetch" or not self.dag_stable_history_prepare:
+            return ()
+        self.dag_cleanup_expired(self.dag_logical_now)
+        candidates = [h for state in self.dag_workflows.values() for h in state.consumers.values()
+                      if h.status == "pending" and h.stable_history_prepare and h.expected_resume_at is not None]
+        candidates.sort(key=lambda h: (h.expected_resume_at, h.next_use_distance if h.next_use_distance is not None else 1 << 30,
+                                      -h.prefix_tokens, h.workflow_id, h.consumer_id))
+        return tuple(candidates[:32])
+
+    def dag_prefix_consumed(self, session_id, matched_tokens):
+        hints = self.dag_hints_for_session(session_id)
+        if not hints:
+            return
+        self.emit(session_id, "DAG_PREFIX_CONSUMED", matched_tokens=matched_tokens,
+                  consumer_ids=[h.consumer_id for h in hints],
+                  workflow_ids=sorted({h.workflow_id for h in hints}))
 
     def diagnose(self, session_id, stage, **fields):
         if session_id in self.trace_sessions:
@@ -152,7 +558,8 @@ class AgentLifecycle:
             return gate_record["predicted_restore_ms"], "calibrated_P_restore_TTFT_upper_bound"
         return None, "missing_restore_samples"
 
-    def admission(self, session_id, tokens, tier, capacity, gate_record=None, complete=True):
+    def admission(self, session_id, tokens, tier, capacity, gate_record=None, complete=True,
+                  allow_stable_history=False):
         hint = self.hints.get(session_id)
         if hint is None or hint.expected_resume_at is None:
             return False, {"reason": "missing_deadline"}
@@ -160,8 +567,13 @@ class AgentLifecycle:
             return False, {"reason": "low_confidence"}
         if hint.state in {"ACTIVE", "WAITING_INPUT", "COMPLETED"}:
             return False, {"reason": "state_not_prefetch_candidate"}
-        if hint.remaining_dependencies != 0:
+        if hint.remaining_dependencies != 0 and not (allow_stable_history and self.dag_stable_history_prepare):
             return False, {"reason": "dependencies_not_converged"}
+        if hint.remaining_dependencies != 0 and allow_stable_history:
+            stable = next((h for h in self.dag_hints_for_session(session_id)
+                           if h.stable_history_prepare and h.prefix_tokens >= tokens), None)
+            if stable is None:
+                return False, {"reason": "stable_history_not_confirmed"}
         if not complete:
             return False, {"reason": "incomplete_cold_copy"}
         if not capacity:
@@ -183,11 +595,21 @@ class AgentLifecycle:
             alternate = min(samples)
         if alternate is None:
             return False, {"reason": "missing_recompute_samples"}
-        overlap = (hint.expected_resume_at - time.time()) * 1000
+        # EP decisions use the broadcast logical clock. Ordinary V1 keeps its
+        # original wall-clock behavior when DAG mode is off.
+        now = (
+            self.dag_logical_now
+            if self.dag_mode == "eviction_prefetch"
+            else time.time()
+        )
+        overlap = (hint.expected_resume_at - now) * 1000
         remaining = max(0.0, restore - max(0.0, overlap))
         fields = dict(restore_estimate_ms=restore, alternate_estimate_ms=alternate,
                       available_overlap_ms=overlap, remaining_restore_wait_ms=remaining,
                       estimate_basis=basis)
+        if (self.dag_mode == "eviction_prefetch"
+                and overlap > restore * (1.0 + self.dag_early_window_factor)):
+            return False, dict(fields, reason="too_early_for_predictive_window")
         if overlap <= 0 or remaining >= min(restore, alternate):
             return False, dict(fields, reason="no_remaining_wait_benefit")
         return True, dict(fields, reason="overlap_reduces_resume_wait")

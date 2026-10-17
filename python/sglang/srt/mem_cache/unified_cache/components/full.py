@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
+import time
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -175,10 +177,28 @@ class FullComponent(TreeComponent):
             policy = getattr(self.cache, "agent_lifecycle", None)
             if policy is not None and any(a.get("gpu_indices") for a in policy.attempts.values()):
                 policy.evicted(cd.value)
-            if policy is not None:
+            if policy is not None and policy.consume_native_victim_log_budget():
                 for sid in cd.session_ids or ():
                     policy.emit(sid, "DEVICE_RELEASED", node_id=node.id, physical_bytes=len(cd.value)*policy.bytes_per_token,
                                 host_copy_present=cd.host_value is not None, native_reference_protection=True)
+                start, end = self._dag_node_range(node)
+                record = dict(
+                    node_id=node.id,
+                    freed_tokens=len(cd.value),
+                    physical_bytes=len(cd.value) * policy.bytes_per_token,
+                    logical_prefix_tokens=end - start,
+                    root_prefix_tokens=end,
+                    stable_key=self._dag_stable_key(node),
+                    session_ids=sorted(cd.session_ids or ()),
+                    dag_mode=policy.dag_mode,
+                )
+                pending = getattr(self.cache, "_pending_native_victim_frees", None)
+                if pending is not None:
+                    pending.append(record)
+                else:
+                    # Direct component-level callers outside UnifiedRadixCache
+                    # have no deferred-free boundary; keep the event observable.
+                    policy.emit(None, "NATIVE_VICTIM_FREED", **record)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
@@ -195,7 +215,183 @@ class FullComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
+    @staticmethod
+    def _dag_stable_key(node: UnifiedTreeNode) -> int:
+        """A stable logical prefix identity for TP tie-breaking.
+
+        The value is independent of object addresses, node IDs, and creation
+        order. It is computed only while building a bounded eviction heap, not
+        in the Decode token path.
+        """
+        key = node.key
+        if key is None:
+            return 0
+        last_hash = node.get_last_hash_value()
+        if last_hash is not None:
+            # Storage-enabled production trees already carry namespace-aware
+            # page hashes. Use the terminal page identity instead of copying
+            # every token along the root path.
+            parts = [(last_hash, key.extra_key, key.cache_salt)]
+        else:
+            # Dependency-light unit trees may not compute page hashes; walk the
+            # logical path only on that fallback path.
+            parts = []
+            current = node
+            while current is not None and current.key is not None:
+                current_key = current.key
+                parts.append(
+                    (tuple(current_key.token_ids), current_key.extra_key, current_key.cache_salt)
+                )
+                current = current.parent
+        digest = hashlib.blake2b(repr(parts).encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, "little", signed=False)
+
+    @staticmethod
+    def _dag_node_range(node: UnifiedTreeNode) -> tuple[int, int]:
+        end = 0
+        current = node
+        while current is not None and current.key is not None:
+            end += len(current.key)
+            current = current.parent
+        node_key_len = len(node.key) if node.key is not None else 0
+        return max(0, end - node_key_len), end
+
+    @staticmethod
+    def _dag_is_ancestor_or_self(node: UnifiedTreeNode, leaf: UnifiedTreeNode) -> bool:
+        current = leaf
+        while current is not None:
+            if current is node:
+                return True
+            current = current.parent
+        return False
+
+    def _dag_raw_hints_for_node(
+        self, node: UnifiedTreeNode, grouped_hints: dict | None = None
+    ) -> tuple[int | None, int]:
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        if policy is None or policy.dag_mode == "off":
+            return None, 0
+        if grouped_hints is None:
+            grouped_hints = policy.dag_hints_by_session()
+        session_ids = set(node.component_data[self.component_type].session_ids or ())
+        for session_id in grouped_hints:
+            leaves = self._session_leaves.get(session_id, ())
+            if any(self._dag_is_ancestor_or_self(node, leaf) for leaf in leaves):
+                session_ids.add(session_id)
+        start, end = self._dag_node_range(node)
+        hints = []
+        for session_id in session_ids:
+            for hint in grouped_hints.get(session_id, ()):
+                # Protect only nodes wholly inside the confirmed stable
+                # prefix. A stable 8K prefix landing inside one 12K node does
+                # not protect the private 4K suffix.
+                if end <= hint.prefix_tokens and start < hint.prefix_tokens:
+                    hints.append(hint)
+        if not hints:
+            return None, 0
+        distance = min((h.next_use_distance for h in hints if h.next_use_distance is not None), default=None)
+        return distance, len(hints)
+
+    def _dag_hints_for_node(
+        self, node: UnifiedTreeNode, grouped_hints: dict | None = None
+    ) -> tuple[int, int, int]:
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        distance, consumer_count = self._dag_raw_hints_for_node(node, grouped_hints)
+        if distance is None:
+            foreground_protected = node in getattr(
+                self, "_dag_foreground_protected_nodes", set()
+            )
+            return (1 if foreground_protected else 0), 0, 0
+        near = distance <= policy.dag_near_use_distance
+        protected = node in getattr(self, "_dag_protected_nodes", set())
+        rank = 2 if near and protected else 1
+        # Min-heap: a more negative key evicts first, so farther future use is
+        # reclaimed before nearer future use.
+        return rank, -distance, consumer_count
+
+    def _dag_try_protect_node(self, node: UnifiedTreeNode, grouped_hints: dict) -> bool:
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        if policy is None or node in getattr(self, "_dag_protected_nodes", set()):
+            return False
+        distance, _count = self._dag_raw_hints_for_node(node, grouped_hints)
+        if distance is None or distance > policy.dag_near_use_distance:
+            return False
+        value = node.component_data[self.component_type].value
+        tokens = len(value) if value is not None else 0
+        if tokens <= 0:
+            return False
+        if self._dag_protected_tokens_used + tokens > self._dag_protected_token_budget:
+            return False
+        self._dag_protected_nodes.add(node)
+        self._dag_protected_tokens_used += tokens
+        return True
+
+    def _dag_try_protect_foreground_node(
+        self, node: UnifiedTreeNode, grouped_hints: dict
+    ) -> bool:
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        if policy is None or node in getattr(
+            self, "_dag_foreground_protected_nodes", set()
+        ):
+            return False
+        distance, _count = self._dag_raw_hints_for_node(node, grouped_hints)
+        if distance is not None:
+            return False
+        value = node.component_data[self.component_type].value
+        tokens = len(value) if value is not None else 0
+        if tokens <= 0:
+            return False
+        if (
+            self._dag_foreground_tokens_used + tokens
+            > self._dag_foreground_token_budget
+        ):
+            return False
+        self._dag_foreground_protected_nodes.add(node)
+        self._dag_foreground_tokens_used += tokens
+        return True
+
     def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
+        dag_rank, dag_distance, _consumer_count = self._dag_hints_for_node(
+            node, getattr(self, "_dag_grouped_hints", None)
+        )
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        ref = self.session_ref(node)
+        session_ids = node.component_data[self.component_type].session_ids or ()
+        lifecycle_states = {
+            self.cache.session_refs.get_session_lifecycle(session_id)
+            for session_id in session_ids
+        }
+        tool_waiting_only = bool(
+            lifecycle_states
+            and SessionLifecycleState.TOOL_WAITING in lifecycle_states
+            and SessionLifecycleState.ACTIVE not in lifecycle_states
+            and SessionLifecycleState.READY_SOON not in lifecycle_states
+        )
+        if policy is not None:
+            if policy.mode in {"native", "v1"}:
+                # V1 uses guarded explicit demote; ordinary victims keep LRU.
+                tool_waiting_only = False
+        if policy is None or policy.dag_mode == "off":
+            # Bit-for-bit policy-equivalent to bed4 when DAG is disabled.
+            return (
+                not tool_waiting_only,
+                ref > 0,
+                ref,
+                self.tree_core.eviction_strategy.get_priority(node),
+            )
+        stable_key = self._dag_stable_key(node)
+        return (
+            dag_rank,
+            dag_distance,
+            not tool_waiting_only,
+            ref > 0,
+            ref,
+            self.tree_core.eviction_strategy.get_priority(node),
+            stable_key,
+        )
+
+    def _native_session_ref_eviction_strategy(self, node: UnifiedTreeNode):
+        """The bed4 comparison key, retained for B-mode observation."""
         ref = self.session_ref(node)
         session_ids = node.component_data[self.component_type].session_ids or ()
         lifecycle_states = {
@@ -209,10 +405,8 @@ class FullComponent(TreeComponent):
             and SessionLifecycleState.READY_SOON not in lifecycle_states
         )
         policy = getattr(self.cache, "agent_lifecycle", None)
-        if policy is not None:
-            if policy.mode in {"native", "v1"}:
-                # V1 uses guarded explicit demote; ordinary victims keep LRU.
-                tool_waiting_only = False
+        if policy is not None and policy.mode in {"native", "v1"}:
+            tool_waiting_only = False
         return (
             not tool_waiting_only,
             ref > 0,
@@ -222,13 +416,90 @@ class FullComponent(TreeComponent):
 
     def _evict_device_start(self, request_cnt: int) -> None:
         self._ensure_eviction_strategy()
+        policy = getattr(self.cache, "agent_lifecycle", None)
+        started = time.perf_counter()
+        self._dag_grouped_hints = None
+        self._dag_protected_nodes = set()
+        self._dag_protected_tokens_used = 0
+        self._dag_protected_token_budget = 0
+        self._dag_foreground_protected_nodes = set()
+        self._dag_foreground_tokens_used = 0
+        self._dag_foreground_token_budget = 0
+        self._dag_candidate_tokens = 0
+        self._dag_counted_nodes = set()
+        leaves = list(self.tree_core.evictable_device_leaves)
+        if policy is not None and policy.dag_mode != "off":
+            self._dag_grouped_hints = policy.dag_hints_by_session()
+            self._dag_candidate_tokens = sum(
+                len(n.component_data[self.component_type].value)
+                if n.component_data[self.component_type].value is not None
+                else 0
+                for n in leaves
+            )
+            self._dag_counted_nodes.update(leaves)
+            self._dag_protected_token_budget = int(
+                self._dag_candidate_tokens * policy.dag_protected_token_fraction
+            )
+            self._dag_foreground_token_budget = int(
+                self._dag_candidate_tokens * policy.dag_foreground_token_fraction
+            )
+            for node in leaves:
+                self._dag_try_protect_node(node, self._dag_grouped_hints)
+            ordinary = [
+                node
+                for node in leaves
+                if self._dag_raw_hints_for_node(node, self._dag_grouped_hints)[0] is None
+            ]
+            # Protect the most recently used ordinary foreground leaves up to a
+            # finite token budget, so a stream of DAG hints cannot starve them.
+            ordinary.sort(key=lambda node: node.last_access_time, reverse=True)
+            for node in ordinary:
+                self._dag_try_protect_foreground_node(node, self._dag_grouped_hints)
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
         self._evict_device_heap = [
             (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_device_leaves
+            for n in leaves
         ]
         heapq.heapify(self._evict_device_heap)
+        if policy is not None:
+            native_order = heapq.nsmallest(
+                32,
+                leaves,
+                key=self._native_session_ref_eviction_strategy,
+            )
+            native_snapshot = [
+                (self._dag_stable_key(node), self.session_ref(node))
+                for node in native_order
+            ]
+            # Compute both orders in every group so B/E/EP carry identical
+            # observation overhead; in off mode the two orders are equal.
+            dag_order = heapq.nsmallest(
+                32,
+                leaves,
+                key=self._session_ref_eviction_strategy,
+            )
+            dag_snapshot = [
+                (self._dag_stable_key(node), self.session_ref(node))
+                for node in dag_order
+            ]
+            elapsed_us = int((time.perf_counter() - started) * 1_000_000)
+            policy.dag_stats["eviction_candidate_checks"] += len(self._evict_device_heap)
+            policy.dag_stats["eviction_cpu_us"] += elapsed_us
+            policy.dag_stats["metadata_entries"] = policy.dag_metadata_size()
+            if policy.consume_native_eviction_log_budget():
+                policy.emit(
+                    None,
+                    "NATIVE_EVICTION_PLAN",
+                    candidates=len(self._evict_device_heap),
+                    cpu_us=elapsed_us,
+                    dag_mode=policy.dag_mode,
+                    metadata_entries=policy.dag_metadata_size(),
+                    protected_token_budget=self._dag_protected_token_budget,
+                    foreground_protected_token_budget=self._dag_foreground_token_budget,
+                    native_candidate_order=native_snapshot,
+                    dag_candidate_order=dag_snapshot,
+                )
 
     def _evict_device_next_node(
         self,
@@ -243,6 +514,25 @@ class FullComponent(TreeComponent):
             and lv.parent is not None
             and lv.parent in self.tree_core.evictable_device_leaves
         ):
+            if self._dag_grouped_hints is not None:
+                parent_value = lv.parent.component_data[self.component_type].value
+                if parent_value is not None and lv.parent not in self._dag_counted_nodes:
+                    self._dag_counted_nodes.add(lv.parent)
+                    self._dag_candidate_tokens += len(parent_value)
+                    policy = getattr(self.cache, "agent_lifecycle", None)
+                    if policy is not None:
+                        self._dag_protected_token_budget = int(
+                            self._dag_candidate_tokens
+                            * policy.dag_protected_token_fraction
+                        )
+                        self._dag_foreground_token_budget = int(
+                            self._dag_candidate_tokens
+                            * policy.dag_foreground_token_fraction
+                        )
+                self._dag_try_protect_node(lv.parent, self._dag_grouped_hints)
+                self._dag_try_protect_foreground_node(
+                    lv.parent, self._dag_grouped_hints
+                )
             heapq.heappush(
                 self._evict_device_heap,
                 (self.session_ref_eviction_strategy(lv.parent), lv.parent),
@@ -252,6 +542,31 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(self._evict_device_heap)
             if x not in self.tree_core.evictable_device_leaves:
                 continue
+            policy = getattr(self.cache, "agent_lifecycle", None)
+            if (policy is not None and policy.dag_mode != "off"
+                    and (any(cd.lock_ref > 0 for cd in x.component_data)
+                         or x.load_back_pending_id is not None)):
+                continue
+            if policy is not None and policy.consume_native_victim_log_budget():
+                start, end = self._dag_node_range(x)
+                dag_rank, dag_distance, _consumer_count = self._dag_hints_for_node(x)
+                policy.emit(
+                    None,
+                    "NATIVE_VICTIM_SELECTED",
+                    node_id=x.id,
+                    logical_prefix_tokens=end - start,
+                    root_prefix_tokens=end,
+                    stable_key=self._dag_stable_key(x),
+                    session_ids=sorted(x.component_data[ct].session_ids or ()),
+                    dag_mode=policy.dag_mode,
+                    dag_rank=dag_rank,
+                    dag_distance=dag_distance,
+                    reason=(
+                        "dag_near_future_protected"
+                        if dag_rank == 2
+                        else "dag_future_or_native_lru"
+                    ),
+                )
             self._evict_device_last_node = x
             return x.id
         return None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import heapq
 import json
 import logging
 import threading
@@ -38,7 +39,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
-from sglang.srt.mem_cache.agent_lifecycle import AgentLifecycle
+from sglang.srt.mem_cache.agent_lifecycle import DAG_MODE_CODES, AgentLifecycle
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -181,6 +182,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
+        # Victim records emitted only after allocator free completes.
+        self._pending_native_victim_frees: list[dict] = []
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
@@ -389,6 +392,9 @@ class UnifiedRadixCache(BasePrefixCache):
         policy = getattr(self, "agent_lifecycle", None)
         if policy is not None:
             policy.completed_requests.clear()
+            policy.dag_workflows.clear()
+            policy.dag_mode = "off"
+            policy.dag_stable_history_prepare = False
 
         # Reset Controller.
         self.session.slots.clear()
@@ -610,6 +616,25 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
+        policy = getattr(self, "agent_lifecycle", None)
+        session_id = getattr(params.req, "session_id", None) if params.req is not None else None
+        if (policy is not None and session_id is not None and result.prefix_len > 0
+                and policy.consume_native_log_budget()):
+            stable_key = None
+            node_by_id = getattr(self.tree_core, "node_by_id", None)
+            component = self.components.get(ComponentType.FULL)
+            if node_by_id is not None and component is not None:
+                node = node_by_id(result.best_match_node)
+                stable_key = component._dag_stable_key(node)
+            policy.emit(
+                session_id,
+                "NATIVE_PREFIX_CONSUMED",
+                matched_tokens=result.prefix_len,
+                stable_key=stable_key,
+                dag_mode=policy.dag_mode,
+            )
+            if policy.dag_mode != "off":
+                policy.dag_prefix_consumed(session_id, result.prefix_len)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
@@ -791,9 +816,19 @@ class UnifiedRadixCache(BasePrefixCache):
         """Free a tree-side step's returned device and host values right away."""
         # Both drains must run even if one raises.
         try:
-            self._drain_device_frees(device_frees)
-        finally:
-            self._drain_host_frees(host_frees)
+            try:
+                self._drain_device_frees(device_frees)
+            finally:
+                self._drain_host_frees(host_frees)
+        except Exception:
+            self._pending_native_victim_frees.clear()
+            raise
+        else:
+            policy = getattr(self, "agent_lifecycle", None)
+            if policy is not None:
+                for record in self._pending_native_victim_frees:
+                    policy.emit(None, "NATIVE_VICTIM_FREED", **record)
+            self._pending_native_victim_frees.clear()
 
     def _accumulate_tracker(
         self,
@@ -4025,12 +4060,256 @@ class UnifiedRadixCache(BasePrefixCache):
         policy = getattr(self, "agent_lifecycle", None)
         if policy is not None:
             policy.completed_requests.pop(session_id, None)
+            for state in policy.dag_workflows.values():
+                state.consumers = {
+                    consumer_id: hint for consumer_id, hint in state.consumers.items()
+                    if hint.session_id != session_id
+                }
         return self.session_refs.release_radix_session(session_id)
 
     def get_session_lifecycle_request(self, session_id: str):
         return self.agent_lifecycle.completed_request(
             session_id, self.session_refs.get_session_generation(session_id)
         )
+
+    def dag_switch_is_safe(self) -> bool:
+        """Whether a mode switch is at a safe, idle window boundary."""
+        if getattr(self, "ongoing_prefetch", None):
+            return False
+        if getattr(self, "ongoing_load_back", None):
+            return False
+        if getattr(self, "ongoing_write_through", None):
+            return False
+        if getattr(self, "ongoing_backup", None):
+            return False
+        cc = getattr(self, "cache_controller", None)
+        if cc is None:
+            return True
+        if getattr(cc, "load_queue", None):
+            return False
+        if getattr(cc, "runtime_active_storage_reads", 0):
+            return False
+        prefetch_buffer = getattr(cc, "prefetch_buffer", None)
+        if prefetch_buffer is not None and not prefetch_buffer.empty():
+            return False
+        return True
+
+    def dag_configure_event(self, event: dict, idle: bool):
+        """Apply a DAG mode switch only after the existing fixed TP vote.
+
+        The management request is already broadcast. This helper reuses the
+        storage-admission coordinator at the same scheduler management point;
+        it does not create a new communication path and is never called from a
+        local CUDA-event branch.
+        """
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is None:
+            return False, "policy_unavailable"
+        local_reason = policy.dag_configure_is_valid(event)
+        local_idle = bool(idle and local_reason is None)
+        mode_code = DAG_MODE_CODES.get(event.get("mode"), -1)
+        stable = int(bool(event.get("stable_history_prepare", False)))
+        epoch = int(event.get("epoch", -1))
+        seq = int(event.get("seq", -1))
+        signature = int.from_bytes(
+            hashlib.blake2b(
+                repr((mode_code, stable, epoch, seq)).encode("utf-8"),
+                digest_size=8,
+            ).digest(),
+            "little",
+            signed=False,
+        ) & ((1 << 62) - 1)
+        vote = torch.tensor(
+            [int(local_idle), signature, -signature],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._all_reduce_storage_admission(vote)
+        if not int(vote[0]):
+            if local_reason is not None:
+                reason = local_reason
+            elif not idle:
+                reason = "not_idle_window"
+            else:
+                reason = "peer_not_idle_or_invalid_configure"
+            policy.dag_stats["events_rejected"] += 1
+            policy.emit(
+                event.get("session_id"),
+                "DAG_EVENT_REJECTED",
+                kind="configure",
+                reason=reason,
+                tp_vote=vote.tolist(),
+            )
+            return False, reason
+        if int(vote[1]) != -int(vote[2]):
+            reason = "peer_configure_signature_mismatch"
+            policy.dag_stats["events_rejected"] += 1
+            policy.emit(
+                event.get("session_id"),
+                "DAG_EVENT_REJECTED",
+                kind="configure",
+                reason=reason,
+                tp_vote=vote.tolist(),
+            )
+            return False, reason
+        return policy.handle_dag_event(event, idle=True)
+
+    def dag_snapshot(self) -> dict:
+        """Cheap allocator/tree-counter snapshot for B/E/EP observation.
+
+        This reads existing counters and the bounded in-flight operation table.
+        It never walks the tree, copies a GPU index tensor, or derives a 3-second
+        residency value from a stale gauge.
+        """
+        allocator = self.token_to_kv_pool_allocator
+        gpu_total = int(getattr(allocator, "size_full", getattr(allocator, "size", 0)))
+        gpu_free = int(self._component_available_size(ComponentType.FULL))
+        gpu_evictable = int(self.full_evictable_size())
+        gpu_locked = int(self.full_protected_size())
+
+        gpu_reserved = 0
+        for load in getattr(self, "ongoing_load_back", {}).values():
+            node = self.tree_core.node_by_id(load.node_id)
+            value = node.component_data[ComponentType.FULL].value
+            gpu_reserved += len(value) if value is not None else 0
+
+        host_total = None
+        host_free = None
+        host_reserved = 0
+        cc = getattr(self, "cache_controller", None)
+        host_pool = getattr(
+            getattr(getattr(cc, "mem_pool_host", None), "anchor_entry", None),
+            "host_pool",
+            None,
+        )
+        if host_pool is not None:
+            host_total = int(getattr(host_pool, "size", 0))
+            host_free = int(host_pool.available_size())
+        for prefetch in getattr(self, "ongoing_prefetch", {}).values():
+            host_reserved += len(prefetch.host_indices)
+
+        policy = getattr(self, "agent_lifecycle", None)
+        return {
+            "role": getattr(policy, "role", None),
+            "dag_mode": getattr(policy, "dag_mode", "off"),
+            "gpu_total_tokens": gpu_total,
+            "gpu_used_tokens": max(0, gpu_total - gpu_free),
+            "gpu_free_tokens": gpu_free,
+            "gpu_evictable_tokens": gpu_evictable,
+            "gpu_locked_tokens": gpu_locked,
+            "gpu_reserved_tokens": gpu_reserved,
+            "gpu_inflight_load_backs": len(getattr(self, "ongoing_load_back", {})),
+            "host_total_tokens": host_total,
+            "host_used_tokens": None if host_total is None or host_free is None else max(0, host_total - host_free),
+            "host_free_tokens": host_free,
+            "host_reserved_tokens": host_reserved,
+            "host_inflight_prefetches": len(getattr(self, "ongoing_prefetch", {})),
+            "dag_metadata_entries": getattr(policy, "dag_metadata_size", lambda: 0)(),
+            "logical_time": getattr(policy, "dag_logical_now", 0.0),
+        }
+
+    def _agent_dag_victim_plan(self, needed_tokens: int, session_id: str):
+        """Bounded, release-free admission trial for an EP prefetch candidate."""
+        policy = getattr(self, "agent_lifecycle", None)
+        if policy is None or policy.dag_mode != "eviction_prefetch":
+            return {"allowed": True, "reason": "dag_prefetch_disabled", "trial_reclaimed_tokens": 0,
+                    "victim_count": 0, "victims": []}
+        free_tokens = self._component_available_size(ComponentType.FULL)
+        if free_tokens >= needed_tokens:
+            return {"allowed": True, "reason": "free_capacity", "free_tokens": free_tokens,
+                    "trial_reclaimed_tokens": 0, "victim_count": 0, "victims": []}
+
+        component = self.components[ComponentType.FULL]
+        grouped = policy.dag_hints_by_session()
+        candidate_hints = grouped.get(session_id, ())
+        candidate_distance = min(
+            (h.next_use_distance for h in candidate_hints if h.next_use_distance is not None),
+            default=None,
+        )
+        candidate_restore, candidate_basis = policy.estimate(
+            needed_tokens, "host", self._agent_cost_record(needed_tokens)
+        )
+
+        # Bound the trial even under a large evictable frontier. This is not a
+        # Decode-token scan; it runs only while admitting a prefetch candidate.
+        leaves = sorted(
+            self.tree_core.evictable_device_leaves,
+            key=component._dag_stable_key,
+        )[:256]
+        original_leaf_ids = {node.id for node in leaves}
+        heap = [(component._session_ref_eviction_strategy(node), node) for node in leaves]
+        heapq.heapify(heap)
+        reclaimed: set[int] = set()
+        trial_seen: set[int] = set()
+        victims = []
+        reclaimed_tokens = 0
+        while heap and free_tokens + reclaimed_tokens < needed_tokens:
+            _, node = heapq.heappop(heap)
+            if node.parent is None or node.id in trial_seen:
+                continue
+            trial_seen.add(node.id)
+            # The tree has not actually been freed yet, so an exposed ancestor
+            # is not yet in the native evictable-leaf set. Count it only when
+            # every child that still has device KV is already in this trial.
+            exposed_ancestor = bool(node.children) and all(
+                child.component_data[ComponentType.FULL].value is None
+                or child.id in reclaimed
+                for child in node.children.values()
+            )
+            if node.id not in original_leaf_ids and not exposed_ancestor:
+                continue
+            if any(cd.lock_ref > 0 for cd in node.component_data) or node.load_back_pending_id is not None:
+                continue
+            cd = node.component_data[ComponentType.FULL]
+            if cd.value is None:
+                continue
+            victim_distance, _ = component._dag_raw_hints_for_node(node, grouped)
+            if (victim_distance is not None and candidate_distance is not None
+                    and victim_distance < candidate_distance):
+                return {"allowed": False, "reason": "would_sacrifice_closer_consumer",
+                        "free_tokens": free_tokens, "needed_tokens": needed_tokens,
+                        "trial_reclaimed_tokens": reclaimed_tokens, "victim_count": len(victims),
+                        "victims": victims}
+            if (victim_distance is not None and candidate_distance is not None
+                    and victim_distance == candidate_distance):
+                victim_source = "host" if cd.host_value is not None else "mooncake"
+                victim_restore, victim_basis = policy.estimate(
+                    len(cd.value), victim_source, self._agent_cost_record(len(cd.value))
+                )
+                if candidate_restore is None or victim_restore is None:
+                    return {"allowed": False, "reason": "same_distance_missing_restore_estimate",
+                            "candidate_estimate_basis": candidate_basis,
+                            "victim_estimate_basis": victim_basis,
+                            "free_tokens": free_tokens, "needed_tokens": needed_tokens,
+                            "trial_reclaimed_tokens": reclaimed_tokens, "victim_count": len(victims),
+                            "victims": victims}
+                if victim_restore > candidate_restore:
+                    return {"allowed": False, "reason": "would_sacrifice_higher_restore_cost",
+                            "candidate_restore_estimate_ms": candidate_restore,
+                            "victim_restore_estimate_ms": victim_restore,
+                            "candidate_estimate_basis": candidate_basis,
+                            "victim_estimate_basis": victim_basis,
+                            "free_tokens": free_tokens, "needed_tokens": needed_tokens,
+                            "trial_reclaimed_tokens": reclaimed_tokens, "victim_count": len(victims),
+                            "victims": victims}
+            tokens = len(cd.value)
+            reclaimed_tokens += tokens
+            reclaimed.add(node.id)
+            victims.append({"node_id": node.id, "tokens": tokens,
+                            "stable_key": component._dag_stable_key(node),
+                            "next_use_distance": victim_distance})
+            parent = node.parent
+            if parent is not None and parent.parent is not None and all(
+                child.component_data[ComponentType.FULL].value is None or child.id in reclaimed
+                for child in parent.children.values()
+            ):
+                heapq.heappush(heap, (component._session_ref_eviction_strategy(parent), parent))
+        allowed = free_tokens + reclaimed_tokens >= needed_tokens
+        return {"allowed": allowed,
+                "reason": "trial_capacity_sufficient" if allowed else "insufficient_bounded_trial_capacity",
+                "free_tokens": free_tokens, "needed_tokens": needed_tokens,
+                "trial_reclaimed_tokens": reclaimed_tokens, "victim_count": len(victims),
+                "victims": victims}
 
     def set_session_lifecycle(
         self, session_id: str, state: SessionLifecycleState
@@ -4161,11 +4440,25 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.match_prefix(MatchPrefixParams(key=RadixKey(
             attempt["tokens"], extra_key=attempt["extra_key"], cache_salt=attempt["cache_salt"])))
 
-    def _agent_prefetch_candidate(self, session_id, req):
+    def _agent_prefetch_candidate(self, session_id, req, prefix_tokens=None):
         policy = self.agent_lifecycle
         if not self.enable_storage or self.cache_controller is None:
             return False
+        if prefix_tokens is not None and not (
+            0 < prefix_tokens <= len(req.origin_input_ids)
+        ):
+            policy.emit(
+                session_id,
+                "DAG_EVENT_REJECTED",
+                kind="tick",
+                reason="stable_prefix_outside_completed_request",
+            )
+            return False
         tokens = req.origin_input_ids[:]
+        if prefix_tokens is not None:
+            # A future consumer may confirm only a stable historical prefix.
+            # Never promote the completed request's private suffix to stable.
+            tokens = tokens[:prefix_tokens]
         if not policy.request(session_id, len(tokens), "pending_lookup", self.session_refs.ensure_session_generation(session_id)):
             return False
         attempt = policy.attempts[session_id]
@@ -4175,22 +4468,94 @@ class UnifiedRadixCache(BasePrefixCache):
         full_host = len(match.device_indices) + match.host_hit_length >= len(tokens)
         source = "host" if full_host else "mooncake"
         attempt["source_tier"] = source
-        capacity_tokens = self._agent_gpu_capacity()
         needed = len(tokens)-len(match.device_indices)
-        capacity = capacity_tokens >= needed
-        permitted, fields = policy.admission(session_id, len(tokens), source, capacity, self._agent_cost_record(len(tokens)))
+        if policy.dag_mode == "eviction_prefetch":
+            victim_plan = self._agent_dag_victim_plan(needed, session_id)
+            capacity_tokens = victim_plan.get("free_tokens", 0) + victim_plan.get("trial_reclaimed_tokens", 0)
+            capacity = bool(victim_plan["allowed"])
+            stable = any(h.stable_history_prepare for h in policy.dag_hints_for_session(session_id))
+            allow_stable = bool(policy.dag_stable_history_prepare and stable)
+        else:
+            capacity_tokens = self._agent_gpu_capacity()
+            capacity = capacity_tokens >= needed
+            victim_plan = {"allowed": capacity, "reason": "native_v1_capacity",
+                           "trial_reclaimed_tokens": 0, "victim_count": 0, "victims": []}
+            allow_stable = False
+        permitted, fields = policy.admission(session_id, len(tokens), source, capacity,
+                                             self._agent_cost_record(len(tokens)),
+                                             allow_stable_history=allow_stable)
+        if not victim_plan["allowed"] and fields.get("reason") == "target_capacity":
+            fields["reason"] = victim_plan["reason"]
+        attempt["dag_victim_plan"] = victim_plan
         # All ranks receive this control request. Use the existing admission
         # coordinator before issuing local IO; no rank may warm on its own.
         if already_gpu:
             permitted, fields = False, {"reason": "already_GPU_resident"}
-        vote = torch.tensor([int(permitted), int(full_host), -int(full_host)], dtype=torch.int64, device="cpu")
+        plan_identity = [
+            (
+                victim["stable_key"],
+                victim["tokens"],
+                victim["next_use_distance"],
+            )
+            for victim in victim_plan.get("victims", ())
+        ]
+        plan_signature = int.from_bytes(
+            hashlib.blake2b(
+                repr(
+                    (
+                        victim_plan.get("reason"),
+                        victim_plan.get("free_tokens"),
+                        victim_plan.get("needed_tokens"),
+                        victim_plan.get("trial_reclaimed_tokens"),
+                        plan_identity,
+                        len(tokens),
+                        prefix_tokens,
+                    )
+                ).encode("utf-8"),
+                digest_size=8,
+            ).digest(),
+            "little",
+            signed=False,
+        ) & ((1 << 62) - 1)
+        vote = torch.tensor(
+            [
+                int(permitted),
+                int(full_host),
+                -int(full_host),
+                plan_signature,
+                -plan_signature,
+                len(tokens),
+                -len(tokens),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
         self._all_reduce_storage_admission(vote)
         policy.diagnose(session_id, "prefetch_admission", source_tier=source,
                         device_hit_tokens=len(match.device_indices), host_hit_tokens=match.host_hit_length,
                         needed_tokens=needed, native_reclaimable_capacity_tokens=capacity_tokens,
+                        dag_victim_plan=victim_plan,
                         local_permitted=permitted, decision=fields, tp_vote=vote.tolist())
-        if not int(vote[0]) or int(vote[1]) != -int(vote[2]):
-            policy.record(session_id, "REJECTED", **dict(fields, reason=fields["reason"] if not permitted else "peer_rejected"))
+        if (
+            not int(vote[0])
+            or int(vote[1]) != -int(vote[2])
+            or int(vote[3]) != -int(vote[4])
+            or int(vote[5]) != -int(vote[6])
+        ):
+            peer_reason = (
+                fields["reason"]
+                if not permitted
+                else (
+                    "peer_victim_plan_mismatch"
+                    if int(vote[3]) != -int(vote[4])
+                    else "peer_prefix_mismatch"
+                )
+            )
+            policy.record(
+                session_id,
+                "REJECTED",
+                **dict(fields, reason=peer_reason),
+            )
             return False
         if full_host:
             policy.record(session_id, "LOOKUP_HIT", source_tier="host", hit_tokens=len(tokens))
@@ -4265,12 +4630,14 @@ class UnifiedRadixCache(BasePrefixCache):
                           unused_h2d_bytes=max(0, attempt.get("h2d_bytes", 0)-attempt["useful_bytes"]),
                           last_execution_state=attempt["state"])
 
-    def prefetch_session(self, session_id: str, req: Req) -> Optional[bool]:
+    def prefetch_session(
+        self, session_id: str, req: Req, prefix_tokens: Optional[int] = None
+    ) -> Optional[bool]:
         policy = getattr(self, "agent_lifecycle", None)
         if policy is not None and policy.mode == "native":
             return False
         if policy is not None and policy.mode == "v1":
-            return self._agent_prefetch_candidate(session_id, req)
+            return self._agent_prefetch_candidate(session_id, req, prefix_tokens)
         if policy is not None:
             policy.request(session_id, len(req.origin_input_ids), "native_v0")
             policy.attempts[session_id]["tokens"] = list(req.origin_input_ids)

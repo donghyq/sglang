@@ -16,7 +16,7 @@ import logging
 import time
 import uuid
 from array import array
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -371,10 +371,17 @@ class Session:
 
 
 class SessionController:
-    def __init__(self, tree_cache: BasePrefixCache):
+    def __init__(
+        self,
+        tree_cache: BasePrefixCache,
+        scheduler_idle: Optional[Callable[[], bool]] = None,
+    ):
         self.sessions: Dict[str, Session] = {}
         self._last_reap_time: float = 0.0
         self.tree_cache = tree_cache
+        # Dynamo explicit-history sessions can bypass Session.req_nodes, so
+        # scheduler state—not the session map alone—defines the real idle window.
+        self._scheduler_idle = scheduler_idle
 
     def __contains__(self, session_id: str) -> bool:
         return session_id in self.sessions
@@ -382,7 +389,69 @@ class SessionController:
     def get(self, session_id: str) -> Optional[Session]:
         return self.sessions.get(session_id)
 
+    def _dag_idle(self) -> bool:
+        if self._scheduler_idle is not None and not self._scheduler_idle():
+            return False
+        if any(
+            (session.streaming and session._inflight)
+            or any(not node.req.finished() for node in session.req_nodes.values())
+            for session in self.sessions.values()
+        ):
+            return False
+        policy = getattr(self.tree_cache, "agent_lifecycle", None)
+        if policy is not None and any(
+            attempt.get("state") not in {"CONSUMED", "CANCELLED", "TIMEOUT", "CAPACITY_REJECT",
+                                          "EVICTED_BEFORE_USE", "STORAGE_MISS", "REJECTED"}
+            for attempt in policy.attempts.values()
+        ):
+            return False
+        check = getattr(self.tree_cache, "dag_switch_is_safe", None)
+        return check() if check is not None else True
+
+    def _drain_dag_prefetch_queue(self):
+        policy = getattr(self.tree_cache, "agent_lifecycle", None)
+        if policy is None or policy.role != "P":
+            return False
+        for hint in policy.dag_prefetch_candidates():
+            req = self.tree_cache.get_session_lifecycle_request(hint.session_id)
+            if req is None:
+                continue
+            started = self.tree_cache.prefetch_session(
+                hint.session_id, req, prefix_tokens=hint.prefix_tokens
+            )
+            if started:
+                return True
+        return False
+
+    def handle_dag_event(self, recv_req):
+        policy = getattr(self.tree_cache, "agent_lifecycle", None)
+        if policy is None:
+            return False, "policy_unavailable", None, None, False, None
+        event = recv_req.dag_event
+        if isinstance(event, dict) and event.get("kind") == "snapshot":
+            reason = policy.set_dag_logical_time(event)
+            if reason is not None:
+                return False, reason, policy.dag_mode, event.get("seq"), False, None
+            snapshot = self.tree_cache.dag_snapshot()
+            policy.emit(None, "NATIVE_SNAPSHOT", **snapshot)
+            return True, None, snapshot["dag_mode"], event.get("seq"), False, snapshot
+        if isinstance(event, dict) and event.get("kind") == "configure":
+            success, reason = self.tree_cache.dag_configure_event(
+                event, self._dag_idle()
+            )
+        else:
+            success, reason = policy.handle_dag_event(event, idle=True)
+        mode = policy.dag_mode if policy.role != "D" else "off"
+        seq = event.get("seq") if isinstance(event, dict) else None
+        prefetch_started = False
+        if success and policy.dag_mode == "eviction_prefetch":
+            prefetch_started = self._drain_dag_prefetch_queue()
+        return success, reason, mode, seq, prefetch_started, None
+
     def update_hint(self, recv_req):
+        dag_event = getattr(recv_req, "dag_event", None)
+        if dag_event is not None:
+            return self.handle_dag_event(recv_req)[4]
         from sglang.srt.mem_cache.agent_lifecycle import LifecycleHint
         state = SessionLifecycleState(recv_req.state)
         if recv_req.session_id not in self.sessions:
