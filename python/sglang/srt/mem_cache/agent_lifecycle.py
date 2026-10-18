@@ -488,7 +488,7 @@ class AgentLifecycle:
             return ()
         self.dag_cleanup_expired(self.dag_logical_now)
         candidates = [h for state in self.dag_workflows.values() for h in state.consumers.values()
-                      if h.status == "pending" and h.stable_history_prepare and h.expected_resume_at is not None]
+                      if h.status in {"pending", "ready"} and h.stable_history_prepare and h.expected_resume_at is not None]
         candidates.sort(key=lambda h: (h.expected_resume_at, h.next_use_distance if h.next_use_distance is not None else 1 << 30,
                                       -h.prefix_tokens, h.workflow_id, h.consumer_id))
         return tuple(candidates[:32])
@@ -608,7 +608,10 @@ class AgentLifecycle:
         fields = dict(restore_estimate_ms=restore, alternate_estimate_ms=alternate,
                       available_overlap_ms=overlap, remaining_restore_wait_ms=remaining,
                       estimate_basis=basis)
+        # The early window bounds speculative preparation. Once dependencies
+        # actually converge, retain V1's benefit decision and resource guards.
         if (self.dag_mode == "eviction_prefetch"
+                and hint.remaining_dependencies != 0
                 and overlap > restore * (1.0 + self.dag_early_window_factor)):
             return False, dict(fields, reason="too_early_for_predictive_window")
         if overlap <= 0 or remaining >= min(restore, alternate):

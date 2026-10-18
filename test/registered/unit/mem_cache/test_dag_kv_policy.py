@@ -520,6 +520,125 @@ class TestDAGKVPolicy(CustomTestCase):
         )
         self.assertEqual(len(self.policy.attempts["session"]["tokens"]), 8)
 
+    def test_converged_16k_prefetch_keeps_v1_benefit_decision(self):
+        self.assertTrue(self._configure("eviction_prefetch", stable_history_prepare=True)[0])
+        self.assertTrue(self._consumer(prefix_tokens=16384, stable_history_prepare=True)[0])
+        cost = dict(valid=True, predicted_restore_ms=627.755019813776,
+                    predicted_recompute_ms=1326.355554163456)
+        # The sealed trace has enough overlap, but it is outside EP's narrow
+        # speculative window. Actual dependency convergence must retain V1.
+        for restore_ms in (90.42651951313019, 113.42152208089828):
+            self.policy.host_samples.clear()
+            for _ in range(3):
+                self.policy.observe("host", 16384, restore_ms)
+            for state in ("READY_SOON", "TOOL_WAITING", "DEPENDENCY_BLOCKED"):
+                with self.subTest(restore_ms=restore_ms, state=state):
+                    self.policy.update("session", LifecycleHint(
+                        state, 1000.3418154716492, remaining_dependencies=0,
+                        confidence=0.9))
+                    allowed, fields = self.policy.admission(
+                        "session", 16384, "host", True, cost)
+                    self.assertTrue(allowed)
+                    self.assertEqual(fields["reason"], "overlap_reduces_resume_wait")
+                    self.policy.update("session", LifecycleHint(
+                        state, 1000.3418154716492, remaining_dependencies=1,
+                        confidence=0.9))
+                    allowed, fields = self.policy.admission(
+                        "session", 16384, "host", True, cost,
+                        allow_stable_history=True)
+                    self.assertFalse(allowed)
+                    self.assertEqual(fields["reason"], "too_early_for_predictive_window")
+
+    def test_converged_prefetch_keeps_resource_and_state_rejections(self):
+        self.assertTrue(self._configure("eviction_prefetch", stable_history_prepare=True)[0])
+        for _ in range(3):
+            self.policy.observe("host", 16384, 90.42651951313019)
+        cases = (
+            ("capacity", {"capacity": False}, "target_capacity"),
+            ("copy", {"complete": False}, "incomplete_cold_copy"),
+            ("budget", {"inflight": True}, "inflight_budget"),
+            ("active", {"state": "ACTIVE"}, "state_not_prefetch_candidate"),
+            ("completed", {"state": "COMPLETED"}, "state_not_prefetch_candidate"),
+            ("confidence", {"confidence": 0.2}, "low_confidence"),
+            ("samples", {"valid": False}, "missing_recompute_samples"),
+            ("expired", {"deadline": 999.9}, "no_remaining_wait_benefit"),
+            ("cost", {"deadline": 1000.03, "alternate": 50}, "no_remaining_wait_benefit"),
+        )
+        for name, options, reason in cases:
+            with self.subTest(name=name):
+                self.policy.attempts.clear()
+                if options.get("inflight"):
+                    self.policy.attempts["other"] = {"state": "REQUESTED"}
+                self.policy.update("session", LifecycleHint(
+                    options.get("state", "TOOL_WAITING"),
+                    options.get("deadline", 1000.3418154716492),
+                    remaining_dependencies=0, confidence=options.get("confidence", 0.9)))
+                allowed, fields = self.policy.admission(
+                    "session", 16384, "host", options.get("capacity", True),
+                    dict(valid=options.get("valid", True), predicted_restore_ms=627.755,
+                         predicted_recompute_ms=options.get("alternate", 1326.355)),
+                    complete=options.get("complete", True))
+                self.assertFalse(allowed)
+                self.assertEqual(fields["reason"], reason)
+
+    def test_dependency_ready_is_evaluated_by_existing_controller(self):
+        self.assertTrue(self._configure("eviction_prefetch", stable_history_prepare=True)[0])
+        self.assertTrue(self._consumer(
+            prefix_tokens=16384, stable_history_prepare=True,
+            required_dependencies=1, completed_dependencies=0)[0])
+        for _ in range(3):
+            self.policy.observe("host", 16384, 90.42651951313019)
+        self.policy.update("session", LifecycleHint(
+            "TOOL_WAITING", 1000.3418154716492,
+            remaining_dependencies=0, confidence=0.9))
+        decisions = []
+
+        def prefetch(session_id, req, prefix_tokens):
+            allowed, fields = self.policy.admission(
+                session_id, prefix_tokens, "host", True,
+                dict(valid=True, predicted_restore_ms=627.755,
+                     predicted_recompute_ms=1326.355))
+            decisions.append((prefix_tokens, allowed, fields["reason"]))
+            return allowed
+
+        controller = SimpleNamespace(tree_cache=SimpleNamespace(
+            agent_lifecycle=self.policy,
+            get_session_lifecycle_request=lambda _sid: object(),
+            prefetch_session=prefetch))
+        controller._drain_dag_prefetch_queue = lambda: (
+            SessionController._drain_dag_prefetch_queue(controller))
+        result = SessionController.handle_dag_event(controller, SimpleNamespace(
+            dag_event=dict(kind="dependency_complete", workflow_id="workflow",
+                           epoch=0, seq=2, logical_time=1000.0,
+                           consumer_id="consumer", session_id="session")))
+        self.assertTrue(result[0])
+        self.assertEqual(self.policy.dag_workflows["workflow"].consumers["consumer"].status, "ready")
+        self.assertTrue(result[4])
+        self.assertEqual(decisions, [(16384, True, "overlap_reduces_resume_wait")])
+        # A later management event must not prepare KV for an active request.
+        self.policy.update("session", LifecycleHint("ACTIVE", confidence=1.0))
+        result = SessionController.handle_dag_event(controller, SimpleNamespace(
+            dag_event=dict(kind="tick", workflow_id="workflow", epoch=0, seq=3,
+                           logical_time=1000.0, session_id="session")))
+        self.assertFalse(result[4])
+        self.assertEqual(decisions[-1], (16384, False, "missing_deadline"))
+
+    def test_prefetch_candidate_status_and_expiry(self):
+        self.assertTrue(self._configure("eviction_prefetch", stable_history_prepare=True)[0])
+        self.assertTrue(self._consumer(prefix_tokens=16384, stable_history_prepare=True)[0])
+        workflow = self.policy.dag_workflows["workflow"]
+        hint = workflow.consumers["consumer"]
+        for state in ("pending", "ready", "active", "cancelled", "completed"):
+            with self.subTest(state=state):
+                hint.status = state
+                workflow.consumers["consumer"] = hint
+                candidates = self.policy.dag_prefetch_candidates()
+                self.assertEqual(len(candidates), int(state in {"pending", "ready"}))
+        hint.status = "ready"
+        hint.valid_until = 1000.0
+        workflow.consumers["consumer"] = hint
+        self.assertEqual(self.policy.dag_prefetch_candidates(), ())
+
     def test_ep_victim_trial_is_bounded_and_does_not_release_or_sacrifice_closer_use(self):
         self.assertTrue(self._configure("eviction_prefetch", stable_history_prepare=True)[0])
         self.assertTrue(self._consumer("future", "future-session", 1,
