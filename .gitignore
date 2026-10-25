@@ -285,3 +285,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Local checkouts for the Project A learning workspace.
+/.project-a-components/

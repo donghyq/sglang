@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "snapshots": [
+    {
+      "name": "sglang-remote-restore-admission",
+      "repository": "https://github.com/donghyq/sglang",
+      "base_revision": "6f1e180773d79a07a6a7c652ff0cdfa38db4ae54",
+      "patch_file": "sglang-remote-restore-admission.patch",
+      "patch_sha256": "48e697c188fbd23912eedf25099ff3a875f5d4385e8738207e4f341b084bfbe6",
+      "files": [
+        {
+          "path": "python/sglang/srt/managers/io_struct.py",
+          "sha256": "3424b1be97092ee3a87313921b9d931d855c5ca3f3fc6279f07a800563623804"
+        },
+        {
+          "path": "python/sglang/srt/managers/schedule_batch.py",
+          "sha256": "7847904e9278d63823c7a3502be3cb9e120db471bdff5ae86be8bb90b530a4d2"
+        },
+        {
+          "path": "python/sglang/srt/managers/scheduler.py",
+          "sha256": "d6b955f797adadc3177773c0079f35e6fbfcdb8a4e5d379457c8935e20dba586"
+        },
+        {
+          "path": "python/sglang/srt/managers/tokenizer_manager.py",
+          "sha256": "387a4349932687786d973f8f99687ed19157a7c6b08ba083c5894374b1ed2548"
+        },
+        {
+          "path": "python/sglang/srt/session/session_controller.py",
+          "sha256": "6f21db20025a954da85d14885d03353f05e41463ef76b2940d0f4fae9d14b94a"
+        },
+        {
+          "path": "test/registered/unit/managers/test_remote_cache_restore_admission.py",
+          "sha256": "6c81fe3648c9ee306271b19ad08f6610ace6068a3931a5b3c02d1746c2e6e73a"
+        }
+      ],
+      "status": "unintegrated_worktree_snapshot_not_runtime_baseline",
+      "applies_cleanly_to_declared_base": true
+    },
+    {
+      "name": "mooncake-conductor-pending",
+      "repository": "https://github.com/donghyq/Mooncake",
+      "base_revision": "3d88bf917ae83eb30633e3fe26113342b902e622",
+      "patch_file": "mooncake-conductor-pending.patch",
+      "patch_sha256": "26965d6fee496d4ef88cd47dc0ef653a77e65f9a0ed8ac05b3fb85d58e2b473e",
+      "files": [
+        {
+          "path": "mooncake-conductor/conductor-ctrl/common/types.go",
+          "sha256": "8ace73eb839a97f48e1b792184e62c61bb75e26a48e41e7b7a6b265ca43a3932"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/kvevent/event_handler.go",
+          "sha256": "ab289bef2b51a0590201d42f3b8a3d9193acdb5ed5d8c77af659c19ed56622d8"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/kvevent/event_handler_test.go",
+          "sha256": "98a1529b5530826934c1b76e0ca07538ba328907b1546a4bf0ca73c0435408a5"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/kvevent/event_manager.go",
+          "sha256": "64b91f9daaaa62ee547d9b51594edeafef33786bdfdd28e0a5a4ac9a98c0279f"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/kvevent/event_manager_test.go",
+          "sha256": "6c0c060a9d3a01da6c6fe5010d4abef2e6d8132ed017a6149a4023242b7fed8e"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/main.go",
+          "sha256": "637c924e2d0f24af29e6dffa146cfcbbd9a22e5e6b7766dc1775edf8edcc17a9"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/prefixindex/prefix_indexer.go",
+          "sha256": "17f16e2014264648e7fc26cb3e76cfc2e892c9075d140437a673b2a80b05637b"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/zmq/event_type.go",
+          "sha256": "bf299e561558be15c569cd94d3ba8e4a3d780e5a0cda986720f6e9ca278e0848"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/zmq/msg_decoder.go",
+          "sha256": "fd99a88431309488876dc6a479c04922d27e2fe8439a4c79c5f75795c266444e"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/zmq/msg_decoder_test.go",
+          "sha256": "7b904410cc7735bbde7f26da88f6050ddbf2455b4618a1a30804ecc3bb3aad94"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/zmq/types.go",
+          "sha256": "93642c8cd01e34955393b1fee7b62205ced80a7085c25ae7306e4d87c5522660"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/zmq/zmq_client.go",
+          "sha256": "3772b58db8ce1edeb1da2b09c8ef5d225f7dce4b4f03d124be2e13310fb23f39"
+        },
+        {
+          "path": "mooncake-conductor/conductor-ctrl/zmq/zmq_client_test.go",
+          "sha256": "6ccc6ca05b1790fa83023c9313a6cbe3b65c99fe3174685be3abd8355ae7f11d"
+        }
+      ],
+      "status": "unintegrated_worktree_snapshot_not_runtime_baseline",
+      "applies_cleanly_to_declared_base": true
+    }
+  ]
+}

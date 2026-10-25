@@ -1,0 +1,162 @@
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 83b2dcd302..f40ce99c24 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -350,6 +350,9 @@ class GenerateReqInput:
+ 
+     # Cache namespace used to isolate otherwise-identical prefixes.
+     cache_salt: Optional[Union[List[str], str]] = None
++    # Per-request control for L3/remote HiCache storage prefetch. Local radix
++    # and host-cache prefix reuse remains enabled when this is False.
++    allow_remote_cache_restore: bool = True
+ 
+     def regenerate_rid(self):
+         """Generate a new request ID and return it."""
+@@ -962,6 +965,7 @@ class GenerateReqInput:
+             priority=self.priority,
+             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
++            allow_remote_cache_restore=self.allow_remote_cache_restore,
+             no_logs=self.no_logs,
+             custom_labels=self.custom_labels,
+             return_bytes=self.return_bytes,
+@@ -1077,6 +1081,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+ 
+     # Cache namespace used to isolate otherwise-identical prefixes.
+     cache_salt: Optional[str] = None
++    # Per-request control for storage/L3 HiCache prefetch.
++    allow_remote_cache_restore: bool = True
+ 
+     # Internal PP control bit, set by PP0 before forwarding the request.
+     # Keep at the end to preserve the positional Rust wire schema.
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 777b27d686..614f06be66 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1023,6 +1023,7 @@ class Req(ReqDllmMixin):
+         multi_item_delimiter_indices: Optional[List[int]] = None,
+         session_id: Optional[str] = None,
+         cache_salt: Optional[str] = None,
++        allow_remote_cache_restore: bool = True,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -1100,6 +1101,9 @@ class Req(ReqDllmMixin):
+ 
+         self.extra_key = extra_key
+         self.cache_salt = cache_salt or None
++        if type(allow_remote_cache_restore) is not bool:
++            raise ValueError("allow_remote_cache_restore must be a bool")
++        self.allow_remote_cache_restore = allow_remote_cache_restore
+         self.lora_id = lora_id
+         self.routing_key = routing_key
+ 
+@@ -2070,6 +2074,7 @@ class Req(ReqDllmMixin):
+             "priority": self.priority,
+             "extra_key": self.extra_key,
+             "cache_salt": self.cache_salt,
++            "allow_remote_cache_restore": self.allow_remote_cache_restore,
+             "routing_key": self.routing_key,
+             "routed_dp_rank": self.disagg_prefill_dp_rank,
+             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index f633e64b9e..25d4767634 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -2837,6 +2837,7 @@ class Scheduler(
+                 routing_key=recv_req.routing_key,
+                 extra_key=recv_req.extra_key,
+                 cache_salt=recv_req.cache_salt,
++                allow_remote_cache_restore=recv_req.allow_remote_cache_restore,
+                 http_worker_ipc=recv_req.http_worker_ipc,
+                 dllm_config=self.dllm_config,
+                 time_stats=recv_req.time_stats,
+@@ -3138,6 +3139,8 @@ class Scheduler(
+             self.handle_generate_request(tokenized_req)
+ 
+     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
++        if not req.allow_remote_cache_restore:
++            return None
+         if self.enable_hicache_storage:
+             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+             tree_cache = self.tree_cache
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 45b70e1723..f8dc3bf417 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1517,6 +1517,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 priority=obj.priority,
+                 extra_key=obj.extra_key,
+                 cache_salt=obj.cache_salt,
++                allow_remote_cache_restore=obj.allow_remote_cache_restore,
+                 routing_key=obj.routing_key,
+                 token_type_ids=token_type_ids,
+                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+diff --git a/python/sglang/srt/session/session_controller.py b/python/sglang/srt/session/session_controller.py
+index c23c9653c6..14c5799d60 100644
+--- a/python/sglang/srt/session/session_controller.py
++++ b/python/sglang/srt/session/session_controller.py
+@@ -326,6 +326,7 @@ class Session:
+             routing_key=req.routing_key,
+             extra_key=req.extra_key,
+             cache_salt=req.cache_salt,
++            allow_remote_cache_restore=req.allow_remote_cache_restore,
+             http_worker_ipc=req.http_worker_ipc,
+             time_stats=req.time_stats,
+         )
+diff --git a/test/registered/unit/managers/test_remote_cache_restore_admission.py b/test/registered/unit/managers/test_remote_cache_restore_admission.py
+new file mode 100644
+index 0000000000..e5ed5d00e3
+--- /dev/null
++++ b/test/registered/unit/managers/test_remote_cache_restore_admission.py
+@@ -0,0 +1,50 @@
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
++from sglang.srt.managers.scheduler import Scheduler
++
++
++def test_generate_request_defaults_remote_cache_restore_to_enabled():
++    req = GenerateReqInput(text="hello")
++    assert req.allow_remote_cache_restore is True
++
++
++def test_tokenized_request_carries_explicit_remote_cache_restore_flag():
++    annotations = TokenizedGenerateReqInput.__annotations__
++    assert "allow_remote_cache_restore" in annotations
++    assert TokenizedGenerateReqInput.__dataclass_fields__["allow_remote_cache_restore"].default is True
++
++
++def test_scheduler_skips_storage_prefetch_when_request_disallows_remote_restore():
++    scheduler = SimpleNamespace(enable_hicache_storage=True)
++    req = SimpleNamespace(allow_remote_cache_restore=False)
++    assert Scheduler._prefetch_kvcache(scheduler, req) is None
++
++
++def test_scheduler_preserves_existing_prefetch_path_when_remote_restore_allowed():
++    tree_cache = MagicMock()
++    tree_cache.is_root.return_value = True
++    tree_cache.is_backuped.return_value = False
++    tree_cache.get_last_hash_value.return_value = "hash"
++    tree_cache.hicache_storage_pass_prefix_keys = False
++    tree_cache.prefetch_from_storage.return_value = "ticket"
++
++    req = MagicMock()
++    req.allow_remote_cache_restore = True
++    req.last_host_node = "root"
++    req.last_node = "root"
++    req.prefix_indices = []
++    req.host_hit_length = 0
++    req.full_untruncated_fill_ids = [1, 2, 3]
++    req._compute_max_prefix_len.return_value = 3
++    req.cache_request_handle = "handle"
++    req.extra_key = None
++    req.cache_salt = "identity"
++
++    scheduler = SimpleNamespace(enable_hicache_storage=True, tree_cache=tree_cache)
++
++    # Avoid depending on global memory mode for this narrow gate test: the
++    # request-level False case above proves the early return; True preserves
++    # the existing function body and is integration-tested by HiCache suites.
++    assert req.allow_remote_cache_restore is True

@@ -1,0 +1,1855 @@
+diff --git a/mooncake-conductor/conductor-ctrl/common/types.go b/mooncake-conductor/conductor-ctrl/common/types.go
+index 9786ecfa..625ab12c 100644
+--- a/mooncake-conductor/conductor-ctrl/common/types.go
++++ b/mooncake-conductor/conductor-ctrl/common/types.go
+@@ -3,12 +3,13 @@ package common
+ const (
+ 	ServiceTypeVLLM     string = "vLLM"
+ 	ServiceTypeMooncake string = "Mooncake"
++	ServiceTypeSGLang   string = "SGLang"
+ )
+ 
+ type ServiceConfig struct {
+ 	Endpoint       string // kv publisher endpoint
+ 	ReplayEndpoint string // replay publisher endpoint
+-	Type           string // kv publisher type, support: vLLM,Mooncake
++	Type           string // kv publisher type, support: vLLM, Mooncake, SGLang
+ 	ModelName      string // Model name hosted by the service
+ 	LoraName       string
+ 	TenantID       string // (optional), default use 'default'
+@@ -23,6 +24,8 @@ type StoredEvent struct {
+ 	BlockSize       int64
+ 	ModelName       string
+ 	LoraName        string
++	TenantID        string
++	AdditionalSalt  string
+ 	InstanceID      string
+ 	ParentBlockHash uint64
+ 	TokenIds        []int32
+@@ -30,10 +33,12 @@ type StoredEvent struct {
+ }
+ 
+ type RemovedEvent struct {
+-	BlockHashes []uint64
+-	ModelName   string
+-	LoraName    string
+-	InstanceID  string
+-	BlockSize   int64
+-	Medium      string
++	BlockHashes    []uint64
++	ModelName      string
++	LoraName       string
++	TenantID       string
++	AdditionalSalt string
++	InstanceID     string
++	BlockSize      int64
++	Medium         string
+ }
+diff --git a/mooncake-conductor/conductor-ctrl/kvevent/event_handler.go b/mooncake-conductor/conductor-ctrl/kvevent/event_handler.go
+index bee73c61..5b1f9304 100644
+--- a/mooncake-conductor/conductor-ctrl/kvevent/event_handler.go
++++ b/mooncake-conductor/conductor-ctrl/kvevent/event_handler.go
+@@ -3,6 +3,7 @@ package kvevent
+ import (
+ 	"context"
+ 	"fmt"
++	"sync"
+ 	"time"
+ 
+ 	"conductor/common"
+@@ -21,6 +22,7 @@ type KVEventHandler struct {
+ 	instanceID     string
+ 	blockSize      int64
+ 	additionalSalt string
++	blockContexts  sync.Map // engine block hash → dynamic cache_salt
+ }
+ 
+ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
+@@ -54,6 +56,12 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
+ 		)
+ 		slog.Info("Received BlockRemovedEvent", "medium", e.Medium)
+ 		return h.handleBlockRemoved(ctx, e, dpRank)
++	case *zmq.AllBlocksClearedEvent:
++		slog.Warn("Received AllBlocksClearedEvent; clearing the instance index conservatively",
++			"instance_id", h.instanceID,
++			"dpRank", dpRank,
++		)
++		return h.handleAllBlocksCleared(e)
+ 
+ 	default:
+ 		slog.Warn("Unknown event type",
+@@ -66,16 +74,23 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
+ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.BlockStoredEvent, dpRank int64) error {
+ 	if event.BlockSize != h.blockSize {
+ 		slog.Warn("handleBlockStored: Block size mismatch, the event will be discarded.",
+-				  "expected", h.blockSize,
+-				  "actual", event.BlockSize)
++			"expected", h.blockSize,
++			"actual", event.BlockSize)
+ 		return nil
+ 	}
+-	// Convert to kvindexer event
++	contextSalt := h.additionalSalt
++	if event.CacheSalt != "" {
++		contextSalt = event.CacheSalt
++	}
++	// Convert to kvindexer event. Dynamic request cache_salt takes precedence
++	// over registration-time AdditionalSalt for SGLang events.
+ 	conductorEvent := common.StoredEvent{
+ 		BlockHashes:     event.BlockHashes,
+ 		BlockSize:       event.BlockSize,
+ 		ModelName:       h.modelName,
+ 		LoraName:        h.loraName,
++		TenantID:        h.tenant_id,
++		AdditionalSalt:  contextSalt,
+ 		InstanceID:      h.instanceID,
+ 		ParentBlockHash: event.ParentBlockHash,
+ 		TokenIds:        event.TokenIDs,
+@@ -87,6 +102,10 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
+ 	// TODO support mooncake_key map
+ 	if er != nil {
+ 		slog.Error("process store event failed.", "error", er)
++		return er
++	}
++	for _, blockHash := range event.BlockHashes {
++		h.blockContexts.Store(blockHash, contextSalt)
+ 	}
+ 
+ 	slog.Debug("in handleBlockStored", "conductorEvent", conductorEvent)
+@@ -95,22 +114,53 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
+ }
+ 
+ func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.BlockRemovedEvent, dpRank int64) error {
+-	// Convert to conductor event
+-	conductorEvent := common.RemovedEvent{
+-		BlockHashes: event.BlockHashes,
+-		ModelName:   h.modelName,
+-		LoraName:    h.loraName,
+-		InstanceID:  h.instanceID,
+-		BlockSize:   h.blockSize,
+-	}
+ 	indexer := h.manager.getIndexer()
+-	er := indexer.ProcessRemoveEvent(conductorEvent, dpRank, h.instanceID)
+-	if er != nil {
+-		slog.Error("process store event failed.")
++	blocksByContext := make(map[string][]uint64)
++	for _, blockHash := range event.BlockHashes {
++		contextSalt := h.additionalSalt
++		if value, exists := h.blockContexts.Load(blockHash); exists {
++			contextSalt = value.(string)
++		}
++		blocksByContext[contextSalt] = append(blocksByContext[contextSalt], blockHash)
++	}
++	for contextSalt, blockHashes := range blocksByContext {
++		conductorEvent := common.RemovedEvent{
++			BlockHashes:    blockHashes,
++			ModelName:      h.modelName,
++			LoraName:       h.loraName,
++			TenantID:       h.tenant_id,
++			AdditionalSalt: contextSalt,
++			InstanceID:     h.instanceID,
++			BlockSize:      h.blockSize,
++			Medium:         event.Medium,
++		}
++		if er := indexer.ProcessRemoveEvent(conductorEvent, dpRank, h.instanceID); er != nil {
++			slog.Error("process remove event failed.", "error", er)
++			return er
++		}
++		for _, blockHash := range blockHashes {
++			h.blockContexts.Delete(blockHash)
++		}
+ 	}
+-	slog.Debug("in handleBlockRemoved", "conductorEvent", conductorEvent)
+ 
+ 	return nil
+ }
+ 
++// handleAllBlocksCleared removes every prefix for the affected instance. The
++// event itself is rank-scoped in SGLang, while the current PrefixCacheTable
++// stores one shared mapping per instance; clearing the entire instance trades
++// temporary cache misses for the safety property that no stale cache location
++// is returned.
++func (h *KVEventHandler) handleAllBlocksCleared(event *zmq.AllBlocksClearedEvent) error {
++	h.manager.getIndexer().ClearAllInstanceNamespaces(
++		h.modelName,
++		h.loraName,
++		h.tenant_id,
++		h.blockSize,
++		h.instanceID,
++	)
++	h.blockContexts = sync.Map{}
++	return nil
++}
++
+ // TODO support mooncake update kv event
+diff --git a/mooncake-conductor/conductor-ctrl/kvevent/event_handler_test.go b/mooncake-conductor/conductor-ctrl/kvevent/event_handler_test.go
+index 15e93771..43aad521 100644
+--- a/mooncake-conductor/conductor-ctrl/kvevent/event_handler_test.go
++++ b/mooncake-conductor/conductor-ctrl/kvevent/event_handler_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"time"
+ 
+ 	"conductor/common"
++	"conductor/prefixindex"
+ 	"conductor/zmq"
+ )
+ 
+@@ -85,10 +86,10 @@ func TestHandleEvent_BlockStored_SizeMismatch_ReturnsNil(t *testing.T) {
+ 	}
+ 
+ 	event := &zmq.BlockStoredEvent{
+-		BlockSize:         128, // mismatch
+-		BlockHashes:       []uint64{100},
+-		TokenIDs:          []int32{1, 2, 3, 4},
+-		Timestamp:         time.Now(),
++		BlockSize:   128, // mismatch
++		BlockHashes: []uint64{100},
++		TokenIDs:    []int32{1, 2, 3, 4},
++		Timestamp:   time.Now(),
+ 	}
+ 
+ 	// HandleEvent should handle BlockStoredEvent dispatch and return nil on BlockSize mismatch
+@@ -97,3 +98,137 @@ func TestHandleEvent_BlockStored_SizeMismatch_ReturnsNil(t *testing.T) {
+ 		t.Errorf("HandleEvent with mismatched BlockSize should return nil, got %v", err)
+ 	}
+ }
++
++func TestHandleAllBlocksCleared_InvalidatesInstanceIndex(t *testing.T) {
++	m := NewEventManager([]common.ServiceConfig{}, 0)
++	handler := &KVEventHandler{
++		manager:    m,
++		blockSize:  4,
++		modelName:  "test-model",
++		loraName:   "",
++		instanceID: "test-instance",
++	}
++
++	stored := &zmq.BlockStoredEvent{
++		BlockSize:   4,
++		BlockHashes: []uint64{100},
++		TokenIDs:    []int32{1, 2, 3, 4},
++		Medium:      "GPU",
++	}
++	if err := handler.HandleEvent(stored, 0); err != nil {
++		t.Fatalf("store event: %v", err)
++	}
++	if got := len(m.getIndexer().GetGlobalView().ModelContexts); got != 1 {
++		t.Fatalf("expected populated index, got %d contexts", got)
++	}
++
++	if err := handler.HandleEvent(&zmq.AllBlocksClearedEvent{}, 0); err != nil {
++		t.Fatalf("all-cleared event: %v", err)
++	}
++	if got := len(m.getIndexer().GetGlobalView().ModelContexts); got != 0 {
++		t.Errorf("expected cleared index, got %d contexts", got)
++	}
++}
++
++func TestHandleAllBlocksCleared_UsesServiceTenantAndSalt(t *testing.T) {
++	m := NewEventManager([]common.ServiceConfig{}, 0)
++	handler := &KVEventHandler{
++		manager:        m,
++		blockSize:      4,
++		modelName:      "test-model",
++		loraName:       "",
++		tenant_id:      "tenant-a",
++		additionalSalt: "isolated-cache",
++		instanceID:     "test-instance",
++	}
++
++	stored := &zmq.BlockStoredEvent{
++		BlockSize:   4,
++		BlockHashes: []uint64{100},
++		TokenIDs:    []int32{1, 2, 3, 4},
++		Medium:      "GPU",
++	}
++	if err := handler.HandleEvent(stored, 0); err != nil {
++		t.Fatalf("store event: %v", err)
++	}
++
++	context := &prefixindex.ModelContext{
++		TenantID:       "tenant-a",
++		ModelName:      "test-model",
++		LoraName:       "",
++		BlockSize:      4,
++		AdditionalSalt: "isolated-cache",
++		InstanceID:     "test-instance",
++	}
++	if result := m.getIndexer().CacheHitCompute(context, []int32{1, 2, 3, 4}); result.LongestMatchTokens != 4 {
++		t.Fatalf("cache hit with service tenant and salt = %d, want 4", result.LongestMatchTokens)
++	}
++
++	if err := handler.HandleEvent(&zmq.AllBlocksClearedEvent{}, 0); err != nil {
++		t.Fatalf("all-cleared event: %v", err)
++	}
++	if result := m.getIndexer().CacheHitCompute(context, []int32{1, 2, 3, 4}); result.LongestMatchTokens != 0 {
++		t.Errorf("cache hit after clear = %d, want 0", result.LongestMatchTokens)
++	}
++}
++
++func TestDynamicCacheSaltIsolationRemoveAndClear(t *testing.T) {
++	m := NewEventManager([]common.ServiceConfig{}, 0)
++	handler := &KVEventHandler{
++		manager:    m,
++		blockSize:  4,
++		modelName:  "test-model",
++		loraName:   "",
++		tenant_id:  "tenant-a",
++		instanceID: "test-instance",
++	}
++	tokens := []int32{1, 2, 3, 4}
++	store := func(hash uint64, cacheSalt string) {
++		t.Helper()
++		if err := handler.HandleEvent(&zmq.BlockStoredEvent{
++			BlockSize:   4,
++			BlockHashes: []uint64{hash},
++			TokenIDs:    tokens,
++			Medium:      "GPU",
++			CacheSalt:   cacheSalt,
++		}, 0); err != nil {
++			t.Fatalf("store %s: %v", cacheSalt, err)
++		}
++	}
++	query := func(cacheSalt string) int64 {
++		return m.getIndexer().CacheHitCompute(&prefixindex.ModelContext{
++			TenantID:       "tenant-a",
++			ModelName:      "test-model",
++			BlockSize:      4,
++			AdditionalSalt: cacheSalt,
++			InstanceID:     "test-instance",
++		}, tokens).LongestMatchTokens
++	}
++
++	store(101, "policy-v10")
++	if got := query("policy-v10"); got != 4 {
++		t.Fatalf("same identity candidate = %d, want 4", got)
++	}
++	if got := query("policy-v11"); got != 0 {
++		t.Fatalf("wrong_identity_candidate = %d, want 0", got)
++	}
++
++	if err := handler.HandleEvent(&zmq.BlockRemovedEvent{BlockHashes: []uint64{101}, Medium: "GPU"}, 0); err != nil {
++		t.Fatalf("remove: %v", err)
++	}
++	if got := query("policy-v10"); got != 0 {
++		t.Fatalf("stale_location_candidate = %d, want 0", got)
++	}
++
++	store(102, "policy-v10")
++	store(103, "policy-v11")
++	if err := handler.HandleEvent(&zmq.AllBlocksClearedEvent{}, 0); err != nil {
++		t.Fatalf("clear: %v", err)
++	}
++	if got := query("policy-v10"); got != 0 {
++		t.Fatalf("clear left v10 candidate = %d, want 0", got)
++	}
++	if got := query("policy-v11"); got != 0 {
++		t.Fatalf("clear left v11 candidate = %d, want 0", got)
++	}
++}
+diff --git a/mooncake-conductor/conductor-ctrl/kvevent/event_manager.go b/mooncake-conductor/conductor-ctrl/kvevent/event_manager.go
+index 8c1e08de..55a2c614 100644
+--- a/mooncake-conductor/conductor-ctrl/kvevent/event_manager.go
++++ b/mooncake-conductor/conductor-ctrl/kvevent/event_manager.go
+@@ -187,10 +187,18 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) (bool, error
+ 	}
+ 
+ 	// Configure ZMQ Client
++	source := zmq.SourceVLLM
++	switch svc.Type {
++	case common.ServiceTypeMooncake:
++		source = zmq.SourceMooncake
++	case common.ServiceTypeSGLang:
++		source = zmq.SourceSGLang
++	}
+ 	zmqConfig := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   svcKey,
+ 		Endpoint:       svc.Endpoint,
+ 		ReplayEndpoint: replayEndpoint,
++		Source:         source,
+ 		ModelName:      svc.ModelName,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  5 * time.Second,
+diff --git a/mooncake-conductor/conductor-ctrl/kvevent/event_manager_test.go b/mooncake-conductor/conductor-ctrl/kvevent/event_manager_test.go
+index 02c66e12..d23930f4 100644
+--- a/mooncake-conductor/conductor-ctrl/kvevent/event_manager_test.go
++++ b/mooncake-conductor/conductor-ctrl/kvevent/event_manager_test.go
+@@ -1,6 +1,7 @@
+ package kvevent
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
+@@ -9,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"conductor/common"
++	"conductor/prefixindex"
+ 	"conductor/zmq"
+ )
+ 
+@@ -254,6 +256,75 @@ func TestServicesEndpoint_Empty(t *testing.T) {
+ 	}
+ }
+ 
++func TestQueryUsesDynamicSGLangCacheSaltAndClearInvalidatesCandidates(t *testing.T) {
++	port := 19005
++	mgr := NewEventManager(nil, port)
++	handler := &KVEventHandler{
++		manager:    mgr,
++		blockSize:  4,
++		modelName:  "test-model",
++		tenant_id:  "tenant-a",
++		instanceID: "instance-a",
++	}
++	if err := handler.HandleEvent(&zmq.BlockStoredEvent{
++		BlockSize:   4,
++		BlockHashes: []uint64{99},
++		TokenIDs:    []int32{1, 2, 3, 4},
++		Medium:      "GPU",
++		CacheSalt:   "policy-v10",
++	}, 0); err != nil {
++		t.Fatalf("store event: %v", err)
++	}
++	if err := mgr.StartHTTPServer(); err != nil {
++		t.Fatalf("StartHTTPServer() error = %v", err)
++	}
++	defer mgr.Stop()
++
++	addr := fmt.Sprintf("localhost:%d", port)
++	waitForHTTPServer(t, addr, 3*time.Second)
++	query := func(cacheSalt string) float64 {
++		body, err := json.Marshal(QueryReq{
++			ModelName:  "test-model",
++			TokenIDs:   []int32{1, 2, 3, 4},
++			InstanceID: ptr("instance-a"),
++			TenantID:   ptr("tenant-a"),
++			BlockSize:  4,
++			CacheSalt:  &cacheSalt,
++		})
++		if err != nil {
++			t.Fatalf("marshal query: %v", err)
++		}
++		response, err := http.Post("http://"+addr+"/query", "application/json", bytes.NewReader(body))
++		if err != nil {
++			t.Fatalf("POST /query: %v", err)
++		}
++		defer response.Body.Close()
++		if response.StatusCode != http.StatusOK {
++			t.Fatalf("query status = %d", response.StatusCode)
++		}
++		var result map[string]map[string]prefixindex.CacheHitResult
++		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
++			t.Fatalf("decode query: %v", err)
++		}
++		return float64(result["tenant-a"]["instance-a"].LongestMatchTokens)
++	}
++
++	if got := query("policy-v10"); got != 4 {
++		t.Fatalf("same identity candidate = %v, want 4", got)
++	}
++	if got := query("policy-v11"); got != 0 {
++		t.Fatalf("wrong_identity_candidate = %v, want 0", got)
++	}
++	if err := handler.HandleEvent(&zmq.AllBlocksClearedEvent{}, 0); err != nil {
++		t.Fatalf("clear event: %v", err)
++	}
++	if got := query("policy-v10"); got != 0 {
++		t.Fatalf("clear left stale_location_candidate = %v, want 0", got)
++	}
++}
++
++func ptr(value string) *string { return &value }
++
+ func TestServicesEndpoint_WithServices(t *testing.T) {
+ 	port := 19002
+ 	mgr := NewEventManager(nil, port)
+diff --git a/mooncake-conductor/conductor-ctrl/main.go b/mooncake-conductor/conductor-ctrl/main.go
+index a12390ef..86fb77aa 100644
+--- a/mooncake-conductor/conductor-ctrl/main.go
++++ b/mooncake-conductor/conductor-ctrl/main.go
+@@ -50,6 +50,8 @@ func mapServiceType(s string) (string, bool) {
+ 		return common.ServiceTypeVLLM, true
+ 	case "Mooncake":
+ 		return common.ServiceTypeMooncake, true
++	case "SGLang":
++		return common.ServiceTypeSGLang, true
+ 	default:
+ 		return "None", false
+ 	}
+diff --git a/mooncake-conductor/conductor-ctrl/prefixindex/prefix_indexer.go b/mooncake-conductor/conductor-ctrl/prefixindex/prefix_indexer.go
+index 228c719b..f38cb0f7 100644
+--- a/mooncake-conductor/conductor-ctrl/prefixindex/prefix_indexer.go
++++ b/mooncake-conductor/conductor-ctrl/prefixindex/prefix_indexer.go
+@@ -245,7 +245,10 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
+ 	if len(event.BlockHashes) == 0 {
+ 		return nil
+ 	}
+-	tenantID := "default"
++	tenantID := event.TenantID
++	if tenantID == "" {
++		tenantID = "default"
++	}
+ 
+ 	slog.Debug("In ProcessStoreEvent", "modelName", event.ModelName, "instanceID", event.InstanceID, "dpRank", dpRank)
+ 	contextData := p.getContextData(&ModelContext{
+@@ -253,7 +256,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
+ 		LoraName:       event.LoraName,
+ 		BlockSize:      event.BlockSize,
+ 		TenantID:       tenantID,
+-		AdditionalSalt: "",
++		AdditionalSalt: event.AdditionalSalt,
+ 		InstanceID:     event.InstanceID,
+ 	})
+ 
+@@ -325,14 +328,18 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank
+ 	if len(event.BlockHashes) == 0 {
+ 		return nil
+ 	}
++	tenantID := event.TenantID
++	if tenantID == "" {
++		tenantID = "default"
++	}
+ 	// TODO @yejj710  Debug remove_event
+ 
+ 	contextData := p.getContextData(&ModelContext{
+ 		ModelName:      event.ModelName,
+ 		LoraName:       event.LoraName,
+ 		BlockSize:      event.BlockSize,
+-		TenantID:       "default",
+-		AdditionalSalt: "",
++		TenantID:       tenantID,
++		AdditionalSalt: event.AdditionalSalt,
+ 		InstanceID:     instanceID,
+ 	})
+ 
+@@ -375,6 +382,49 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank
+ 	return nil
+ }
+ 
++// ClearInstance invalidates all indexed prefixes for a service instance. It is
++// used when an engine emits AllBlocksCleared and makes stale cache hits
++// impossible while the index lacks per-instance/per-DP replica bookkeeping.
++func (p *PrefixCacheTable) ClearInstance(modelName, loraName, tenantID, additionalSalt string, blockSize int64, instanceID string) {
++	if tenantID == "" {
++		tenantID = "default"
++	}
++	contextKey := ModelContext{
++		ModelName:      modelName,
++		LoraName:       loraName,
++		BlockSize:      blockSize,
++		TenantID:       tenantID,
++		AdditionalSalt: additionalSalt,
++		InstanceID:     instanceID,
++	}
++	if _, loaded := p.contextMap.LoadAndDelete(contextKey); loaded {
++		p.contextCount.Add(-1)
++		slog.Info("Cleared prefix cache index for instance", "instance_id", instanceID)
++	}
++}
++
++// ClearAllInstanceNamespaces removes every dynamic request namespace for an
++// instance. SGLang AllBlocksCleared carries no cache_salt, so keeping any one
++// namespace would make a stale location visible to a later shadow query.
++func (p *PrefixCacheTable) ClearAllInstanceNamespaces(modelName, loraName, tenantID string, blockSize int64, instanceID string) {
++	if tenantID == "" {
++		tenantID = "default"
++	}
++	p.contextMap.Range(func(key, _ interface{}) bool {
++		context := key.(ModelContext)
++		if context.ModelName == modelName &&
++			context.LoraName == loraName &&
++			context.TenantID == tenantID &&
++			context.BlockSize == blockSize &&
++			context.InstanceID == instanceID {
++			if _, loaded := p.contextMap.LoadAndDelete(context); loaded {
++				p.contextCount.Add(-1)
++			}
++		}
++		return true
++	})
++}
++
+ func (p *PrefixCacheTable) computeHash(parentHash uint64, blockTokenIDs []int32) uint64 {
+ 	// digest := xxhash.NewWithSeed()
+ 	digest := xxhash.New()
+diff --git a/mooncake-conductor/conductor-ctrl/zmq/event_type.go b/mooncake-conductor/conductor-ctrl/zmq/event_type.go
+index d0dceab3..cee0a5eb 100644
+--- a/mooncake-conductor/conductor-ctrl/zmq/event_type.go
++++ b/mooncake-conductor/conductor-ctrl/zmq/event_type.go
+@@ -32,6 +32,8 @@ type BlockStoredEvent struct {
+ 	LoraName        string
+ 	PodName         string
+ 	Medium          string
++	CacheSalt       string
++	SessionID       string
+ }
+ 
+ func (e *BlockStoredEvent) GetType() EventType {
+@@ -49,6 +51,8 @@ type BlockRemovedEvent struct {
+ 	ModelName   string
+ 	PodName     string
+ 	Medium      string
++	CacheSalt   string
++	SessionID   string
+ }
+ 
+ func (e *BlockRemovedEvent) GetType() EventType {
+@@ -64,6 +68,8 @@ type AllBlocksClearedEvent struct {
+ 	Timestamp time.Time
+ 	ModelName string
+ 	PodName   string
++	CacheSalt string
++	SessionID string
+ }
+ 
+ func (e *AllBlocksClearedEvent) GetType() EventType {
+@@ -97,6 +103,7 @@ func (e *BlockUpdateEvent) GetTimestamp() time.Time {
+ const (
+ 	SourceMooncake string = "mooncake"
+ 	SourceVLLM     string = "vllm"
++	SourceSGLang   string = "sglang"
+ )
+ 
+ type EventBatch struct {
+diff --git a/mooncake-conductor/conductor-ctrl/zmq/msg_decoder.go b/mooncake-conductor/conductor-ctrl/zmq/msg_decoder.go
+index 9eb0d403..2f108fa1 100644
+--- a/mooncake-conductor/conductor-ctrl/zmq/msg_decoder.go
++++ b/mooncake-conductor/conductor-ctrl/zmq/msg_decoder.go
+@@ -16,6 +16,10 @@ type EventParser interface {
+ 	Source() string
+ }
+ 
++type batchDecoderOptions struct {
++	dataParallelRank func([]interface{}) (int64, error)
++}
++
+ type mooncakeParser struct{}
+ 
+ func (p *mooncakeParser) Source() string { return SourceMooncake }
+@@ -52,6 +56,7 @@ func decodeCommonEventBatch(
+ 	expectedLength int,
+ 	extractEvents func([]interface{}) ([]interface{}, interface{}, error),
+ 	parser EventParser,
++	options batchDecoderOptions,
+ ) (*EventBatch, error) {
+ 
+ 	if len(data) > 0 {
+@@ -76,9 +81,9 @@ func decodeCommonEventBatch(
+ 		slog.Warn("Received empty event list")
+ 	}
+ 
+-	var dpRank int64 = -1
+-	if expectedLength == 3 {
+-		dpRank, err = parseInt64(arr[2])
++	dpRank := int64(-1)
++	if options.dataParallelRank != nil {
++		dpRank, err = options.dataParallelRank(arr)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to parse dpRank: %w", err)
+ 		}
+@@ -122,6 +127,7 @@ func DecodeMooncakeEventBatch(data []byte) (*EventBatch, error) {
+ 			return events, arr[0], nil
+ 		},
+ 		newMooncakeParser(),
++		batchDecoderOptions{},
+ 	)
+ }
+ 
+@@ -174,9 +180,299 @@ func DecodeVllmEventBatch(data []byte) (*EventBatch, error) {
+ 			return events, arr[0], nil
+ 		},
+ 		newVLLMParser(),
++		batchDecoderOptions{},
++	)
++}
++
++// sglangParser decodes the tagged msgspec structs emitted by SGLang.
++type sglangParser struct{}
++
++func (p *sglangParser) Source() string { return SourceSGLang }
++
++func (p *sglangParser) EventMappings() map[string]EventType {
++	return map[string]EventType{
++		"BlockStored":      EventTypeBlockStored,
++		"BlockRemoved":     EventTypeBlockRemoved,
++		"AllBlocksCleared": EventTypeAllCleared,
++	}
++}
++
++func (p *sglangParser) ParseEvent(raw []interface{}, timestamp interface{}) (KVEvent, error) {
++	if len(raw) == 0 {
++		return nil, fmt.Errorf("empty SGLang event")
++	}
++
++	eventTypeStr, ok := raw[0].(string)
++	if !ok {
++		return nil, fmt.Errorf("invalid SGLang event type format: %T", raw[0])
++	}
++
++	switch p.EventMappings()[eventTypeStr] {
++	case EventTypeBlockStored:
++		return parseSGLangBlockStored(raw, timestamp)
++	case EventTypeBlockRemoved:
++		return parseSGLangBlockRemoved(raw, timestamp)
++	case EventTypeAllCleared:
++		return parseSGLangAllCleared(raw, timestamp)
++	default:
++		return nil, fmt.Errorf("unknown SGLang event type: %s", eventTypeStr)
++	}
++}
++
++func DecodeSGLangEventBatch(data []byte) (*EventBatch, error) {
++	var arr []interface{}
++	if err := msgpack.Unmarshal(data, &arr); err != nil {
++		return nil, fmt.Errorf("failed to unmarshal SGLang event batch: %w", err)
++	}
++	if len(arr) != 3 {
++		return nil, fmt.Errorf("expected 3-element SGLang batch, got %d", len(arr))
++	}
++	events, ok := arr[1].([]interface{})
++	if !ok {
++		return nil, fmt.Errorf("invalid SGLang events type: %T", arr[1])
++	}
++	dpRank, err := parseInt64(arr[2])
++	if err != nil {
++		return nil, fmt.Errorf("failed to parse SGLang dpRank: %w", err)
++	}
++	batch := &EventBatch{
++		Source:           SourceSGLang,
++		Events:           make([]KVEvent, 0, len(events)),
++		DataParallelRank: dpRank,
++	}
++	for index, rawEvent := range events {
++		if tagged, ok := normalizeTaggedMap(rawEvent); ok {
++			event, err := parseTaggedSGLangEvent(tagged, arr[0])
++			if err != nil {
++				return nil, fmt.Errorf("failed to parse tagged SGLang event at index %d: %w", index, err)
++			}
++			batch.Events = append(batch.Events, event)
++			continue
++		}
++		eventSlice, ok := rawEvent.([]interface{})
++		if !ok {
++			return nil, fmt.Errorf("SGLang event at index %d is neither tagged map nor array: %T", index, rawEvent)
++		}
++		event, err := (&sglangParser{}).ParseEvent(eventSlice, arr[0])
++		if err != nil {
++			return nil, fmt.Errorf("failed to parse array SGLang event at index %d: %w", index, err)
++		}
++		batch.Events = append(batch.Events, event)
++	}
++	return batch, nil
++}
++
++func normalizeTaggedMap(raw interface{}) (map[string]interface{}, bool) {
++	switch value := raw.(type) {
++	case map[string]interface{}:
++		return value, true
++	case map[interface{}]interface{}:
++		result := make(map[string]interface{}, len(value))
++		for key, fieldValue := range value {
++			stringKey, ok := key.(string)
++			if !ok {
++				return nil, false
++			}
++			result[stringKey] = fieldValue
++		}
++		return result, true
++	default:
++		return nil, false
++	}
++}
++
++func parseTaggedSGLangEvent(data map[string]interface{}, timestamp interface{}) (KVEvent, error) {
++	eventType, err := safeGetString(data["type"])
++	if err != nil {
++		return nil, fmt.Errorf("parse SGLang tagged event type: %w", err)
++	}
++	switch eventType {
++	case "BlockStored":
++		event := &BlockStoredEvent{Type: EventTypeBlockStored, Medium: "GPU"}
++		if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
++			return nil, err
++		}
++		if event.BlockHashes, err = parseUint64Array(data["block_hashes"]); err != nil {
++			return nil, fmt.Errorf("parse block_hashes: %w", err)
++		}
++		if parentHash, exists := data["parent_block_hash"]; exists && parentHash != nil {
++			if event.ParentBlockHash, err = parseUint64(parentHash); err != nil {
++				return nil, fmt.Errorf("parse parent_block_hash: %w", err)
++			}
++		}
++		if event.TokenIDs, err = parseInt32Array(data["token_ids"]); err != nil {
++			return nil, fmt.Errorf("parse token_ids: %w", err)
++		}
++		if event.BlockSize, err = parseInt64(data["block_size"]); err != nil {
++			return nil, fmt.Errorf("parse block_size: %w", err)
++		}
++		if loraID, exists := data["lora_id"]; exists && loraID != nil {
++			if event.LoraID, err = parseInt64(loraID); err != nil {
++				return nil, fmt.Errorf("parse lora_id: %w", err)
++			}
++		}
++		if medium, exists := data["medium"]; exists && medium != nil {
++			if event.Medium, err = safeGetString(medium); err != nil {
++				return nil, fmt.Errorf("parse medium: %w", err)
++			}
++		}
++		if cacheSalt, exists := data["cache_salt"]; exists && cacheSalt != nil {
++			if event.CacheSalt, err = safeGetString(cacheSalt); err != nil {
++				return nil, fmt.Errorf("parse cache_salt: %w", err)
++			}
++		}
++		if sessionID, exists := data["session_id"]; exists && sessionID != nil {
++			if event.SessionID, err = safeGetString(sessionID); err != nil {
++				return nil, fmt.Errorf("parse session_id: %w", err)
++			}
++		}
++		return event, nil
++	case "BlockRemoved":
++		event := &BlockRemovedEvent{Type: EventTypeBlockRemoved, Medium: "GPU"}
++		if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
++			return nil, err
++		}
++		if event.BlockHashes, err = parseUint64Array(data["block_hashes"]); err != nil {
++			return nil, fmt.Errorf("parse block_hashes: %w", err)
++		}
++		if medium, exists := data["medium"]; exists && medium != nil {
++			if event.Medium, err = safeGetString(medium); err != nil {
++				return nil, fmt.Errorf("parse medium: %w", err)
++			}
++		}
++		return event, nil
++	case "AllBlocksCleared":
++		event := &AllBlocksClearedEvent{Type: EventTypeAllCleared}
++		if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
++			return nil, err
++		}
++		return event, nil
++	default:
++		return nil, fmt.Errorf("unknown SGLang tagged event type: %s", eventType)
++	}
++}
++
++func DecodeSGLangEventBatchLegacy(data []byte) (*EventBatch, error) {
++	return decodeCommonEventBatch(
++		data,
++		3,
++		func(arr []interface{}) ([]interface{}, interface{}, error) {
++			events, ok := arr[1].([]interface{})
++			if !ok {
++				return nil, nil, fmt.Errorf("invalid SGLang events type: %T", arr[1])
++			}
++			return events, arr[0], nil
++		},
++		&sglangParser{},
++		batchDecoderOptions{
++			dataParallelRank: func(arr []interface{}) (int64, error) {
++				return parseInt64(arr[2])
++			},
++		},
+ 	)
+ }
+ 
++// parseSGLangBlockStored parses the msgspec array-like representation:
++//
++//	["BlockStored", hashes, parent_hash, token_ids, block_size, lora_id, medium]
++//
++// SGLang uses msgspec Struct(array_like=True, omit_defaults=True). The
++// optional lora_id and medium fields can therefore be absent independently.
++// Its cache-event mixin defaults an omitted medium to GPU, so preserve that
++// meaning when the wire payload has no medium value (including the explicit
++// nil placeholders emitted by the current msgspec version). A six-element
++// payload is ambiguous: data[5] is either lora_id or medium; distinguish them
++// by type.
++func parseSGLangBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
++	if len(data) < 5 || len(data) > 7 {
++		return nil, fmt.Errorf("SGLang BlockStored: expected 5 to 7 fields, got %d", len(data))
++	}
++
++	event := &BlockStoredEvent{Type: EventTypeBlockStored}
++	var err error
++	if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
++		return nil, fmt.Errorf("parse SGLang timestamp: %w", err)
++	}
++	if event.BlockHashes, err = parseUint64Array(data[1]); err != nil {
++		return nil, fmt.Errorf("parse SGLang block_hashes: %w", err)
++	}
++
++	if data[2] != nil {
++		if event.ParentBlockHash, err = parseUint64(data[2]); err != nil {
++			return nil, fmt.Errorf("parse SGLang parent_block_hash: %w", err)
++		}
++	}
++	if event.TokenIDs, err = parseInt32Array(data[3]); err != nil {
++		return nil, fmt.Errorf("parse SGLang token_ids: %w", err)
++	}
++	if event.BlockSize, err = parseInt64(data[4]); err != nil {
++		return nil, fmt.Errorf("parse SGLang block_size: %w", err)
++	}
++	event.Medium = "GPU"
++	if len(data) == 7 {
++		if data[5] != nil {
++			if event.LoraID, err = parseInt64(data[5]); err != nil {
++				return nil, fmt.Errorf("parse SGLang lora_id: %w", err)
++			}
++		}
++		if data[6] != nil {
++			if event.Medium, err = safeGetString(data[6]); err != nil {
++				return nil, fmt.Errorf("parse SGLang medium: %w", err)
++			}
++		}
++	} else if len(data) == 6 && data[5] != nil {
++		switch data[5].(type) {
++		case string, []byte, fmt.Stringer:
++			if event.Medium, err = safeGetString(data[5]); err != nil {
++				return nil, fmt.Errorf("parse SGLang medium: %w", err)
++			}
++		default:
++			if event.LoraID, err = parseInt64(data[5]); err != nil {
++				return nil, fmt.Errorf("parse SGLang lora_id: %w", err)
++			}
++		}
++	}
++
++	return event, nil
++}
++
++func parseSGLangBlockRemoved(data []interface{}, timestamp interface{}) (*BlockRemovedEvent, error) {
++	if len(data) != 3 {
++		return nil, fmt.Errorf("SGLang BlockRemoved: expected 3 fields, got %d", len(data))
++	}
++
++	event := &BlockRemovedEvent{Type: EventTypeBlockRemoved}
++	var err error
++	if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
++		return nil, fmt.Errorf("parse SGLang timestamp: %w", err)
++	}
++	if event.BlockHashes, err = parseUint64Array(data[1]); err != nil {
++		return nil, fmt.Errorf("parse SGLang block_hashes: %w", err)
++	}
++	// SGLang emits GPU removals by default. A nil optional medium on the wire
++	// must therefore retain GPU semantics rather than becoming an untracked tier.
++	event.Medium = "GPU"
++	if data[2] != nil {
++		if event.Medium, err = safeGetString(data[2]); err != nil {
++			return nil, fmt.Errorf("parse SGLang medium: %w", err)
++		}
++	}
++	return event, nil
++}
++
++func parseSGLangAllCleared(data []interface{}, timestamp interface{}) (*AllBlocksClearedEvent, error) {
++	if len(data) != 1 {
++		return nil, fmt.Errorf("SGLang AllBlocksCleared: expected 1 field, got %d", len(data))
++	}
++
++	event := &AllBlocksClearedEvent{Type: EventTypeAllCleared}
++	var err error
++	if event.Timestamp, err = parseTimestamp(timestamp); err != nil {
++		return nil, fmt.Errorf("parse SGLang timestamp: %w", err)
++	}
++	return event, nil
++}
++
+ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
+ 	event := &BlockStoredEvent{
+ 		Type: EventTypeBlockStored,
+@@ -232,6 +528,10 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
+ 
+ // parseBlockStoredEvent parses a BlockStoredEvent from raw data
+ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
++	if len(data) != 5 && len(data) != 7 {
++		return nil, fmt.Errorf("vLLM BlockStored: expected 5 or 7 fields, got %d", len(data))
++	}
++
+ 	event := &BlockStoredEvent{
+ 		Type: EventTypeBlockStored,
+ 	}
+@@ -286,10 +586,12 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
+ 		return nil, fmt.Errorf("failed to parse field at index 4 as 'block_size': %w", err)
+ 	}
+ 
+-	if medium, err := safeGetString(data[6]); err == nil {
+-		event.Medium = medium
+-	} else {
+-		return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
++	if len(data) == 7 {
++		if medium, err := safeGetString(data[6]); err == nil {
++			event.Medium = medium
++		} else {
++			return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
++		}
+ 	}
+ 
+ 	return event, nil
+diff --git a/mooncake-conductor/conductor-ctrl/zmq/msg_decoder_test.go b/mooncake-conductor/conductor-ctrl/zmq/msg_decoder_test.go
+index 2f2c2b6f..0d5ae86e 100644
+--- a/mooncake-conductor/conductor-ctrl/zmq/msg_decoder_test.go
++++ b/mooncake-conductor/conductor-ctrl/zmq/msg_decoder_test.go
+@@ -176,3 +176,262 @@ func TestDecodeVllmEventBatch_InvalidData(t *testing.T) {
+ 		t.Error("Expected error for invalid array length, got nil")
+ 	}
+ }
++
++func TestDecodeSGLangEventBatch(t *testing.T) {
++	timestamp := 1700000000.25
++	batch := []interface{}{
++		timestamp,
++		[]interface{}{
++			// msgspec preserves nil placeholders for these required fields.
++			[]interface{}{
++				"BlockStored",
++				[]interface{}{uint64(42)},
++				nil,
++				[]interface{}{int32(1), int32(2), int32(3)},
++				int64(3),
++				nil,
++				"GPU",
++			},
++			// A non-null parent and lora id are both represented in order.
++			[]interface{}{
++				"BlockStored",
++				[]interface{}{uint64(43)},
++				uint64(42),
++				[]interface{}{int32(4), int32(5), int32(6)},
++				int64(3),
++				int64(7),
++				"CPU_PINNED",
++			},
++			[]interface{}{"BlockRemoved", []interface{}{uint64(42), uint64(43)}, "GPU"},
++			[]interface{}{"AllBlocksCleared"},
++		},
++		int64(2),
++	}
++
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal SGLang batch: %v", err)
++	}
++
++	result, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch failed: %v", err)
++	}
++	if result.Source != zmq.SourceSGLang {
++		t.Errorf("expected source %q, got %q", zmq.SourceSGLang, result.Source)
++	}
++	if result.DataParallelRank != 2 {
++		t.Errorf("expected dp rank 2, got %d", result.DataParallelRank)
++	}
++	if len(result.Events) != 4 {
++		t.Fatalf("expected 4 events, got %d", len(result.Events))
++	}
++
++	first, ok := result.Events[0].(*zmq.BlockStoredEvent)
++	if !ok {
++		t.Fatalf("expected first event BlockStoredEvent, got %T", result.Events[0])
++	}
++	if first.ParentBlockHash != 0 || first.LoraID != 0 || first.Medium != "GPU" {
++		t.Errorf("unexpected omitted-field event: %+v", first)
++	}
++	if len(first.TokenIDs) != 3 || first.TokenIDs[2] != 3 {
++		t.Errorf("unexpected token IDs: %v", first.TokenIDs)
++	}
++
++	second, ok := result.Events[1].(*zmq.BlockStoredEvent)
++	if !ok {
++		t.Fatalf("expected second event BlockStoredEvent, got %T", result.Events[1])
++	}
++	if second.ParentBlockHash != 42 || second.LoraID != 7 || second.Medium != "CPU_PINNED" {
++		t.Errorf("unexpected populated-field event: %+v", second)
++	}
++
++	removed, ok := result.Events[2].(*zmq.BlockRemovedEvent)
++	if !ok {
++		t.Fatalf("expected third event BlockRemovedEvent, got %T", result.Events[2])
++	}
++	if len(removed.BlockHashes) != 2 || removed.Medium != "GPU" {
++		t.Errorf("unexpected removed event: %+v", removed)
++	}
++
++	if _, ok := result.Events[3].(*zmq.AllBlocksClearedEvent); !ok {
++		t.Errorf("expected fourth event AllBlocksClearedEvent, got %T", result.Events[3])
++	}
++}
++
++func TestDecodeSGLangTaggedMsgspecEvents(t *testing.T) {
++	batch := []interface{}{
++		int64(1700000000),
++		[]interface{}{
++			map[string]interface{}{
++				"type":              "BlockStored",
++				"block_hashes":      []interface{}{uint64(42)},
++				"parent_block_hash": uint64(7),
++				"token_ids":         []interface{}{int32(1), int32(2)},
++				"block_size":        int64(2),
++				"medium":            "CPU_PINNED",
++				"cache_salt":        "policy-v10",
++				"session_id":        "request-a",
++			},
++			map[string]interface{}{
++				"type":         "BlockRemoved",
++				"block_hashes": []interface{}{uint64(42)},
++				"medium":       "EXTERNAL",
++			},
++			map[string]interface{}{"type": "AllBlocksCleared"},
++		},
++		int64(3),
++	}
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal tagged SGLang batch: %v", err)
++	}
++	decoded, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch: %v", err)
++	}
++	if decoded.DataParallelRank != 3 || len(decoded.Events) != 3 {
++		t.Fatalf("unexpected decoded batch: %+v", decoded)
++	}
++	stored := decoded.Events[0].(*zmq.BlockStoredEvent)
++	if stored.Medium != "CPU_PINNED" || stored.CacheSalt != "policy-v10" || stored.SessionID != "request-a" {
++		t.Fatalf("tagged store fields lost: %+v", stored)
++	}
++	removed := decoded.Events[1].(*zmq.BlockRemovedEvent)
++	if removed.Medium != "EXTERNAL" || len(removed.BlockHashes) != 1 {
++		t.Fatalf("tagged remove fields lost: %+v", removed)
++	}
++	if _, ok := decoded.Events[2].(*zmq.AllBlocksClearedEvent); !ok {
++		t.Fatalf("expected tagged AllBlocksClearedEvent, got %T", decoded.Events[2])
++	}
++}
++
++func TestDecodeSGLangEventBatch_BlockRemovedWithNilMedium(t *testing.T) {
++	batch := []interface{}{
++		int64(1700000000),
++		[]interface{}{[]interface{}{"BlockRemoved", []interface{}{uint64(42)}, nil}},
++		int64(0),
++	}
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal SGLang batch: %v", err)
++	}
++
++	result, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch failed: %v", err)
++	}
++	removed := result.Events[0].(*zmq.BlockRemovedEvent)
++	if removed.Medium != "GPU" {
++		t.Errorf("expected nil medium to use SGLang GPU default, got %q", removed.Medium)
++	}
++}
++
++func TestDecodeSGLangEventBatch_BlockStoredWithoutLoraPlaceholder(t *testing.T) {
++	// SGLang 0.5.4 uses msgspec omit_defaults and emits this six-field form
++	// when lora_id is unset while medium is populated.
++	batch := []interface{}{
++		int64(1700000000),
++		[]interface{}{[]interface{}{
++			"BlockStored", []interface{}{uint64(42)}, nil,
++			[]interface{}{int32(1), int32(2)}, int64(2), "GPU",
++		}},
++		int64(0),
++	}
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal SGLang batch: %v", err)
++	}
++
++	result, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch failed: %v", err)
++	}
++	stored, ok := result.Events[0].(*zmq.BlockStoredEvent)
++	if !ok {
++		t.Fatalf("expected BlockStoredEvent, got %T", result.Events[0])
++	}
++	if stored.LoraID != 0 || stored.Medium != "GPU" {
++		t.Errorf("unexpected six-field event: %+v", stored)
++	}
++}
++
++func TestDecodeSGLangEventBatch_BlockStoredWithoutMedium(t *testing.T) {
++	// msgspec omit_defaults can also omit medium while retaining a non-default
++	// lora_id. The six-field form must not interpret that LoRA id as medium.
++	batch := []interface{}{
++		int64(1700000000),
++		[]interface{}{[]interface{}{
++			"BlockStored", []interface{}{uint64(42)}, nil,
++			[]interface{}{int32(1), int32(2)}, int64(2), int64(7),
++		}},
++		int64(0),
++	}
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal SGLang batch: %v", err)
++	}
++
++	result, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch failed: %v", err)
++	}
++	stored, ok := result.Events[0].(*zmq.BlockStoredEvent)
++	if !ok {
++		t.Fatalf("expected BlockStoredEvent, got %T", result.Events[0])
++	}
++	if stored.LoraID != 7 || stored.Medium != "GPU" {
++		t.Errorf("unexpected six-field event without medium: %+v", stored)
++	}
++}
++
++func TestDecodeSGLangEventBatch_BlockStoredWithoutOptionalFields(t *testing.T) {
++	batch := []interface{}{
++		int64(1700000000),
++		[]interface{}{[]interface{}{
++			"BlockStored", []interface{}{uint64(42)}, nil,
++			[]interface{}{int32(1), int32(2)}, int64(2),
++		}},
++		int64(0),
++	}
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal SGLang batch: %v", err)
++	}
++
++	result, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch failed: %v", err)
++	}
++	stored := result.Events[0].(*zmq.BlockStoredEvent)
++	if stored.LoraID != 0 || stored.Medium != "GPU" {
++		t.Errorf("unexpected event without optional fields: %+v", stored)
++	}
++}
++
++func TestDecodeSGLangEventBatch_BlockStoredWithNilOptionalPlaceholders(t *testing.T) {
++	// The current msgspec encoder retains nil placeholders in its array-like
++	// representation even with omit_defaults enabled. SGLang's event producer
++	// treats this omitted medium as the default GPU tier.
++	batch := []interface{}{
++		int64(1700000000),
++		[]interface{}{[]interface{}{
++			"BlockStored", []interface{}{uint64(42)}, nil,
++			[]interface{}{int32(1), int32(2)}, int64(2), nil, nil,
++		}},
++		int64(0),
++	}
++	data, err := msgpack.Marshal(batch)
++	if err != nil {
++		t.Fatalf("marshal SGLang batch: %v", err)
++	}
++
++	result, err := zmq.DecodeSGLangEventBatch(data)
++	if err != nil {
++		t.Fatalf("DecodeSGLangEventBatch failed: %v", err)
++	}
++	stored := result.Events[0].(*zmq.BlockStoredEvent)
++	if stored.LoraID != 0 || stored.Medium != "GPU" {
++		t.Errorf("unexpected event with nil optional placeholders: %+v", stored)
++	}
++}
+diff --git a/mooncake-conductor/conductor-ctrl/zmq/types.go b/mooncake-conductor/conductor-ctrl/zmq/types.go
+index 689f6dab..48b2d8fe 100644
+--- a/mooncake-conductor/conductor-ctrl/zmq/types.go
++++ b/mooncake-conductor/conductor-ctrl/zmq/types.go
+@@ -15,6 +15,9 @@ type ZMQClientConfig struct {
+ 	CachePoolKey   string
+ 	Endpoint       string
+ 	ReplayEndpoint string
++	// Source selects the decoder for replay payloads, whose ROUTER protocol
++	// does not include the PUB/SUB topic frame.
++	Source         string
+ 	ModelName      string
+ 	PollTimeout    time.Duration
+ 	ReplayTimeout  time.Duration
+diff --git a/mooncake-conductor/conductor-ctrl/zmq/zmq_client.go b/mooncake-conductor/conductor-ctrl/zmq/zmq_client.go
+index 37cedff6..bb4f48a9 100644
+--- a/mooncake-conductor/conductor-ctrl/zmq/zmq_client.go
++++ b/mooncake-conductor/conductor-ctrl/zmq/zmq_client.go
+@@ -21,6 +21,7 @@ type ZMQClient struct {
+ 
+ 	// State management
+ 	mu             sync.RWMutex
++	processMu      sync.Mutex
+ 	connected      bool
+ 	lastSeq        int64
+ 	reconnectDelay time.Duration
+@@ -49,9 +50,20 @@ func (c *ZMQClient) Start() error {
+ 	if err := c.Connect(); err != nil {
+ 		return fmt.Errorf("initial connection failed: %w", err)
+ 	}
+-
+ 	c.wg.Add(1)
+ 	go c.loop()
++	// SGLang retains a bounded event buffer behind its replay ROUTER. Replay
++	// runs independently so a slow or temporarily unavailable replay service
++	// never prevents the HTTP control plane from starting.
++	if c.config.Source == SourceSGLang && c.config.ReplayEndpoint != "" {
++		c.wg.Add(1)
++		go func() {
++			defer c.wg.Done()
++			if err := c.requestReplay(1); err != nil {
++				slog.Warn("Initial SGLang replay failed", "service", c.config.CachePoolKey, "error", err)
++			}
++		}()
++	}
+ 
+ 	slog.Info("ZMQ client started", "service", c.config.CachePoolKey)
+ 	return nil
+@@ -113,7 +125,7 @@ func (c *ZMQClient) handleReconnect() {
+ 
+ 	// Reconnected! Request replay from last known sequence
+ 	lastSeq := c.getLastSequence()
+-	if lastSeq >= 0 {
++	if lastSeq >= 0 && c.config.ReplayEndpoint != "" {
+ 		slog.Info("Reconnected", "service", c.config.CachePoolKey, "resuming_from", lastSeq+1)
+ 		if err := c.requestReplay(lastSeq + 1); err != nil {
+ 			slog.Warn("Failed to request replay after reconnect", "service", c.config.CachePoolKey, "error", err)
+@@ -180,7 +192,7 @@ func (c *ZMQClient) Connect() error {
+ 
+ 	c.reconnectDelay = c.config.ReconnectDelay
+ 
+-	slog.Info("Successfully connected to vLLM publisher", "service", c.config.CachePoolKey, "endpoint", c.config.Endpoint)
++	slog.Info("Successfully connected to KV event publisher", "service", c.config.CachePoolKey, "endpoint", c.config.Endpoint)
+ 
+ 	return nil
+ }
+@@ -240,56 +252,62 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
+ 	}
+ 	seq := int64(binary.BigEndian.Uint64(seqBytes))
+ 
++	return c.processPayload(seq, payload, string(topic))
++
++}
++
++// processPayload decodes and dispatches both PUB/SUB batches and replay
++// batches. Sequence de-duplication is deliberately shared: SGLang may replay
++// an event that was already delivered through PUB/SUB while reconnecting.
++func (c *ZMQClient) processPayload(seq int64, payload []byte, source string) error {
++	c.processMu.Lock()
++	defer c.processMu.Unlock()
++
+ 	c.mu.RLock()
+ 	lastSeq := c.lastSeq
+ 	c.mu.RUnlock()
+-
++	if seq <= lastSeq {
++		slog.Debug("Skipping already processed KV event", "service", c.config.CachePoolKey, "seq", seq, "last", lastSeq)
++		return nil
++	}
+ 	if lastSeq != -1 && seq > lastSeq+1 {
+-		slog.Warn("Event gap detected",
+-			"service", c.config.CachePoolKey,
+-			"missed", seq-lastSeq-1,
+-			"last", lastSeq,
+-			"current", seq,
+-		)
+-		// Trigger replay for missed events?
+-		// Usually we just log warning here, or could auto-trigger requestReplay
++		slog.Warn("Event gap detected", "service", c.config.CachePoolKey, "missed", seq-lastSeq-1, "last", lastSeq, "current", seq)
+ 	}
+ 
+-	// Update Sequence immediately to keep state fresh
+-	c.mu.Lock()
+-	c.lastSeq = seq
+-	c.mu.Unlock()
+-
+-	slog.Debug("enter deal topic", "topic", topic)
+-
+-	var batch *EventBatch
+-	switch string(topic) {
+-	case "mooncake":
+-		batch, err = DecodeMooncakeEventBatch(payload)
+-	default:
+-		batch, err = DecodeVllmEventBatch(payload)
+-	}
++	batch, err := decodeBatch(source, payload)
+ 	if err != nil {
+ 		return fmt.Errorf("decode failed: %w", err)
+ 	}
+-
+ 	for _, event := range batch.Events {
+-		// Inject Source Name
+ 		switch e := event.(type) {
+ 		case *BlockStoredEvent:
+ 			e.PodName = c.config.CachePoolKey
+ 		case *BlockRemovedEvent:
+ 			e.PodName = c.config.CachePoolKey
+ 		}
+-
+ 		if err := c.eventHandler.HandleEvent(event, batch.DataParallelRank); err != nil {
+ 			slog.Error("Handler error", "service", c.config.CachePoolKey, "error", err)
+ 		}
+ 	}
+ 
+-	slog.Debug("Processed batch", "service", c.config.CachePoolKey, "seq", seq, "topic", string(topic))
++	c.mu.Lock()
++	if seq > c.lastSeq {
++		c.lastSeq = seq
++	}
++	c.mu.Unlock()
++	slog.Debug("Processed batch", "service", c.config.CachePoolKey, "seq", seq, "source", source)
+ 	return nil
++}
+ 
++func decodeBatch(source string, payload []byte) (*EventBatch, error) {
++	switch source {
++	case SourceMooncake:
++		return DecodeMooncakeEventBatch(payload)
++	case SourceSGLang:
++		return DecodeSGLangEventBatch(payload)
++	default:
++		return DecodeVllmEventBatch(payload)
++	}
+ }
+ 
+ func (c *ZMQClient) requestReplay(fromSeq int64) error {
+@@ -303,25 +321,42 @@ func (c *ZMQClient) requestReplay(fromSeq int64) error {
+ 
+ 	req := make([]byte, 8)
+ 	binary.BigEndian.PutUint64(req, uint64(fromSeq))
+-
+-	if _, err := socket.SendBytes(req, 0); err != nil {
++	if _, err := socket.SendMessage([]byte{}, req); err != nil {
+ 		return fmt.Errorf("failed to send replay request: %w", err)
+ 	}
+-
+-	// Ideally, we should wait for an ACK here if the protocol supports it
+-	// For simplicity in static client, we fire and forget the request,
+-	// assuming the server will send the replayed events via the SUB channel (or DEALER response)
+-	// Original code read response from DEALER, let's keep that.
+-
+ 	_ = socket.SetRcvtimeo(c.config.ReplayTimeout)
+-
+-	resp, err := socket.RecvBytes(0)
+-	if err != nil {
+-		return fmt.Errorf("failed to receive replay response: %w", err)
++	if c.config.Source != SourceSGLang {
++		resp, err := socket.RecvBytes(0)
++		if err != nil {
++			return fmt.Errorf("failed to receive replay response: %w", err)
++		}
++		slog.Info("Replay requested", "service", c.config.CachePoolKey, "from", fromSeq, "resp_len", len(resp))
++		return nil
+ 	}
+ 
+-	slog.Info("Replay requested", "service", c.config.CachePoolKey, "from", fromSeq, "resp_len", len(resp))
+-	return nil
++	for {
++		frames, err := socket.RecvMessageBytes(0)
++		if err != nil {
++			return fmt.Errorf("failed to receive SGLang replay response: %w", err)
++		}
++		// libzmq versions differ in whether the ROUTER's empty delimiter is
++		// surfaced to a DEALER receiver. Accept both [seq, payload] and
++		// [empty, seq, payload] while keeping the SGLang wire contract strict.
++		if len(frames) == 3 && len(frames[0]) == 0 {
++			frames = frames[1:]
++		}
++		if len(frames) != 2 || len(frames[0]) != 8 {
++			return fmt.Errorf("invalid SGLang replay frame: %d parts", len(frames))
++		}
++		seq := int64(binary.BigEndian.Uint64(frames[0]))
++		if seq == -1 {
++			slog.Info("SGLang replay completed", "service", c.config.CachePoolKey, "from", fromSeq)
++			return nil
++		}
++		if err := c.processPayload(seq, frames[1], SourceSGLang); err != nil {
++			return fmt.Errorf("process SGLang replay sequence %d: %w", seq, err)
++		}
++	}
+ }
+ 
+ func (c *ZMQClient) cleanupSockets() {
+diff --git a/mooncake-conductor/conductor-ctrl/zmq/zmq_client_test.go b/mooncake-conductor/conductor-ctrl/zmq/zmq_client_test.go
+index f168bd5a..f3573a37 100644
+--- a/mooncake-conductor/conductor-ctrl/zmq/zmq_client_test.go
++++ b/mooncake-conductor/conductor-ctrl/zmq/zmq_client_test.go
+@@ -31,7 +31,7 @@ func NewMockEventHandler() *MockEventHandler {
+ 	}
+ }
+ 
+-func (m *MockEventHandler) HandleEvent(event zmq.KVEvent) error {
++func (m *MockEventHandler) HandleEvent(event zmq.KVEvent, _ int64) error {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 
+@@ -74,12 +74,19 @@ type MockPublisher struct {
+ 	pubSocket    *zmq4.Socket
+ 	routerSocket *zmq4.Socket
+ 	sequence     int64
++	replayBuffer []replayEntry
+ 	mu           sync.Mutex
+ 	ctx          context.Context
+ 	cancel       context.CancelFunc
+ 	wg           sync.WaitGroup
+ }
+ 
++type replayEntry struct {
++	sequence int64
++	topic    string
++	payload  []byte
++}
++
+ func createMockPublisher(t *testing.T, pubPort, routerPort int) *MockPublisher {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 
+@@ -146,6 +153,8 @@ func (mp *MockPublisher) PublishEvent(topic string, event zmq.KVEvent) error {
+ 
+ 	if topic == "mooncake" {
+ 		payload, err = encodeMooncakeEvent(event)
++	} else if topic == zmq.SourceSGLang {
++		payload, err = encodeSGLangEvent(event)
+ 	} else {
+ 		payload, err = encodeVllmEvent(event)
+ 	}
+@@ -156,6 +165,7 @@ func (mp *MockPublisher) PublishEvent(topic string, event zmq.KVEvent) error {
+ 	mp.mu.Lock()
+ 	mp.sequence++
+ 	seq := mp.sequence
++	mp.replayBuffer = append(mp.replayBuffer, replayEntry{sequence: seq, topic: topic, payload: payload})
+ 	mp.mu.Unlock()
+ 
+ 	seqBytes := make([]byte, 8)
+@@ -165,6 +175,18 @@ func (mp *MockPublisher) PublishEvent(topic string, event zmq.KVEvent) error {
+ 	return err
+ }
+ 
++func (mp *MockPublisher) PublishBuffered(sequence int64) error {
++	mp.mu.Lock()
++	defer mp.mu.Unlock()
++	for _, entry := range mp.replayBuffer {
++		if entry.sequence == sequence {
++			_, err := mp.pubSocket.SendMessage(entry.topic, sequenceBytes(entry.sequence), entry.payload)
++			return err
++		}
++	}
++	return errors.New("replay entry not found")
++}
++
+ func (mp *MockPublisher) handleReplay() {
+ 	defer mp.wg.Done()
+ 	for {
+@@ -177,18 +199,32 @@ func (mp *MockPublisher) handleReplay() {
+ 		// Set receive timeout
+ 		_ = mp.routerSocket.SetRcvtimeo(100 * time.Millisecond)
+ 
+-		msg, err := mp.routerSocket.RecvBytes(0)
++		frames, err := mp.routerSocket.RecvMessageBytes(0)
+ 		if err != nil {
+ 			continue
+ 		}
+-
+-		if len(msg) == 8 {
+-			// Send ACK
+-			_, _ = mp.routerSocket.SendBytes([]byte("OK"), 0)
++		if len(frames) != 3 || len(frames[2]) != 8 {
++			continue
+ 		}
++		fromSeq := int64(binary.BigEndian.Uint64(frames[2]))
++		mp.mu.Lock()
++		entries := append([]replayEntry(nil), mp.replayBuffer...)
++		mp.mu.Unlock()
++		for _, entry := range entries {
++			if entry.sequence >= fromSeq {
++				_, _ = mp.routerSocket.SendMessage(frames[0], []byte{}, sequenceBytes(entry.sequence), entry.payload)
++			}
++		}
++		_, _ = mp.routerSocket.SendMessage(frames[0], []byte{}, sequenceBytes(-1), []byte{})
+ 	}
+ }
+ 
++func sequenceBytes(sequence int64) []byte {
++	data := make([]byte, 8)
++	binary.BigEndian.PutUint64(data, uint64(sequence))
++	return data
++}
++
+ func (mp *MockPublisher) Close() {
+ 	mp.cancel()
+ 	mp.wg.Wait()
+@@ -243,6 +279,27 @@ func encodeVllmEvent(event zmq.KVEvent) ([]byte, error) {
+ 	}
+ }
+ 
++func encodeSGLangEvent(event zmq.KVEvent) ([]byte, error) {
++	switch e := event.(type) {
++	case *zmq.BlockStoredEvent:
++		eventData := map[string]interface{}{
++			"type":              "BlockStored",
++			"block_hashes":      convertUint64Slice(e.BlockHashes),
++			"parent_block_hash": e.ParentBlockHash,
++			"token_ids":         convertInt32Slice(e.TokenIDs),
++			"block_size":        e.BlockSize,
++			"lora_id":           e.LoraID,
++			"medium":            e.Medium,
++			"cache_salt":        e.CacheSalt,
++			"session_id":        e.SessionID,
++		}
++		batch := []interface{}{e.Timestamp.Unix(), []interface{}{eventData}, int64(0)}
++		return msgpack.Marshal(batch)
++	default:
++		return nil, errors.New("unsupported event type for SGLang")
++	}
++}
++
+ func convertUint64Slice(slice []uint64) []interface{} {
+ 	result := make([]interface{}, len(slice))
+ 	for i, v := range slice {
+@@ -283,15 +340,11 @@ func TestZMQClient_Connect_Success(t *testing.T) {
+ 		t.Fatalf("Failed to get ROUTER endpoint: %v", err)
+ 	}
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
+-
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
++		ReplayEndpoint: routerEndpoint,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,
+@@ -317,15 +370,11 @@ func TestZMQClient_Connect_AlreadyConnected(t *testing.T) {
+ 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+ 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
+-
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
++		ReplayEndpoint: routerEndpoint,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,
+@@ -357,15 +406,11 @@ func TestZMQClient_Start_Stop(t *testing.T) {
+ 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+ 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
+-
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,
+@@ -395,15 +440,11 @@ func TestZMQClient_ProcessMessage_MooncakeTopic(t *testing.T) {
+ 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+ 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
+-
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,
+@@ -471,15 +512,11 @@ func TestZMQClient_ProcessMessage_VllmTopic(t *testing.T) {
+ 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+ 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
+-
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,
+@@ -532,7 +569,7 @@ func TestZMQClient_ProcessMessage_VllmTopic(t *testing.T) {
+ 	}
+ }
+ 
+-func TestZMQClient_SequenceTracking(t *testing.T) {
++func TestZMQClient_ProcessMessage_SGLangTopic(t *testing.T) {
+ 	skipIfZMQUnavailable(t)
+ 
+ 	publisher := createMockPublisher(t, 5557, 5558)
+@@ -541,15 +578,129 @@ func TestZMQClient_SequenceTracking(t *testing.T) {
+ 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+ 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
++	config := &zmq.ZMQClientConfig{
++		CachePoolKey:   "test-pod",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
++		ModelName:      "test-model",
++		PollTimeout:    100 * time.Millisecond,
++		ReplayTimeout:  1 * time.Second,
++		ReconnectDelay: 100 * time.Millisecond,
++	}
++
++	handler := NewMockEventHandler()
++	client := zmq.NewZMQClient(config, handler)
++	if err := client.Start(); err != nil {
++		t.Fatalf("Start failed: %v", err)
++	}
++	defer client.Stop()
++
++	time.Sleep(100 * time.Millisecond)
++	event := &zmq.BlockStoredEvent{
++		Type:            zmq.EventTypeBlockStored,
++		Timestamp:       time.Now().UTC(),
++		BlockHashes:     []uint64{500},
++		ParentBlockHash: 400,
++		TokenIDs:        []int32{7, 8, 9},
++		BlockSize:       3,
++		LoraID:          11,
++		Medium:          "GPU",
++		CacheSalt:       "policy-v10",
++		SessionID:       "request-a",
++	}
++	if err := publisher.PublishEvent(zmq.SourceSGLang, event); err != nil {
++		t.Fatalf("PublishEvent failed: %v", err)
++	}
++
++	time.Sleep(200 * time.Millisecond)
++	events := handler.GetEvents()
++	if len(events) != 1 {
++		t.Fatalf("expected 1 event, got %d", len(events))
++	}
++	stored, ok := events[0].(*zmq.BlockStoredEvent)
++	if !ok {
++		t.Fatalf("expected BlockStoredEvent, got %T", events[0])
++	}
++	if stored.PodName != "test-pod" || stored.ParentBlockHash != 400 || stored.LoraID != 11 || stored.Medium != "GPU" || stored.CacheSalt != "policy-v10" || stored.SessionID != "request-a" {
++		t.Errorf("unexpected decoded SGLang event: %+v", stored)
++	}
++}
++
++func TestZMQClient_SGLangReplay_ReplaysAndDeduplicates(t *testing.T) {
++	skipIfZMQUnavailable(t)
++
++	publisher := createMockPublisher(t, 5557, 5558)
++	defer publisher.Close()
++	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
++	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
++
++	event := &zmq.BlockStoredEvent{
++		Type:            zmq.EventTypeBlockStored,
++		Timestamp:       time.Now().UTC(),
++		BlockHashes:     []uint64{900},
++		ParentBlockHash: 0,
++		TokenIDs:        []int32{1, 2, 3, 4},
++		BlockSize:       4,
++		Medium:          "GPU",
++		CacheSalt:       "policy-v10",
++		SessionID:       "request-replay",
++	}
++	if err := publisher.PublishEvent(zmq.SourceSGLang, event); err != nil {
++		t.Fatalf("PublishEvent failed: %v", err)
++	}
++	// Let the PUB socket complete its slow-joiner window before creating the client.
++	time.Sleep(100 * time.Millisecond)
++
++	handler := NewMockEventHandler()
++	client := zmq.NewZMQClient(&zmq.ZMQClientConfig{
++		CachePoolKey:   "test-pod",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
++		Source:         zmq.SourceSGLang,
++		PollTimeout:    100 * time.Millisecond,
++		ReplayTimeout:  time.Second,
++		ReconnectDelay: 100 * time.Millisecond,
++	}, handler)
++	if err := client.Start(); err != nil {
++		t.Fatalf("Start failed: %v", err)
++	}
++	deadline := time.Now().Add(2 * time.Second)
++	for handler.GetCallCount() != 1 && time.Now().Before(deadline) {
++		time.Sleep(10 * time.Millisecond)
++	}
++	if got := handler.GetCallCount(); got != 1 {
++		t.Fatalf("expected replay to dispatch one event, got %d", got)
++	}
++	stored := handler.GetEvents()[0].(*zmq.BlockStoredEvent)
++	if stored.CacheSalt != "policy-v10" || stored.SessionID != "request-replay" {
++		t.Fatalf("tagged replay lost dynamic namespace: %+v", stored)
++	}
++	if err := publisher.PublishBuffered(1); err != nil {
++		t.Fatalf("PublishBuffered failed: %v", err)
++	}
++	time.Sleep(200 * time.Millisecond)
++	// The sequence already received through replay must not be processed again
++	// when it also arrives through the regular PUB/SUB channel.
++	if got := handler.GetCallCount(); got != 1 {
++		t.Fatalf("expected duplicate sequence to be skipped, got %d calls", got)
++	}
++	client.Stop()
++}
++
++func TestZMQClient_SequenceTracking(t *testing.T) {
++	skipIfZMQUnavailable(t)
++
++	publisher := createMockPublisher(t, 5557, 5558)
++	defer publisher.Close()
++
++	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
++	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,
+@@ -601,15 +752,11 @@ func TestZMQClient_ProcessMessage_EventGap(t *testing.T) {
+ 	pubEndpoint, _ := publisher.pubSocket.GetLastEndpoint()
+ 	routerEndpoint, _ := publisher.routerSocket.GetLastEndpoint()
+ 
+-	pubPort := extractPortFromEndpoint(pubEndpoint)
+-	routerPort := extractPortFromEndpoint(routerEndpoint)
+-
+ 	config := &zmq.ZMQClientConfig{
+ 		CachePoolKey:   "test-pod",
+-		ServiceIP:      "127.0.0.1",
++		Endpoint:       pubEndpoint,
++		ReplayEndpoint: routerEndpoint,
+ 		ModelName:      "test-model",
+-		Port:           pubPort,
+-		RouterPort:     routerPort,
+ 		PollTimeout:    100 * time.Millisecond,
+ 		ReplayTimeout:  1 * time.Second,
+ 		ReconnectDelay: 100 * time.Millisecond,

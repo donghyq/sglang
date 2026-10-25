@@ -1,0 +1,23 @@
+{
+  "folders": [
+    {
+      "path": "..",
+      "name": "SGLang — Project A runtime"
+    },
+    {
+      "path": "../.project-a-components/dynamo",
+      "name": "Dynamo — routing and session bridge"
+    },
+    {
+      "path": "../.project-a-components/mooncake",
+      "name": "Mooncake — optional Conductor bridge"
+    }
+  ],
+  "settings": {
+    "search.exclude": {
+      "**/.git": true,
+      "**/__pycache__": true,
+      "**/.project-a-components": true
+    }
+  }
+}

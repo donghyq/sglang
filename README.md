@@ -10,6 +10,18 @@
 
 </div>
 
+<!-- Project A study entry: keep this block at the top; the original SGLang README below is unchanged. -->
+## Project A 学习入口
+
+这个分支保留完整的 SGLang 原生目录，只把 Project A 的学习材料集中在 [project_a/README.md](project_a/README.md)。
+
+- **先读**：[project_a/README.md](project_a/README.md)（版本、边界和学习入口）
+- **再读**：[project_a/ARCHITECTURE.md](project_a/ARCHITECTURE.md)（请求路径与个人增量）
+- **按调用链读源码**：[project_a/READING_GUIDE.md](project_a/READING_GUIDE.md)
+- **组件版本**：[project_a/COMPONENTS.json](project_a/COMPONENTS.json)
+
+本分支集中保存 Project A 的运行时代码、源码导航、独立示例和候选快照。运行时代码保留在原生目录；整理不改变已封存算法，也不代表新的性能验收。
+
 --------------------------------------------------------------------------------
 
 <p align="center">

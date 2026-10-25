@@ -1,0 +1,26 @@
+{
+  "components": [
+    {
+      "repo_url": "https://github.com/donghyq/sglang",
+      "branch": "codex/project-a-study",
+      "revision": "517f3acdfa2134199dcae28426b31728c6544c9e",
+      "upstream_base": "2f5c9ac43d76eef11e8561c89c55a79db7db715a",
+      "role": "SGLang full runtime and Project A study snapshot"
+    },
+    {
+      "repo_url": "https://github.com/donghyq/dynamo",
+      "branch": "codex/project-a-study",
+      "revision": "1e68205353f69f5bca67b179c7bcc9f2c8cd61b8",
+      "upstream_base": "ea89e8bdfcc8b9c95514fa9beabc5bd8296ec546",
+      "role": "Dynamo request routing and passive session identity bridge; Agent-cache routing is a prototype and real runtime cost signal wiring is not fully accepted"
+    },
+    {
+      "repo_url": "https://github.com/donghyq/Mooncake",
+      "branch": "codex/project-a-study",
+      "revision": "7b8330baf042de5e35ccdf025201de1b281e9c7b",
+      "upstream_base": "3d88bf917ae83eb30633e3fe26113342b902e622",
+      "role": "Optional Mooncake Conductor event bridge; not a mandatory request routing path"
+    }
+  ],
+  "revision_semantics": "revision pins the runtime/component implementation; the SGLang study branch adds packaging commits after its runtime revision"
+}

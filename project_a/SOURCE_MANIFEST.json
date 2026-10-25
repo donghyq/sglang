@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "classification": "study_source_manifest",
+  "runtime_revision": "517f3acdfa2134199dcae28426b31728c6544c9e",
+  "upstream_base": "2f5c9ac43d76eef11e8561c89c55a79db7db715a",
+  "runtime_layout_preserved": true,
+  "runtime_files": [
+    {
+      "path": "python/sglang/srt/arg_groups/field_order.py",
+      "sha256": "13056218edf477927419ec86cfaa60023d4e484efb442b63a176d3ac58686074"
+    },
+    {
+      "path": "python/sglang/srt/arg_groups/fields/memory.py",
+      "sha256": "9e67fdc6141577bb3bae15b979ff4a5537d13479fad52d566947df684ba37db0"
+    },
+    {
+      "path": "python/sglang/srt/disaggregation/decode.py",
+      "sha256": "ffc88f064c3d8bad79acc44c6d175acf513f251966320fb17613f1a0d6155ef2"
+    },
+    {
+      "path": "python/sglang/srt/entrypoints/http_server.py",
+      "sha256": "3e31f78a312b0b0e68ba8527ff924645f2ad58da54fffc5ca0c853ec4c58f9b8"
+    },
+    {
+      "path": "python/sglang/srt/managers/cache_controller.py",
+      "sha256": "743c5bd8451bb3896dbb93877252a6cb564c61b0d43da6d67535208b71b1840e"
+    },
+    {
+      "path": "python/sglang/srt/managers/io_struct.py",
+      "sha256": "52fa644f09581989249c7b290c6f72ce0f610df2b3facdc6a7f304c82254881d"
+    },
+    {
+      "path": "python/sglang/srt/managers/scheduler.py",
+      "sha256": "e25098d41c089aaee13b874589d411944dd42fb2e10fc78c48e9d580efc0371d"
+    },
+    {
+      "path": "python/sglang/srt/managers/tokenizer_control_mixin.py",
+      "sha256": "66c5bb536c740a13a3ca230c2d61ba5cc3282a08d820992aac31812886ac993f"
+    },
+    {
+      "path": "python/sglang/srt/managers/tokenizer_manager.py",
+      "sha256": "3287c6c3e8c52948384f765dc02b4f52858f6d58df19f0485bae0698db8f8560"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/agent_lifecycle.py",
+      "sha256": "f791dd0b9f6206eefeb8d1e28ce3fc5b21bdbbf4cd8d64622bd27b3f495d0a93"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py",
+      "sha256": "58d459789923c8c0f90a30e7ef01b163ea91ec42acf69b37ce8b0cb4b10dcb06"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/restore_cost.py",
+      "sha256": "a5ed27a77d0617ab4452007c6e19ce4b23c1c5c760718073a8a3c7c5227c7923"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py",
+      "sha256": "837701fe9d3aeeb2d13d85b39839de6642bd5cb078a9d79c2e7fe810f8c401b4"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/unified_cache/components/full.py",
+      "sha256": "61c2706ffd54c03936c03366600d310f6df8deb71b9b5128e89febf02e031d73"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/unified_cache/session_ref_tracker.py",
+      "sha256": "7b32b9e6ce6daca4833d98665dd58996d13f1407f8f835c5bdb17b371ae32e26"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/unified_cache/storage_attachment.py",
+      "sha256": "15ab87618568c27f129cb67d0385eb7394003285accbca2073baf52f1a726e66"
+    },
+    {
+      "path": "python/sglang/srt/mem_cache/unified_radix_cache.py",
+      "sha256": "f50aeb4b23ecb9f8ea6c42bc61fdcd0b33d29b1fa0af01f363538bbcd22dcb62"
+    },
+    {
+      "path": "python/sglang/srt/observability/metrics_collector.py",
+      "sha256": "ec236a25b2c53deb0e7a927e9c3ef8fa9ba05eb4a3c44121e1fdc79b94eb6e05"
+    },
+    {
+      "path": "python/sglang/srt/session/session_controller.py",
+      "sha256": "52a976494fafd65fc935b09f692c995be5ac5b473ea62c7cd830b9218b71f64e"
+    },
+    {
+      "path": "test/manual/mem_cache/test_dag_agent_lifecycle_local.py",
+      "sha256": "9fb01ba27468c45b0e8da984241274ac4dc85f6276d300121bce4f807716a267"
+    },
+    {
+      "path": "test/registered/unit/disaggregation/test_decode_hicache_tree_core.py",
+      "sha256": "49d40bbbcdc06eeebb068d2f42d4a7edfd3aa1d294dd89989072b198b50f87c2"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_agent_lifecycle_v1.py",
+      "sha256": "114427600647b5f6e84030680ab3089d1f741d04df8fb6230d76900dd61b8bf2"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_dag_kv_policy.py",
+      "sha256": "88cfcfb188fb8eda90b6ab386d0117d0ba49f0ce1ca3dbffc15cec4cfa244915"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_mooncake_group_semantics.py",
+      "sha256": "9c2ddb80321b9634061f6682201f2d5bb60fef6557048ae6e17cbc0d423d4d0f"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_runtime_restore_cost.py",
+      "sha256": "5b9289bffc08bf06e368a853e6033743c3280a9eaf8871654e9f63f33d8b9ff7"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_session_lifecycle.py",
+      "sha256": "acbb9e32c87beb52b242262d5f88ec34ef45624b290f5983e7cfc25d11d61c2d"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_session_token_share_unit.py",
+      "sha256": "ab04021661e1047c6120a2134350ab38ebf7a779ed138de8fee2eb7857f8df1f"
+    },
+    {
+      "path": "test/registered/unit/mem_cache/test_storage_prefetch_lifecycle.py",
+      "sha256": "57ca6da92f251725681fb9f7b01b6753702e44d9034935464e11ee7f68d10d77"
+    }
+  ],
+  "client_extract": {
+    "path": "project_a/replay/control_dispatch.py",
+    "source_sha256": "b574925e8970f9c26e73ebc4a7987b46cfeb85ccde1e717801c137dfb3a19f42",
+    "function": "workflow_control_queue",
+    "source_function_sha256": "ddeb3e7f99ea1f9f2a87d5e1f28e990cf84a5566ced3f8d1c41ab7e2d7b3f8be",
+    "implementation_unchanged": true,
+    "adaptations": [
+      "package location and standard-library imports only",
+      "private archived harness loader omitted"
+    ]
+  }
+}

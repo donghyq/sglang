@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "mode": "shadow",
+  "model": "Qwen3-30B-A3B",
+  "tp": 2,
+  "kv_bytes_per_token_per_rank": 49152,
+  "cost_scope": "request_ttft_ms",
+  "min_samples": 3,
+  "window_size": 20,
+  "risk_margin_ms": 0,
+  "buckets": []
+}
